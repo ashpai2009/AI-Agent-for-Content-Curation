@@ -32,7 +32,12 @@ from tenacity import (
 )
 
 from ..config import Settings
-from .base import LLMRequest, LLMResponse, ProviderError
+from .base import (
+    LLMRequest,
+    LLMResponse,
+    ProviderConfigurationError,
+    ProviderError,
+)
 
 
 class RateLimited(ProviderError):
@@ -42,6 +47,30 @@ class RateLimited(ProviderError):
 def _is_rate_limit(error: Exception) -> bool:
     text = f"{type(error).__name__} {error}".lower()
     return "429" in text or "resource_exhausted" in text or "rate limit" in text
+
+
+#: Signals that the call will fail the same way until the settings change. Matched on the
+#: message because the SDK raises a wide, undocumented set of exception types and the
+#: alternative -- treating everything as transient -- retries a bad key five times per
+#: model call for the length of a job.
+_CONFIGURATION_SIGNALS = (
+    "api key not valid",
+    "api_key_invalid",
+    "invalid api key",
+    "permission_denied",
+    "unauthenticated",
+    "401",
+    "403",
+    "not found for api version",
+    "invalid_argument",
+    "is not supported",
+    "unknown model",
+)
+
+
+def _is_configuration_error(error: Exception) -> bool:
+    text = f"{type(error).__name__} {error}".lower()
+    return any(signal in text for signal in _CONFIGURATION_SIGNALS)
 
 
 class GeminiClient:
@@ -63,9 +92,13 @@ class GeminiClient:
         if self._client is None:
             from google import genai
 
-            # Reads GEMINI_API_KEY from the environment, which `config` has already
-            # confirmed is present.
-            self._client = genai.Client()
+            # The key is passed explicitly rather than left to the SDK's environment
+            # lookup. Settings can be supplied programmatically -- a test, an embedded
+            # runner, a deployment that reads its secrets from somewhere other than the
+            # process environment -- and a client that silently reads `os.environ`
+            # instead would use a different key from the one this service was configured
+            # with, or none at all.
+            self._client = genai.Client(api_key=self._settings.gemini_api_key)
         return self._client
 
     @retry(
@@ -96,6 +129,10 @@ class GeminiClient:
         except Exception as error:
             if _is_rate_limit(error):
                 raise RateLimited(str(error), status="rate_limited") from error
+            if _is_configuration_error(error):
+                raise ProviderConfigurationError(
+                    str(error), status="configuration"
+                ) from error
             raise ProviderError(str(error)) from error
 
         status = getattr(interaction, "status", "unknown")

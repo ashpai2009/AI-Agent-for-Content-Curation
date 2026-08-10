@@ -487,6 +487,34 @@ def test_a_defect_no_issue_tracks_still_prevents_success(make_workbook, tmp_path
     assert "LATEX_BANNED_COMMAND" in report
 
 
+def test_a_misconfigured_provider_fails_the_job_rather_than_burning_its_budget(setup):
+    """Covering all four agents, not just the Writer: they call the same provider with
+    the same settings, so a key that is wrong for one is wrong for every one of them.
+    Refunding the attempt and retrying would spend the whole budget to arrive at the
+    same message."""
+    from oatutor_council.llm.base import ProviderConfigurationError
+
+    db, _ = setup
+    client = ScriptedLLMClient()
+
+    def reply(_request):
+        raise ProviderConfigurationError("API key not valid")
+
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.CONFIG
+    # Non-resumable: retrying repeats the failure until the settings change.
+    from oatutor_council.state_machine import is_resumable
+
+    assert not is_resumable(result.state, result.failure_reason)
+    assert result.llm_calls_used <= 1
+    assert any(
+        e["kind"] == "provider_misconfigured" for e in list_events(db, "job-1")
+    )
+
+
 def test_the_step_budget_is_a_real_fuse(setup):
     client = quiet_client()
     result = council(setup, client, step_budget=3).run()

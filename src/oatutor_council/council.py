@@ -32,7 +32,7 @@ from uuid import uuid4
 from .agents import independent_reviewer, initial_auditor, known_issue_reviewer, writer
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
-from .llm.base import LLMClient, ProviderError
+from .llm.base import LLMClient, ProviderConfigurationError, ProviderError
 from .models import (
     ArtifactKind,
     AttemptOutcome,
@@ -227,6 +227,15 @@ class CurationCouncil:
         except BudgetExhausted as error:
             record_event(self.db, self.job_id, "budget_exhausted", str(error))
             self._advance(JobState.FAILED, FailureReason.BUDGET_EXHAUSTED)
+            return StepOutcome(False, str(error), self.job.state)
+        except ProviderConfigurationError as error:
+            # Handled here rather than in `_write` so it covers all four agents: the
+            # auditor and the reviewers make the same call against the same settings, and
+            # a key that is wrong for one is wrong for every one of them. Retrying is a
+            # loop that spends the whole job budget to arrive at the same message, so the
+            # job fails as CONFIG -- non-resumable until somebody changes the settings.
+            record_event(self.db, self.job_id, "provider_misconfigured", str(error))
+            self._advance(JobState.FAILED, FailureReason.CONFIG)
             return StepOutcome(False, str(error), self.job.state)
         except ContextIsolationError as error:
             # Never a warning and never a retry: the same tainted payload would be sent
@@ -583,6 +592,10 @@ class CurationCouncil:
                 job_id=self.job_id,
                 taint=self.taint,
             )
+        except ProviderConfigurationError:
+            # Not an interrupted attempt. Refunding it would hand the budget back so the
+            # same misconfiguration could spend it again; `step` fails the job instead.
+            raise
         except (ProviderError, writer.WriterProposedNothing) as error:
             # Infrastructure or an unusable response. The attempt is refunded within the
             # bounded budget, because neither is the Writer failing at the task.

@@ -19,6 +19,7 @@ from oatutor_council.llm.base import (
     LLMRequest,
     LLMResponse,
     MalformedResponse,
+    ProviderConfigurationError,
     ProviderError,
     call_structured,
 )
@@ -371,3 +372,66 @@ def test_missing_credentials_fail_before_any_call_is_made():
     upload and the wait."""
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
         GeminiClient(settings().__class__(**{**settings().__dict__, "gemini_api_key": ""}))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "400 API key not valid. Please pass a valid API key.",
+        "403 PERMISSION_DENIED",
+        "404 models/nonexistent is not found for API version v1",
+        "401 UNAUTHENTICATED",
+    ],
+)
+def test_a_configuration_error_is_not_treated_as_an_outage(message):
+    """The two need opposite handling. An outage is transient and worth retrying; a bad
+    key fails identically for as long as the settings say what they say, so retrying it
+    spends the job's whole budget to arrive at the same message."""
+    calls: list[dict] = []
+    client = GeminiClient(settings(), client=FakeClient(RuntimeError(message), calls))
+
+    with pytest.raises(ProviderConfigurationError) as error:
+        client.complete(request())
+    assert error.value.retryable is False
+    assert len(calls) == 1  # tried once, not five times
+
+
+def test_an_outage_stays_retryable():
+    """The other side of the same judgment: a 503 is exactly the case retrying exists
+    for, and misclassifying it as configuration would fail jobs that would have worked."""
+    calls: list[dict] = []
+    client = GeminiClient(
+        settings(), client=FakeClient(RuntimeError("503 Service Unavailable"), calls)
+    )
+    with pytest.raises(ProviderError) as error:
+        client.complete(request())
+    assert not isinstance(error.value, ProviderConfigurationError)
+    assert error.value.retryable is True
+
+
+def test_the_api_key_is_passed_explicitly_rather_than_read_from_the_environment(
+    monkeypatch,
+):
+    """Settings can be supplied programmatically -- a test, an embedded runner, a
+    deployment whose secrets are not in the process environment. An SDK client that read
+    `os.environ` itself would use a different key from the one this service was
+    configured with, or none at all."""
+    captured: dict = {}
+
+    class FakeGenai:
+        @staticmethod
+        def Client(**kwargs):  # noqa: N802 - mirrors the SDK's name
+            captured.update(kwargs)
+            return FakeClient(FakeInteraction(), [])
+
+    import sys
+    import types
+
+    module = types.ModuleType("google")
+    module.genai = FakeGenai
+    monkeypatch.setitem(sys.modules, "google", module)
+    monkeypatch.setenv("GEMINI_API_KEY", "a-different-key-from-the-environment")
+
+    client = GeminiClient(settings())
+    assert client.client is not None
+    assert captured == {"api_key": "test-key"}

@@ -29,14 +29,14 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from .agents.initial_auditor import SeedClaim
-from .config import Settings, load_settings
+from .config import ConfigurationError, Settings, load_settings
 from .council import CurationCouncil
 from .ingestion.instruction_documents import (
     UnsupportedDocumentError,
     read_instruction_document,
 )
-from .llm.base import LLMClient
-from .models import ArtifactKind, CurationJob, JobState, SourcePath
+from .llm.base import LLMClient, ProviderConfigurationError
+from .models import ArtifactKind, CurationJob, FailureReason, JobState, SourcePath
 from .persistence import (
     Database,
     acquire_lease,
@@ -118,6 +118,14 @@ class JobRunner:
                 seed_claims=seed_claims,
             )
             council.run()
+        except (ConfigurationError, ProviderConfigurationError) as error:
+            # The client could not even be built. Left as a generic worker error the job
+            # would sit in `created` with an expired lease, be swept, fail the same way,
+            # and be swept again -- looking like work in progress forever. `CONFIG` is
+            # non-resumable, so the sweep leaves it alone until the settings change.
+            log.error("job %s cannot run: %s", job_id, error)
+            record_event(self.db, job_id, "provider_misconfigured", str(error))
+            _fail_job(self.db, job_id, FailureReason.CONFIG)
         except Exception as error:  # pragma: no cover - defence in depth
             log.exception("job %s failed", job_id)
             record_event(self.db, job_id, "worker_error", str(error))
@@ -140,6 +148,24 @@ class JobRunner:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _database_reachable(db: Database) -> bool:
+    try:
+        db.connection.execute("SELECT 1").fetchone()
+    except Exception:  # noqa: BLE001 - any failure here means the same thing
+        return False
+    return True
+
+
+def _fail_job(db: Database, job_id: str, reason: FailureReason) -> None:
+    from .persistence import transition_job
+
+    job = get_job(db, job_id)
+    if job is None or job.is_terminal:
+        return
+    transition_job(db, job_id, JobState.FAILED, run_epoch=job.run_epoch,
+                   failure_reason=reason)
 
 
 def _job_dir(settings: Settings, job_id: str) -> Path:
@@ -180,6 +206,22 @@ def create_app(
     autostart: bool = True,
 ) -> FastAPI:
     resolved = settings or load_settings()
+
+    # Credentials are checked **here**, before the first upload rather than at the first
+    # model call. A service that starts without them accepts work it cannot do: the job
+    # is created, the workbook is stored, the worker fails on its first call, and the
+    # curator has paid the upload and the wait to learn something that was knowable at
+    # boot.
+    #
+    # The escape hatch is explicit and narrow: supplying a `client_factory` says you are
+    # running against something other than the live provider -- the scripted mock, a
+    # recorded transcript, a local stub -- and the check does not apply. It is a
+    # parameter rather than an environment flag on purpose, because an environment
+    # variable that disables a credential check is a thing that ends up set in
+    # production.
+    if client_factory is None:
+        resolved.require_credentials()
+
     resolved.data_root.mkdir(parents=True, exist_ok=True)
     database = db or Database(resolved.data_root / "council.db")
     factory = client_factory or _default_client_factory
@@ -208,6 +250,43 @@ def create_app(
         # Deliberately 400 with the reason spelled out. An unreadable document must never
         # be reported as a document containing no instructions.
         return JSONResponse(status_code=400, content={"error": error.user_message})
+
+    # -- health -----------------------------------------------------------------------
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        """Liveness. Answers "is this process up", and nothing that needs a secret."""
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readiness() -> JSONResponse:
+        """Readiness: could a job submitted right now actually be run?
+
+        Separate from `/health` because the answers differ in the case that matters. A
+        process that is up but whose worker pool never started, or whose database has
+        gone away, accepts uploads and does nothing with them -- and a load balancer that
+        cannot tell that apart from working routes every upload into it.
+
+        The provider is *described*, never contacted. A readiness probe that made a paid
+        model call would be a bill that scales with how often it is polled. Credentials
+        are checked at startup instead, which is why this reports rather than enforces.
+        """
+        offline = client_factory is not None
+        checks = {
+            "provider_configured": offline or resolved.provider_configured,
+            "database": _database_reachable(database),
+            "worker_pool": getattr(app.state, "runner", None) is not None,
+        }
+        ready = all(checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "ready": ready,
+                "checks": checks,
+                "offline_client": offline,
+                **resolved.describe_provider(),
+            },
+        )
 
     # -- submission -------------------------------------------------------------------
 

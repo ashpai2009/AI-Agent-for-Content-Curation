@@ -22,6 +22,15 @@ from dotenv import load_dotenv
 DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 
 
+class ConfigurationError(RuntimeError):
+    """The service is not configured well enough to do the work it accepts.
+
+    Raised at startup rather than at the first model call. A service that starts happily
+    without credentials accepts uploads it can never process, and the curator finds out
+    after the wait rather than before the upload.
+    """
+
+
 def _int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -59,17 +68,40 @@ class Settings:
     #: as a flag so the opposite reading stays testable rather than unimaginable.
     reviewer_sees_writer_rationale: bool = False
 
+    @property
+    def provider_configured(self) -> bool:
+        return bool(self.gemini_api_key.strip() and self.gemini_model.strip())
+
     def require_credentials(self) -> None:
         """Fail loudly and early rather than at the first model call.
 
         A missing key discovered halfway through a job has already cost the curator the
-        upload and the wait.
+        upload and the wait -- and worse, the job sits in `created` looking like work in
+        progress rather than work that was never possible.
         """
-        if not self.gemini_api_key:
-            raise RuntimeError(
+        if not self.gemini_api_key.strip():
+            raise ConfigurationError(
                 "GEMINI_API_KEY is not set. The curation council cannot run without "
-                "credentials for the Gemini API."
+                "credentials for the Gemini API. Set it in the environment or in .env, "
+                "or start the service with an explicit offline client."
             )
+        if not self.gemini_model.strip():
+            raise ConfigurationError(
+                "GEMINI_MODEL is empty. Unset it to use the default, or name a model."
+            )
+
+    def describe_provider(self) -> dict[str, object]:
+        """What is configured, in a form that is safe to serve over HTTP.
+
+        The key itself never appears -- not truncated, not fingerprinted, not its length.
+        The only question an operator needs answered here is *is one present*, and every
+        further detail is material for someone who should not have any.
+        """
+        return {
+            "provider": "google-gemini",
+            "model": self.gemini_model,
+            "credentials_present": bool(self.gemini_api_key.strip()),
+        }
 
 
 def load_settings(*, env_file: str | Path | None = ".env") -> Settings:

@@ -62,7 +62,14 @@ and prints every artefact.
 ```bash
 export GEMINI_API_KEY=...            # see .env.example for every setting
 .venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src --port 8000
+
+# Verify the provider with one live call carrying no workbook content
+.venv/bin/python scripts/smoke_provider.py
 ```
+
+Without credentials the service **refuses to start**, rather than accepting uploads it
+can never process. `GET /health` is liveness; `GET /readyz` answers the different and more
+useful question of whether a job submitted right now could actually run.
 
 ```bash
 # Submit

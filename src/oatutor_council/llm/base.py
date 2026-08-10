@@ -46,6 +46,23 @@ class ProviderError(Exception):
         self.retryable = retryable
 
 
+class ProviderConfigurationError(ProviderError):
+    """The provider cannot be called with the settings this service has.
+
+    A missing or rejected key, an unknown model, a malformed request. Kept apart from an
+    outage because the two need opposite handling: an outage is transient and worth
+    retrying, while a configuration error will fail identically for as long as the
+    settings say what they say. Retrying one is patience; retrying the other is a loop
+    that spends a job's budget to reach the same place.
+
+    Never retryable, and it fails the job as `FAILED(CONFIG)`, which is non-resumable
+    until somebody changes the settings.
+    """
+
+    def __init__(self, message: str, *, status: str = "") -> None:
+        super().__init__(message, status=status, retryable=False)
+
+
 class MalformedResponse(Exception):
     """The model returned text that does not satisfy the schema.
 

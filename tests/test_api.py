@@ -97,6 +97,100 @@ def submit(client, data: bytes, name: str = "workbook.xlsx", **extra):
 
 
 # --------------------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------------------
+
+
+def test_the_service_refuses_to_start_without_credentials(tmp_path):
+    """Before the first upload, not at the first model call. A service that starts
+    unconfigured accepts work it can never do, and the curator pays the upload and the
+    wait to learn something that was knowable at boot."""
+    from oatutor_council.config import ConfigurationError
+
+    with pytest.raises(ConfigurationError) as error:
+        create_app(
+            settings=settings_for(tmp_path, gemini_api_key=""),
+            db=Database(tmp_path / "c.db"),
+        )
+    assert "GEMINI_API_KEY" in str(error.value)
+
+
+def test_an_explicit_offline_client_is_the_only_way_past_that(tmp_path):
+    """The escape hatch is a parameter rather than an environment flag, because an
+    environment variable that disables a credential check ends up set in production."""
+    settings = settings_for(tmp_path, gemini_api_key="")
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "c.db"),
+        client_factory=mock_client,
+        autostart=False,
+    )
+    with TestClient(app) as test_client:
+        assert test_client.get("/readyz").status_code == 200
+
+
+def test_readiness_reports_the_provider_without_exposing_the_key(client):
+    body = client.get("/readyz").json()
+    assert body["ready"] is True
+    assert body["credentials_present"] is True
+    assert body["model"] == "mock"
+    assert "test" not in str(body)  # the key itself, in any form
+    assert "api_key" not in body and "gemini_api_key" not in body
+
+
+def test_a_process_with_no_worker_pool_is_alive_but_not_ready(tmp_path):
+    """Where `/health` and `/readyz` part company. Without the lifespan the pool never
+    starts, so the service accepts uploads and does nothing with them -- which is exactly
+    what a readiness probe exists to catch and a liveness probe cannot see."""
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "c.db"),
+        client_factory=mock_client,
+        autostart=False,
+    )
+    # Deliberately not used as a context manager: no lifespan, no runner.
+    unstarted = TestClient(app)
+    assert unstarted.get("/health").json() == {"status": "ok"}
+
+    readiness = unstarted.get("/readyz")
+    assert readiness.status_code == 503
+    assert readiness.json()["checks"]["worker_pool"] is False
+
+
+def test_a_configuration_failure_fails_the_job_and_is_not_resumable(
+    tmp_path, workbook_bytes
+):
+    """A key the provider rejects must not look like work in progress. Left as a generic
+    worker error the job sits in `created` with an expired lease, is swept, fails the
+    same way, and is swept again -- forever."""
+    from oatutor_council.llm.base import ProviderConfigurationError
+
+    def broken_factory(_settings):
+        raise ProviderConfigurationError("API key not valid")
+
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "council.db"),
+        client_factory=broken_factory,
+        autostart=True,
+    )
+    with TestClient(app) as test_client:
+        job_id = submit(test_client, workbook_bytes).json()["job_id"]
+        _wait_for_terminal(test_client, job_id)
+        status = test_client.get(f"/jobs/{job_id}").json()
+        assert status["state"] == "failed"
+        assert status["failure_reason"] == "config"
+
+        resumed = test_client.post(f"/jobs/{job_id}/resume")
+        assert resumed.status_code == 409
+
+
+# --------------------------------------------------------------------------------------
 # Submission
 # --------------------------------------------------------------------------------------
 
