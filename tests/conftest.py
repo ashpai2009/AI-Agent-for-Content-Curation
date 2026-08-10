@@ -57,7 +57,10 @@ def cells(**values: Any) -> list[Any]:
         index = FIXED_COLUMNS.get(key)
         if index is None:
             raise KeyError(f"{name} is not a fixed column; place it positionally")
-        row[index - 1] = value
+        # An unset column is an empty cell, not a cell holding "". Writing the empty
+        # string produces an `inlineStr` cell that openpyxl rewrites as empty on the
+        # next save, which would show up in every diff as a spurious type change.
+        row[index - 1] = value if value != "" else None
     return row
 
 
@@ -131,6 +134,74 @@ def write_workbook(
 
     workbook.save(path)
     return path
+
+
+#: A 1x1 transparent PNG, inlined so the image fixture needs no binary in the repo.
+TINY_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000d4944415478da6364f8cf000000030101002d0dd8a8"
+    "0000000049454e44ae426082"
+)
+
+
+def write_feature_rich_workbook(path: Path) -> Path:
+    """A workbook exercising every dimension the diff compares.
+
+    The real corpus is almost featureless -- ten of eleven workbooks have no merged
+    ranges, no explicit geometry, no validations, no images -- so round-tripping one of
+    those proves very little. This fixture exists so the fidelity test has something to
+    lose.
+    """
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Main"
+
+    sheet["A1"] = "value"
+    sheet["B1"] = 3.5
+    sheet["C1"] = "=B1*2"
+    sheet["D1"] = True
+    sheet["A1"].font = Font(
+        name="Arial", size=12, bold=True, italic=True, color="FF0000"
+    )
+    sheet["A1"].fill = PatternFill(fill_type="solid", fgColor="FFFF00")
+    sheet["A1"].border = Border(left=Side(style="thin"), bottom=Side(style="double"))
+    sheet["A1"].alignment = Alignment(
+        horizontal="center", vertical="top", wrap_text=True, indent=2, text_rotation=45
+    )
+    sheet["B1"].number_format = "0.000"
+
+    sheet.merge_cells("A3:C4")
+    sheet.row_dimensions[1].height = 33.75
+    sheet.row_dimensions[5].hidden = True
+    sheet.column_dimensions["A"].width = 42.5
+    sheet.column_dimensions["E"].hidden = True
+    sheet.freeze_panes = "B2"
+
+    validation = DataValidation(type="list", formula1='"a,b,c"')
+    sheet.add_data_validation(validation)
+    validation.add("F1:F9")
+
+    sheet["G1"] = "link"
+    sheet["G1"].hyperlink = "https://example.org/x"
+
+    png = path.parent / f"{path.stem}-image.png"
+    png.write_bytes(TINY_PNG)
+    sheet.add_image(XLImage(str(png)), "H1")
+
+    workbook.create_sheet("Second")
+    workbook.create_sheet("Hidden").sheet_state = "hidden"
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
+@pytest.fixture
+def feature_rich_workbook(tmp_path: Path) -> Path:
+    return write_feature_rich_workbook(tmp_path / "rich.xlsx")
 
 
 @pytest.fixture
