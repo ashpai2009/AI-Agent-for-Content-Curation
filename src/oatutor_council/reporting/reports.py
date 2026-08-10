@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from ..models import (
+    SUCCESSFUL_ISSUE_STATES,
     ArtifactKind,
     ChangeRecord,
     Issue,
@@ -211,9 +212,16 @@ def _validation_report(
         "integrity_passed": not integrity_findings,
         "integrity_findings": [_render_finding(f) for f in integrity_findings],
         "changes_applied": len(changes),
+        # Every state that counts as resolved, not just `ACCEPTED`. A refuted claim was
+        # checked and was not there, and a superseded one was fixed by another repair;
+        # counting only accepted issues made the summary contradict its own first line.
         "issues_resolved": len(
+            [i for i in ledger.issues if i.state in SUCCESSFUL_ISSUE_STATES]
+        ),
+        "issues_repaired": len(
             [i for i in ledger.issues if i.state is IssueState.ACCEPTED]
         ),
+        "issues_superseded": len(ledger.by_state(IssueState.SUPERSEDED)),
         "issues_refuted": len(ledger.by_state(IssueState.REFUTED)),
         "issues_needing_a_person": [
             {
@@ -289,8 +297,10 @@ def render_markdown(reports: JobReports) -> str:
         "## Summary",
         "",
         f"- Issues tracked: {reports.issue_ledger['issue_count']}",
-        f"- Issues resolved: {validation['issues_resolved']}",
-        f"- Claims refuted: {validation['issues_refuted']}",
+        f"- Issues resolved: {validation['issues_resolved']}"
+        f" (repaired {validation['issues_repaired']},"
+        f" refuted {validation['issues_refuted']},"
+        f" resolved by another repair {validation['issues_superseded']})",
         f"- Cells changed: {validation['changes_applied']}",
         f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
     ]

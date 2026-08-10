@@ -273,7 +273,13 @@ def test_the_report_still_hands_over_what_was_accepted(reports):
     """Finalisation writes outputs before evaluating gates, so an unfinished job still
     delivers the corrected workbook and an account of what it could not fix."""
     assert reports.validation_report["changes_applied"] == 1
-    assert reports.validation_report["issues_resolved"] == 1
+    # `resolved` is every state compatible with success, and the split says how each one
+    # got there. Counting only repairs made the summary contradict its own first line on
+    # a job whose issues were refuted or resolved by a sibling repair.
+    assert reports.validation_report["issues_resolved"] == 2
+    assert reports.validation_report["issues_repaired"] == 1
+    assert reports.validation_report["issues_refuted"] == 1
+    assert reports.validation_report["issues_superseded"] == 0
 
 
 def test_an_integrity_failure_dominates_the_summary():

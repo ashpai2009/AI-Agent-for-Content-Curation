@@ -215,6 +215,258 @@ def test_pre_existing_findings_do_not_block_a_patch(make_workbook):
 
 
 # --------------------------------------------------------------------------------------
+# Does the patch fix what it was asked to fix?
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unanswered(make_workbook):
+    """A block whose scaffold has no answer, and an issue that says exactly that."""
+    return read_workbook(
+        make_workbook(
+            [
+                problem("angles1", title="Convert", oer_src="s", license="CC"),
+                step("angles1", answer="pi/6", answer_type="algebra"),
+                scaffold("angles1", "s1", answer="", answer_type="numeric"),
+            ]
+        )
+    )
+
+
+def missing_answer_issue(**kwargs) -> Issue:
+    from oatutor_council.models import FIXED_COLUMNS
+
+    defaults = dict(
+        category=IssueCategory.ROW_TYPE,
+        rule_codes=("SCAFFOLD_MISSING_ANSWER",),
+        cells=((4, FIXED_COLUMNS[ColumnKey.ANSWER]),),
+    )
+    return make_issue(**{**defaults, **kwargs})
+
+
+def test_a_patch_resolving_the_named_defect_is_accepted(unanswered):
+    result = check(
+        make_patch(edit(4, ColumnKey.ANSWER, "", "30")),
+        missing_answer_issue(),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.accepted, result.rejection
+
+
+def test_an_unrelated_title_edit_under_an_answer_issue_is_refused(unanswered):
+    """The reported case. Editing the Title of the row whose Answer is missing is a
+    perfectly valid edit that has nothing to do with the issue, and nothing about it
+    breaks a rule -- so only a scope check catches it."""
+    result = check(
+        make_patch(edit(4, ColumnKey.TITLE, "", "First part")),
+        missing_answer_issue(),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.rejection.code is RejectionCode.UNRELATED_CELL
+
+
+def test_an_unrelated_edit_with_an_explanation_still_has_to_fix_the_issue(unanswered):
+    """A stated reason is necessary, not sufficient. The Writer can always produce a
+    sentence; it cannot produce a defect that is no longer there."""
+    result = check(
+        make_patch(
+            edit(4, ColumnKey.TITLE, "", "First part"),
+            related_edits_reason="the title clarifies what the scaffold is asking",
+        ),
+        missing_answer_issue(),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.rejection.code is RejectionCode.ISSUE_NOT_RESOLVED
+    assert "SCAFFOLD_MISSING_ANSWER" in result.rejection.detail["codes"]
+
+
+def test_a_patch_that_edits_the_right_cell_but_does_not_fix_it_is_refused(unanswered):
+    """The edit is in scope, well-formed, breaks nothing, and leaves the scaffold with
+    no answer -- because whitespace is not an answer."""
+    result = check(
+        make_patch(edit(4, ColumnKey.ANSWER, "", "   ")),
+        missing_answer_issue(),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.rejection.code is RejectionCode.ISSUE_NOT_RESOLVED
+
+
+def test_a_sibling_cell_the_repair_needs_is_allowed_when_explained(make_workbook):
+    """An answer that matches no choice is repaired in `mcChoices`, which is not the
+    cell the issue named. Scope must permit that or the defect is unfixable."""
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("mc1", title="Choose", oer_src="s", license="CC"),
+                step("mc1", answer="1/2", answer_type="mc", mc_choices="0.5|1/3|1/4"),
+            ]
+        )
+    )
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(
+            edit(3, ColumnKey.MC_CHOICES, "0.5|1/3|1/4", "1/2|1/3|1/4"),
+            related_edits_reason="the answer is correct; the choice list must contain "
+            "it character for character",
+        ),
+        make_issue(
+            category=IssueCategory.MULTIPLE_CHOICE,
+            rule_codes=("MC_ANSWER_NOT_IN_CHOICES",),
+            cells=((3, FIXED_COLUMNS[ColumnKey.ANSWER]),),
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.accepted, result.rejection
+
+
+def test_an_edit_the_repair_did_not_need_is_refused_even_with_an_explanation(unanswered):
+    """Necessity, decided by consequence rather than by intent: drop the edit, and if the
+    issue is still resolved and nothing new is broken, the repair never needed it."""
+    result = check(
+        make_patch(
+            edit(4, ColumnKey.ANSWER, "", "30"),
+            edit(4, ColumnKey.TITLE, "", "First part"),
+            related_edits_reason="the title makes the scaffold clearer",
+        ),
+        missing_answer_issue(),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.rejection.code is RejectionCode.UNRELATED_CELL
+    assert result.rejection.row == 4
+
+
+def test_an_issue_with_no_rule_code_is_left_to_its_reviewer(unanswered):
+    """An agent-discovered defect carries no registered rule, so there is nothing to
+    re-run. The gate must not read "cannot be checked" as "not fixed" -- that would make
+    every semantic issue permanently unrepairable."""
+    result = check(
+        make_patch(edit(4, ColumnKey.TITLE, "", "First part")),
+        make_issue(rule_codes=("AUDITOR_FINDING",)),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.accepted, result.rejection
+
+
+def test_the_named_column_must_agree_with_the_column_index(unanswered):
+    """The writer addresses the cell by index and the scope checks read the key. If they
+    disagree the patch is checked against one cell and written to another."""
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(
+            CellEdit(
+                row=4,
+                column=FIXED_COLUMNS[ColumnKey.TITLE],
+                column_key=ColumnKey.ANSWER,
+                before="",
+                after="30",
+            )
+        ),
+        missing_answer_issue(),
+        unanswered.blocks[0],
+        unanswered,
+    )
+    assert result.rejection.code is RejectionCode.COLUMN_KEY_MISMATCH
+
+
+# --------------------------------------------------------------------------------------
+# Presentation repairs must not change the mathematics
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def caret(make_workbook):
+    return read_workbook(
+        make_workbook(
+            [
+                problem("a1", title="Simplify", oer_src="s", license="CC"),
+                step("a1", answer="x^2", answer_type="algebra"),
+            ]
+        )
+    )
+
+
+def notation_issue(**kwargs) -> Issue:
+    from oatutor_council.models import FIXED_COLUMNS
+
+    defaults = dict(
+        category=IssueCategory.NOTATION,
+        rule_codes=("CARET_EXPONENT",),
+        cells=((3, FIXED_COLUMNS[ColumnKey.ANSWER]),),
+    )
+    return make_issue(**{**defaults, **kwargs})
+
+
+def test_a_notation_repair_that_preserves_the_value_is_accepted(caret):
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER, "x^2", "x**2")),
+        notation_issue(),
+        caret.blocks[0],
+        caret,
+    )
+    assert result.accepted, result.rejection
+
+
+def test_a_notation_repair_that_changes_the_value_is_refused(caret):
+    """`x**3` is correctly-written ASCII and satisfies the rule that raised the issue.
+    It is also a different answer, and every other check in the gate would pass it."""
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER, "x^2", "x**3")),
+        notation_issue(),
+        caret.blocks[0],
+        caret,
+    )
+    assert result.rejection.code is RejectionCode.MATH_NOT_EQUIVALENT
+
+
+def test_a_mathematics_issue_is_allowed_to_change_the_value(caret):
+    """The equivalence check applies to presentation repairs only. Under a mathematics
+    issue, changing the value is the entire point."""
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER, "x^2", "x**3")),
+        notation_issue(category=IssueCategory.MATHEMATICS),
+        caret.blocks[0],
+        caret,
+    )
+    assert result.accepted, result.rejection
+
+
+def test_mathematics_sympy_cannot_decide_is_left_to_the_reviewer(make_workbook):
+    """SymPy is a gate, not a proof. An expression it cannot parse yields UNKNOWN, and
+    UNKNOWN must pass through to a reviewer -- refusing it would reject most correct
+    LaTeX repairs, which is worse than the risk it guards against."""
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("a1", title="State", oer_src="s", license="CC"),
+                step("a1", answer="the domain of f", answer_type="algebra"),
+            ]
+        )
+    )
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER, "the domain of f", "all real numbers")),
+        make_issue(
+            category=IssueCategory.NOTATION,
+            rule_codes=(),
+            cells=((3, FIXED_COLUMNS[ColumnKey.ANSWER]),),
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.accepted, result.rejection
+
+
+# --------------------------------------------------------------------------------------
 # Structural edits
 # --------------------------------------------------------------------------------------
 

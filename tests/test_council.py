@@ -340,6 +340,153 @@ def test_a_rediscovered_defect_does_not_get_a_fresh_attempt_budget(setup):
     )
 
 
+def test_an_issue_whose_defect_is_already_gone_is_superseded_not_repaired(
+    make_workbook, tmp_path
+):
+    """Two issues on one block, and repairing the first resolves the second.
+
+    Sending the second to the Writer buys an escalation or an invented change, and pays
+    for a model call to get it. `SUPERSEDED` is the honest terminal state, and it counts
+    towards success because nothing is left wrong.
+    """
+    source = make_workbook(
+        [
+            problem("angles1", title="Convert", oer_src="s", license="CC"),
+            # One cell, two deterministic defects: a caret exponent and the padding
+            # around it. Writing `x**2` clears both.
+            step("angles1", answer=" x^2 ", answer_type="algebra"),
+        ]
+    )
+    db = Database(tmp_path / "c.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename="w.xlsx", source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client(
+        **{
+            AgentRole.WRITER: WriterResponse(
+                derivation="the ASCII convention writes exponents with **",
+                edits=[
+                    {"row": 3, "column": "answer", "before": " x^2 ", "after": "x**2"}
+                ],
+            )
+        }
+    )
+    result = CurationCouncil(
+        db=db, settings=settings(), client=client, job_id="job-1", copy=copy
+    ).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    assert read_workbook(copy.path).blocks[0].rows[1].get(ColumnKey.ANSWER) == "x**2"
+
+    states = {i.title.split(" at ")[0]: i.state for i in list_issues(db, "job-1")}
+    assert states["WHITESPACE_PADDING"] is IssueState.SUPERSEDED
+    assert states["CARET_EXPONENT"] is IssueState.ACCEPTED
+    # One Writer call between them, not two.
+    assert client.call_count(AgentRole.WRITER) == 1
+
+
+def test_a_reviewer_asking_for_a_revision_is_not_overruled_by_the_rule_being_satisfied(
+    setup,
+):
+    """The other half of the supersede rule, and the dangerous half.
+
+    Once the council has edited for an issue, the rule no longer firing is the council's
+    own work. A reviewer who still asks for a revision is saying the value is wrong
+    though the rule is satisfied -- so superseding there would let a mechanically-clean
+    but incorrect repair close the issue by silencing the reviewer.
+    """
+    db, _ = setup
+    client = quiet_client(
+        **{
+            AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(
+                decision="revise", feedback="30 is not what this scaffold asks for"
+            )
+        }
+    )
+    result = council(setup, client).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    assert not any(
+        i.state is IssueState.SUPERSEDED for i in list_issues(db, "job-1")
+    )
+
+
+# --------------------------------------------------------------------------------------
+# False success
+# --------------------------------------------------------------------------------------
+
+
+def test_an_accepted_unrelated_edit_cannot_hide_a_remaining_defect(setup, tmp_path):
+    """The reported case, reproduced.
+
+    The Writer edits a cell that has nothing to do with the open issue, the reviewer
+    accepts it, and the defect the issue was opened for is still there at the end. Every
+    issue is terminal and the integrity gate passes, so a job that decides success from
+    those two facts alone reports success over a workbook it never fixed.
+    """
+    db, copy = setup
+    client = quiet_client(
+        **{
+            AgentRole.WRITER: WriterResponse(
+                derivation="",
+                edits=[
+                    {"row": 4, "column": "title", "before": "", "after": "First part"}
+                ],
+            )
+        }
+    )
+    result = council(setup, client).run()
+
+    assert result.state is not JobState.SUCCEEDED
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    # The scaffold still has no answer, and the report has to say so.
+    assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == ""
+    report = (copy.path.parent.parent / "outputs" / "report.md").read_text()
+    assert "SCAFFOLD_MISSING_ANSWER" in report
+
+
+def test_a_defect_no_issue_tracks_still_prevents_success(make_workbook, tmp_path):
+    """A blocking finding no issue was ever opened for.
+
+    `LATEX_BANNED_COMMAND` is deliberately not repairable, so it never enters the repair
+    loop. A success test that only asks whether every *issue* is resolved therefore never
+    sees it, and hands back a workbook with a blocking defect marked succeeded.
+    """
+    source = make_workbook(
+        [
+            problem("angles1", title="Convert", oer_src="s", license="CC"),
+            # A LaTeX workbook, so the only finding is the banned command itself and
+            # nothing repairable opens an issue that could reach the same verdict by
+            # another route.
+            step(
+                "angles1",
+                answer=r"$$\frac{\pi}{6}$$",
+                answer_type="algebra",
+                body_text=r"$$\input{/etc/passwd}$$",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "c.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename="w.xlsx", source_sha256=copy.source_sha256
+        ),
+    )
+    result = CurationCouncil(
+        db=db, settings=settings(), client=quiet_client(), job_id="job-1", copy=copy
+    ).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    report = (copy.path.parent.parent / "outputs" / "report.md").read_text()
+    assert "LATEX_BANNED_COMMAND" in report
+
+
 def test_the_step_budget_is_a_real_fuse(setup):
     client = quiet_client()
     result = council(setup, client, step_budget=3).run()

@@ -68,9 +68,24 @@ def test_terminal_job_states_go_nowhere(state):
     assert LEGAL_JOB_TRANSITIONS[state] == frozenset()
 
 
-@pytest.mark.parametrize("state", sorted(TERMINAL_ISSUE_STATES, key=str))
-def test_terminal_issue_states_go_nowhere(state):
-    assert LEGAL_ISSUE_TRANSITIONS[state] == frozenset()
+def test_an_escalated_issue_goes_nowhere():
+    """The one true dead end. Nothing the council does next can un-escalate an issue a
+    person has been asked to look at."""
+    assert LEGAL_ISSUE_TRANSITIONS[IssueState.NEEDS_HUMAN_REVIEW] == frozenset()
+
+
+@pytest.mark.parametrize(
+    "state",
+    sorted(TERMINAL_ISSUE_STATES - {IssueState.NEEDS_HUMAN_REVIEW}, key=str),
+)
+def test_a_resolved_issue_reopens_only_backwards_or_to_a_person(state):
+    """Final validation can rediscover the defect an issue was closed for. It has to be
+    able to say so -- absorbing the rediscovery silently is how a job reports success
+    over a workbook it never fixed -- but only in these two directions, so a rediscovery
+    can never re-enter the pipeline at an earlier stage."""
+    assert LEGAL_ISSUE_TRANSITIONS[state] == frozenset(
+        {IssueState.REVISION_REQUESTED, IssueState.NEEDS_HUMAN_REVIEW}
+    )
 
 
 def test_every_non_terminal_job_state_can_fail_or_be_cancelled():
@@ -240,3 +255,28 @@ def test_the_refund_budget_is_bounded_so_neither_counter_can_loop():
 
 def test_a_refund_cannot_create_an_attempt_that_was_never_spent():
     assert MACHINE.refund_interrupted(make_issue(attempts_used=0)).attempts_used == 0
+
+
+# --------------------------------------------------------------------------------------
+# Reopening
+# --------------------------------------------------------------------------------------
+
+
+def test_a_rediscovered_defect_reopens_the_issue_it_belongs_to():
+    issue = make_issue(state=IssueState.ACCEPTED, attempts_used=1)
+    reopened = MACHINE.reopen(issue)
+    assert reopened.state is IssueState.REVISION_REQUESTED
+
+
+def test_reopening_does_not_refill_the_attempt_budget():
+    """The bound on the reopen cycle. A reopened issue is the same issue; a fresh budget
+    is exactly how the validation loop stops terminating."""
+    issue = make_issue(state=IssueState.ACCEPTED, attempts_used=2)
+    assert MACHINE.reopen(issue).attempts_used == 2
+
+
+def test_reopening_an_issue_with_no_attempts_left_sends_it_to_a_person():
+    """Absorption stops the loop. It never launders the defect: the issue lands in a
+    state that denies the job success rather than one that ignores the rediscovery."""
+    issue = make_issue(state=IssueState.ACCEPTED, attempts_used=3)
+    assert MACHINE.reopen(issue).state is IssueState.NEEDS_HUMAN_REVIEW

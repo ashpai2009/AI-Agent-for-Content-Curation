@@ -47,6 +47,20 @@ anything is written, and a mismatch rejects the whole patch and spends an attemp
 
 Edit only cells inside this block, and only cells the issue concerns.
 
+Your patch must actually resolve the stated issue. It is simulated and the rule that
+raised the issue is re-run against the result; a patch that leaves the defect in place is
+rejected and spends an attempt, however sound the edit is on its own terms.
+
+Do not make unrelated improvements. If a cell the issue did not name has to change for
+this repair to work -- a choice list that must match a corrected answer, the cell a
+shifted value came from -- edit it and say why in `related_edits_reason`. An edit outside
+the issue's cells with no stated reason is rejected, and so is one that turns out not to
+have been needed.
+
+If the issue is about how a value is *written* rather than what it is -- notation, LaTeX,
+formatting -- the corrected cell must still mean the same thing. That is checked
+symbolically.
+
 If you cannot determine the correct content confidently, set `needs_human_review` and
 produce no edits.
 """
@@ -157,5 +171,6 @@ def _to_patch(response: WriterResponse, *, issue: Issue, attempt_no: int) -> Pat
         # built from `ReviewerContext`, which structurally cannot reference it.
         reason=response.reasoning,
         derivation=response.derivation,
+        related_edits_reason=response.related_edits_reason,
         confidence=response.confidence,
     )

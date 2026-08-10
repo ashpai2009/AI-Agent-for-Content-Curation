@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from ..models import (
+    MC_CHOICE_DELIMITER,
     STRUCTURAL_COLUMNS,
     CellEdit,
     ColumnKey,
@@ -38,7 +39,8 @@ from ..models import (
     ValidationFinding,
     WorkbookRow,
 )
-from .rules import run_rules
+from .mathematics import MathVerdict, equations_equivalent
+from .rules import REGISTRY, run_rules
 
 #: Columns describing provenance rather than content. An edit here under a mathematics
 #: issue is out of scope, however tempting.
@@ -61,6 +63,18 @@ MATHEMATICAL_COLUMNS = frozenset({ColumnKey.ANSWER, ColumnKey.MC_CHOICES})
 
 #: Findings this severe must not be *introduced* by a repair.
 REGRESSION_SEVERITIES = frozenset({Severity.BLOCKING, Severity.ERROR})
+
+#: Issue categories about how a value is *written* rather than what it is. A repair under
+#: one of these must leave the mathematics alone: rewriting `sqrt(2)/2` as `0.7` is a
+#: notation fix that quietly changed the answer, and nothing downstream would notice.
+VALUE_PRESERVING_CATEGORIES = frozenset(
+    {
+        IssueCategory.NOTATION,
+        IssueCategory.LATEX,
+        IssueCategory.FORMATTING,
+        IssueCategory.APPEARANCE,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -140,6 +154,130 @@ def regressions_introduced(
         if f.severity in REGRESSION_SEVERITIES
         and (f.code, f.row, f.column) not in before
     )
+
+
+# --------------------------------------------------------------------------------------
+# Does the patch fix what it was asked to fix?
+# --------------------------------------------------------------------------------------
+
+
+def target_findings(
+    issue: Issue, parsed: ParsedWorkbook, block: ProblemBlock
+) -> tuple[ValidationFinding, ...] | None:
+    """The findings this issue was opened for, as they stand in `block`.
+
+    `None` -- distinct from an empty tuple -- means the claim is **not mechanically
+    checkable**. Two cases produce it, and conflating either with "resolved" would be a
+    serious mistake:
+
+    * an agent-discovered issue carries no registered rule code, because the defect is a
+      semantic one only a reviewer can judge;
+    * a structural finding the *reader* emitted while parsing is not re-derivable from a
+      simulated block, since simulation edits cell values and does not re-parse the sheet.
+
+    In both cases the gate falls back on the checks it can make exactly -- invariants,
+    conservation, regressions -- and leaves sufficiency to the assigned reviewer.
+    """
+    codes = tuple(code for code in issue.rule_codes if code in REGISTRY)
+    if not codes:
+        return None
+
+    single = parsed.model_copy(update={"blocks": (block,)})
+    found = run_rules(single, only=codes)
+    cells = set(issue.cells)
+    if not cells:
+        return found
+    # An issue that named its cells is only claiming a defect *there*. The same rule
+    # firing elsewhere in the block is somebody else's issue, and treating it as this
+    # one's would make a correct repair look like a failed one.
+    return tuple(f for f in found if (f.row, f.column) in cells)
+
+
+def _still_present(
+    issue: Issue, parsed: ParsedWorkbook, patched: ProblemBlock
+) -> tuple[ValidationFinding, ...]:
+    remaining = target_findings(issue, parsed, patched)
+    return remaining or ()
+
+
+def _unnecessary_edit(
+    issue: Issue,
+    parsed: ParsedWorkbook,
+    block: ProblemBlock,
+    edits: Sequence[CellEdit],
+    extra: Sequence[CellEdit],
+) -> CellEdit | None:
+    """Find an edit outside the issue's cells that the repair did not actually need.
+
+    "Necessary" sounds like a judgment call, and stated as a question about intent it is
+    one. Stated as a question about consequences it is exactly decidable: drop the edit,
+    simulate what is left, and ask whether the issue is still resolved and nothing new is
+    broken. If both hold, the repair worked without that edit, so it was an unrelated
+    improvement travelling under the issue's authority.
+
+    Only run when the issue is mechanically checkable -- otherwise "still resolved" is
+    vacuously true and every extra edit would look unnecessary.
+    """
+    for candidate in extra:
+        reduced = [edit for edit in edits if edit is not candidate]
+        if not reduced:
+            # Dropping it leaves nothing, so it carried the whole repair.
+            continue
+        without = simulate_block(block, reduced)
+        if _still_present(issue, parsed, without):
+            continue
+        if _block_invariants_broken(without) or regressions_introduced(
+            parsed, block, without
+        ):
+            continue
+        return candidate
+    return None
+
+
+def _value_changed(issue: Issue, edits: Sequence[CellEdit]) -> tuple[CellEdit, str] | None:
+    """Catch a presentation repair that changed the mathematics.
+
+    SymPy is a gate here, never a proof. `EQUIVALENT` passes and `DIFFERENT` is refused,
+    but anything it cannot decide yields `UNKNOWN` and is **allowed through to the
+    reviewer** -- that is the whole point of having a reviewer, and refusing every
+    expression the parser does not understand would reject most correct LaTeX repairs.
+    """
+    if issue.category not in VALUE_PRESERVING_CATEGORIES:
+        return None
+
+    for edit in edits:
+        if edit.column_key not in MATHEMATICAL_COLUMNS:
+            continue
+        if edit.column_key is ColumnKey.MC_CHOICES:
+            failure = _choices_changed(edit)
+            if failure:
+                return edit, failure
+            continue
+        if not edit.before.strip() or not edit.after.strip():
+            # Adding or clearing a value is not a rewriting of one, so there is nothing
+            # to compare and no claim to check.
+            continue
+        if equations_equivalent(edit.before, edit.after) is MathVerdict.DIFFERENT:
+            return edit, (
+                f"{edit.before!r} and {edit.after!r} are not the same value"
+            )
+    return None
+
+
+def _choices_changed(edit: CellEdit) -> str | None:
+    before = [part.strip() for part in edit.before.split(MC_CHOICE_DELIMITER)]
+    after = [part.strip() for part in edit.after.split(MC_CHOICE_DELIMITER)]
+    if len(before) != len(after):
+        return (
+            f"the choice list goes from {len(before)} to {len(after)} choices, which is "
+            "a change of content rather than of notation"
+        )
+    for old, new in zip(before, after):
+        if old == new or not old or not new:
+            continue
+        if equations_equivalent(old, new) is MathVerdict.DIFFERENT:
+            return f"choice {old!r} would become {new!r}, which is a different value"
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -282,10 +420,24 @@ def validate_patch(
                 column=edit.column,
             )
 
-        if parsed.column_map.key_at(edit.column) is None:
+        actual_key = parsed.column_map.key_at(edit.column)
+        if actual_key is None:
             return _reject(
                 RejectionCode.CELL_NOT_FOUND,
                 f"column {edit.column} is not part of the workbook contract",
+                row=edit.row,
+                column=edit.column,
+            )
+
+        # The patch says both "column 5" and "answer", and everything downstream trusts
+        # one or the other: the file writer addresses the cell by index, while the scope
+        # and structural checks read the key. If they disagree the patch is checked
+        # against one cell and written to a different one.
+        if edit.column_key is not None and edit.column_key is not actual_key:
+            return _reject(
+                RejectionCode.COLUMN_KEY_MISMATCH,
+                f"the edit names column {edit.column_key.value} but column "
+                f"{edit.column} is {actual_key.value} in this workbook",
                 row=edit.row,
                 column=edit.column,
             )
@@ -311,6 +463,32 @@ def validate_patch(
                 "the patch changes a mathematical cell without stating how the new "
                 "value was derived",
             )
+
+    # Scope. The issue names the cells it is about; anything else has to be justified,
+    # and the justification is checked for substance further down by dropping the edit
+    # and seeing whether the repair still works.
+    #
+    # An issue that names *no* cells -- a block-scoped finding, a defect the auditor
+    # described without pinning to one cell -- is a different situation, not a stricter
+    # one. There is nothing to have deviated from, so demanding an explanation for the
+    # deviation asks the Writer to justify a patch against an empty baseline. Those edits
+    # still face the necessity test below; they are just not required to argue first.
+    named = set(issue.cells)
+    extra = [edit for edit in patch.edits if (edit.row, edit.column) not in named]
+    if named and extra and not patch.related_edits_reason.strip():
+        first = extra[0]
+        named = (
+            ", ".join(f"row {row} column {column}" for row, column in issue.cells)
+            or "no cell in particular"
+        )
+        return _reject(
+            RejectionCode.UNRELATED_CELL,
+            f"the patch edits row {first.row} column {first.column}, which the issue "
+            f"does not name (it concerns {named}), without saying why that cell is part "
+            "of the same repair",
+            row=first.row,
+            column=first.column,
+        )
 
     structural = [edit for edit in patch.edits if edit.is_structural]
     if structural and not issue.is_structural:
@@ -347,6 +525,17 @@ def validate_patch(
                 f"the structural patch does not conserve content: {failure}",
             )
 
+    changed = _value_changed(issue, patch.edits)
+    if changed:
+        edit, why = changed
+        return _reject(
+            RejectionCode.MATH_NOT_EQUIVALENT,
+            f"the issue is a {issue.category.value} issue -- about how the value is "
+            f"written, not what it is -- but {why}",
+            row=edit.row,
+            column=edit.column,
+        )
+
     regressions = regressions_introduced(parsed, block, patched)
     if regressions:
         worst = regressions[0]
@@ -363,6 +552,33 @@ def validate_patch(
             ),
             regressions=regressions,
         )
+
+    # Sufficiency, last, because every check above describes damage and this one only
+    # describes absence. A patch that breaks the block deserves to hear about that first.
+    before = target_findings(issue, parsed, block)
+    if before:
+        remaining = _still_present(issue, parsed, patched)
+        if remaining:
+            worst = remaining[0]
+            return _reject(
+                RejectionCode.ISSUE_NOT_RESOLVED,
+                f"the patch does not resolve the issue: {worst.code} is still raised at "
+                f"row {worst.row} after the edits are applied",
+                row=worst.row,
+                column=worst.column,
+                detail={"codes": [f.code for f in remaining]},
+            )
+
+        unnecessary = _unnecessary_edit(issue, parsed, block, patch.edits, extra)
+        if unnecessary is not None:
+            return _reject(
+                RejectionCode.UNRELATED_CELL,
+                f"the edit at row {unnecessary.row} column {unnecessary.column} was not "
+                "needed: the issue is resolved without it, so it is an unrelated change "
+                "travelling under this issue's authority",
+                row=unnecessary.row,
+                column=unnecessary.column,
+            )
 
     return GateResult()
 

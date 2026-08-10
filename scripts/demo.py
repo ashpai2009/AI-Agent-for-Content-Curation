@@ -160,6 +160,11 @@ def _writer_reply(db: Database, request) -> WriterResponse:
             reasoning="the answer is equal to a choice but written differently",
             derivation="1/2 and 0.5 are the same value; the choice list must match "
             "the answer exactly",
+            # The issue names the Answer cell; the repair belongs in mcChoices. The gate
+            # requires that deviation to be stated, and then checks that the edit was
+            # actually needed rather than taking the sentence on trust.
+            related_edits_reason="the answer is correct as written, so the choice list "
+            "is what has to change for one choice to match it exactly",
             edits=[
                 {
                     "row": row,

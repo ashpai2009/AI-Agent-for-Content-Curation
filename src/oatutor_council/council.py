@@ -73,11 +73,21 @@ from .persistence import (
     settle_attempt,
     transition_job,
 )
-from .reporting.ledger import actionable, dedupe, fingerprint, issue_from_finding
+from .reporting.ledger import (
+    actionable,
+    dedupe,
+    fingerprint,
+    issue_from_finding,
+    unresolved,
+)
 from .reporting.reports import build_reports, render_markdown
 from .state_machine import AttemptsExhausted, IssueMachine, advance_issue
 from .validation.final_gate import run_final_gate
-from .validation.patch_gate import rejection_consumes_attempt, validate_patch
+from .validation.patch_gate import (
+    rejection_consumes_attempt,
+    target_findings,
+    validate_patch,
+)
 from .validation.rules import run_rules
 from .workbook.reader import read_workbook
 from .workbook.writer import EditRejected, WorkingCopy, create_working_copy
@@ -105,6 +115,26 @@ class StepOutcome:
     did_work: bool
     description: str
     state: JobState
+
+
+@dataclass
+class Rediscovery:
+    """What a validation round did with its findings.
+
+    Kept as four separate counts rather than one total because they mean different
+    things: `reopened` is the council getting another go at a repair that did not hold,
+    while `absorbed` is a defect that has now defeated the council and is on its way to a
+    person. Collapsing them would make the report unable to tell a curator which happened.
+    """
+
+    opened: int = 0
+    reopened: int = 0
+    absorbed: int = 0
+    still_open: int = 0
+
+    @property
+    def needs_another_round(self) -> bool:
+        return bool(self.opened or self.reopened)
 
 
 class CurationCouncil:
@@ -382,20 +412,27 @@ class CurationCouncil:
             self.db, self.job_id, run_epoch=job.run_epoch, validation_rounds=1
         )
 
-        opened, absorbed = self._open_validation_issues(findings)
-        if absorbed:
+        found = self._open_validation_issues(findings)
+        if found.absorbed:
             # A defect the council already failed to repair three times. Opening it again
             # would hand it a fresh budget and loop; escalating is the honest outcome.
             record_event(
                 self.db, self.job_id, "finding_absorbed",
-                f"{absorbed} finding(s) match issues that are already terminal",
+                f"{found.absorbed} finding(s) match issues whose attempts are spent; "
+                "each is escalated to human review",
+            )
+        if found.reopened:
+            record_event(
+                self.db, self.job_id, "issue_reopened",
+                f"{found.reopened} accepted repair(s) did not hold and were reopened",
             )
 
-        if opened and round_no < self.settings.max_validation_rounds:
+        if found.needs_another_round and round_no < self.settings.max_validation_rounds:
             self._advance(JobState.REPAIRING_VALIDATION)
             return StepOutcome(
                 True,
-                f"validation round {round_no}: {opened} issue(s) reopened",
+                f"validation round {round_no}: {found.opened} new issue(s), "
+                f"{found.reopened} reopened",
                 JobState.REPAIRING_VALIDATION,
             )
 
@@ -432,10 +469,23 @@ class CurationCouncil:
             self.db, self.job_id, ArtifactKind.CORRECTED_WORKBOOK, str(corrected)
         )
 
-        succeeded = gate.passed and ledger.all_resolved
+        # Three conditions, and all three are load-bearing. Integrity says the output is
+        # an accounted-for descendant of the source. The ledger says every claim reached
+        # a good end. **The remaining findings say the workbook is actually fixed** --
+        # without which a job can close every issue it opened and still hand back a
+        # defective workbook marked succeeded, because the defect it never opened an
+        # issue for, or opened one and closed it wrongly, is invisible to the other two.
+        remaining = unresolved(gate.content_findings)
+        succeeded = gate.passed and ledger.all_resolved and not remaining
         final_state = (
             JobState.SUCCEEDED if succeeded else JobState.NEEDS_HUMAN_ATTENTION
         )
+        if remaining and gate.passed and ledger.all_resolved:
+            record_event(
+                self.db, self.job_id, "unresolved_findings",
+                f"every issue is resolved but {len(remaining)} finding(s) remain, "
+                f"starting with {remaining[0].code} at row {remaining[0].row}",
+            )
 
         reports = build_reports(
             job_id=self.job_id,
@@ -476,6 +526,28 @@ class CurationCouncil:
         if block is None:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, f"{issue.issue_id} has no block to repair", state)
+
+        # The defect may already be gone -- a repair to a sibling issue in this block can
+        # resolve this one on the way past. That is what `SUPERSEDED` is for, and asking
+        # the Writer to repair something that is no longer there costs a model call and
+        # gets back either an escalation or an invented change. Only decidable for an
+        # issue carrying a rule code; a semantic one still goes to the Writer.
+        #
+        # **Only before this issue's own first attempt.** Once the council has edited for
+        # it, the rule not firing is this issue's own work, and a reviewer who then asked
+        # for a revision has said the value is wrong even though the rule is satisfied.
+        # Superseding there would let a mechanically-clean but incorrect repair close the
+        # issue by silencing the reviewer -- the exact failure this whole section exists
+        # to prevent.
+        remaining = target_findings(issue, parsed, block)
+        if issue.attempts_used == 0 and remaining is not None and not remaining:
+            save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
+            record_event(
+                self.db, self.job_id, "issue_superseded",
+                f"{issue.issue_id}: {', '.join(issue.rule_codes)} no longer fires in "
+                f"{issue.problem_name}",
+            )
+            return StepOutcome(True, f"{issue.issue_id} no longer applies", state)
 
         # Reserved and committed BEFORE the call. Incrementing afterwards would let a
         # crash loop burn unbounded spend against a counter that never moves.
@@ -683,25 +755,47 @@ class CurationCouncil:
 
     def _open_validation_issues(
         self, findings: Sequence[ValidationFinding]
-    ) -> tuple[int, int]:
-        """Route by origin, and absorb anything already terminal.
+    ) -> Rediscovery:
+        """Route by origin, and decide what a rediscovered defect means.
 
         A finding on a block that had an original ledger entry goes back to the
-        Known-Issue Reviewer; everything else to the Independent Reviewer. A finding whose
-        fingerprint matches an issue that is already terminal opens nothing -- that is the
-        loop a naive implementation gets stuck in.
+        Known-Issue Reviewer; everything else to the Independent Reviewer.
+
+        The interesting case is a finding whose fingerprint matches an issue that is
+        already resolved -- the council fixed this, a reviewer accepted it, and the defect
+        is still here. **Silently absorbing that is how a job reports success over a
+        workbook it never repaired.** So:
+
+        * the issue is *reopened* while it still has attempts, because a rediscovered
+          defect is exactly the evidence that the accepted repair did not work;
+        * once its attempts are spent the rediscovery is absorbed -- opening it again
+          would hand it a fresh budget and loop -- but the issue is moved to
+          `NEEDS_HUMAN_REVIEW`, which durably denies the job success. Absorption stops
+          the loop; it never launders the defect.
         """
         from .persistence import fingerprint_states
 
         known_blocks = load_ledger(self.db, self.job_id).blocks_with_ledger_entry
-        existing = fingerprint_states(self.db, self.job_id)
-        opened = absorbed = 0
+        existing = {i.fingerprint: i for i in list_issues(self.db, self.job_id)}
+        result = Rediscovery()
 
         for finding in actionable(tuple(findings)):
             mark = fingerprint(finding)
-            if mark in existing:
-                absorbed += 1
+            seen = existing.get(mark)
+            if seen is not None:
+                if not seen.is_terminal:
+                    # Already in flight. It will be repaired or escalated on its own.
+                    result.still_open += 1
+                elif seen.state is IssueState.NEEDS_HUMAN_REVIEW:
+                    result.absorbed += 1
+                elif self.machine.can_attempt(seen):
+                    save_issue(self.db, self.machine.reopen(seen))
+                    result.reopened += 1
+                else:
+                    save_issue(self.db, self.machine.reopen(seen))
+                    result.absorbed += 1
                 continue
+
             role = (
                 ReviewerRole.KNOWN_ISSUE_REVIEWER
                 if finding.block_id in known_blocks
@@ -714,8 +808,8 @@ class CurationCouncil:
                 reviewer_role=role,
             )
             if insert_issue(self.db, issue) is not None:
-                opened += 1
-        return opened, absorbed
+                result.opened += 1
+        return result
 
 
 # --------------------------------------------------------------------------------------

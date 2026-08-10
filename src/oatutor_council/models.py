@@ -449,6 +449,11 @@ class Patch(BaseModel):
     edits: tuple[CellEdit, ...]
     reason: str = ""
     derivation: str = ""
+    #: Why cells the issue did not name are part of the same repair. Public, unlike the
+    #: three fields above: the gate reads it, and an unexplained edit outside the issue's
+    #: own cells is refused. A repair that genuinely needs a sibling cell can say so; an
+    #: unrelated improvement has nothing to write here.
+    related_edits_reason: str = ""
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     needs_human_review: bool = False
     human_review_reason: str = ""
@@ -487,6 +492,14 @@ class RejectionCode(StrEnum):
     UNRELATED_CELL = "UNRELATED_CELL"
     RULE_VIOLATION = "RULE_VIOLATION"
     NO_OP = "NO_OP"
+    #: The patch is well-formed, breaks nothing, and leaves the defect exactly where it
+    #: was. Without this the repair loop can close an issue by editing something else.
+    ISSUE_NOT_RESOLVED = "ISSUE_NOT_RESOLVED"
+    #: The row/column pair and the named column disagree, so the patch describes one cell
+    #: and would write another.
+    COLUMN_KEY_MISMATCH = "COLUMN_KEY_MISMATCH"
+    #: A repair to how a value is *written* changed what the value *is*.
+    MATH_NOT_EQUIVALENT = "MATH_NOT_EQUIVALENT"
     MISSING_MATH_VERIFICATION = "MISSING_MATH_VERIFICATION"
     DUPLICATE_CELL_EDIT = "DUPLICATE_CELL_EDIT"
     SCHEMA_INVALID = "SCHEMA_INVALID"

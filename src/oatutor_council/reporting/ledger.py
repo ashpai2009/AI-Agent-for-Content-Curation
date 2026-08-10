@@ -118,6 +118,34 @@ def actionable(findings: tuple[ValidationFinding, ...]) -> tuple[ValidationFindi
     )
 
 
+#: A finding this severe stands between the job and success whether or not anything can
+#: be done about it. A blocking defect the council *cannot* repair is precisely the case
+#: for `NEEDS_HUMAN_ATTENTION`, and reporting success over it would be the worst outcome
+#: available: the curator is told a workbook is fixed when nobody ever looked at it.
+UNRESOLVED_SEVERITIES = frozenset({Severity.BLOCKING, Severity.ERROR})
+
+
+def unresolved(findings: tuple[ValidationFinding, ...]) -> tuple[ValidationFinding, ...]:
+    """Findings that must prevent `SUCCEEDED`.
+
+    Deliberately wider than `actionable`. An actionable finding still present at the end
+    means the repair loop finished without fixing what it was opened for -- so every
+    actionable finding is here. But so is every blocking or erroneous finding the loop
+    never touched, because "no issue tracks it" is a statement about this system's
+    coverage, not about the workbook being sound.
+
+    Observations stay out: they are recorded in the report and were never claims that
+    anything is wrong. A non-repairable *warning* also stays out -- it is neither serious
+    enough to stop a job nor something the council was ever going to act on.
+    """
+    return tuple(
+        f
+        for f in findings
+        if f.severity in UNRESOLVED_SEVERITIES
+        or (f.repairable and f.severity in ACTIONABLE_SEVERITIES)
+    )
+
+
 def build_ledger(job_id: str, issues: tuple[Issue, ...]) -> IssueLedger:
     return IssueLedger(job_id=job_id, issues=issues)
 

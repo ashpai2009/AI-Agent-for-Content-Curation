@@ -97,6 +97,15 @@ class WriterResponse(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
     edits: list[WriterEdit] = Field(default_factory=list)
+    #: Public, and read by the gate. Required whenever the patch edits a cell the issue
+    #: did not name.
+    related_edits_reason: str = Field(
+        default="",
+        description=(
+            "If any edit is to a cell the issue did not name, why that cell is part of "
+            "the same repair. Leave empty when every edit is to a named cell."
+        ),
+    )
     needs_human_review: bool = False
     human_review_reason: str = ""
 

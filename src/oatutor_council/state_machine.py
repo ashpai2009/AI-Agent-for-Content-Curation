@@ -72,6 +72,13 @@ RESUMABLE_JOB_STATES: frozenset[JobState] = frozenset(
 # Issue machine
 # --------------------------------------------------------------------------------------
 
+#: Where a resolved issue may go when final validation finds its defect again. Back to
+#: the Writer if attempts remain, to a person if they do not -- and nowhere else, so a
+#: rediscovery can never quietly re-enter the pipeline at an earlier stage.
+_REOPENABLE: frozenset[IssueState] = frozenset(
+    {IssueState.REVISION_REQUESTED, IssueState.NEEDS_HUMAN_REVIEW}
+)
+
 #: `SUPERSEDED` is reachable from every non-terminal state: a later issue can subsume an
 #: earlier one at any point, and forcing it through the repair loop first would spend
 #: attempts on a defect that no longer exists independently.
@@ -92,9 +99,20 @@ _ISSUE_FLOW: dict[IssueState, frozenset[IssueState]] = {
     ),
     IssueState.REVISION_REQUESTED: frozenset({IssueState.AWAITING_PATCH}),
     IssueState.PATCH_REJECTED: frozenset({IssueState.AWAITING_PATCH}),
-    IssueState.ACCEPTED: frozenset(),
-    IssueState.REFUTED: frozenset(),
-    IssueState.SUPERSEDED: frozenset(),
+    # A resolved issue is reopenable, and only in these two directions. Final validation
+    # can rediscover the very defect an issue was closed for -- the repair looked right
+    # to a reviewer and did not hold, or a later edit in the same block undid it. Leaving
+    # those states with no way out is what forces the choice between silently absorbing
+    # the rediscovery and reporting success over it, and both of those are dishonest.
+    #
+    # This is the second cycle in the issue machine, and it is bounded by the same
+    # counter as the first: reopening never resets `attempts_used`, and the caller only
+    # reopens while attempts remain. `max_validation_rounds` bounds it again from outside.
+    IssueState.ACCEPTED: _REOPENABLE,
+    IssueState.REFUTED: _REOPENABLE,
+    IssueState.SUPERSEDED: _REOPENABLE,
+    # The one true dead end. An issue a person has to look at cannot be un-escalated by
+    # anything the council does next.
     IssueState.NEEDS_HUMAN_REVIEW: frozenset(),
 }
 
@@ -215,6 +233,20 @@ class IssueMachine:
         """Move an issue that ran out of attempts to human review."""
         assert_issue_transition(issue.state, IssueState.NEEDS_HUMAN_REVIEW)
         return issue.model_copy(update={"state": IssueState.NEEDS_HUMAN_REVIEW})
+
+    def reopen(self, issue: Issue) -> Issue:
+        """Take a resolved issue back, because its defect is still there.
+
+        Back to the Writer while attempts remain, to a person once they do not. The
+        attempt count is deliberately **not** reset: a reopened issue is the same issue,
+        and giving it a fresh budget is how the validation loop stops terminating.
+        """
+        target = (
+            IssueState.REVISION_REQUESTED
+            if self.can_attempt(issue)
+            else IssueState.NEEDS_HUMAN_REVIEW
+        )
+        return advance_issue(issue, target)
 
 
 def advance_issue(issue: Issue, target: IssueState) -> Issue:
