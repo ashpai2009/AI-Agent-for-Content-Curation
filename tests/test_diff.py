@@ -224,6 +224,53 @@ def test_an_edit_with_the_wrong_after_value_stays_unexplained(
     assert [d.dimension for d in unexplained] == [DiffDimension.CELL_VALUE]
 
 
+def test_a_cell_edited_twice_reconciles_against_the_net_effect(
+    feature_rich_workbook, tmp_path
+):
+    """The change log is a history and the diff is a net. A cell repaired once and then
+    revised after review carries two records while the workbook shows one difference;
+    matching records individually finds neither and fails a job that did exactly what it
+    was supposed to."""
+    from datetime import timedelta
+
+    output = mutate(
+        resaved(feature_rich_workbook, tmp_path / "out.xlsx"),
+        lambda wb, ws: ws.__setitem__("A1", "second correction"),
+    )
+    first = change(1, 1, "value", "first correction")
+    second = change(1, 1, "first correction", "second correction").model_copy(
+        update={"change_id": "c2", "applied_at": first.applied_at + timedelta(seconds=1)}
+    )
+
+    unexplained = reconcile(
+        compare_workbooks(feature_rich_workbook, output),
+        [first, second],
+        sheet_name="Main",
+    )
+    assert unexplained == ()
+
+
+def test_a_chain_of_edits_that_nets_to_nothing_expects_no_difference(
+    feature_rich_workbook, tmp_path
+):
+    """A value written and then written back leaves the workbook unchanged. Both records
+    are real and both appear in the change log; the gate must not demand a difference
+    that correctly does not exist."""
+    from datetime import timedelta
+
+    from oatutor_council.validation.final_gate import _changes_not_present
+
+    output = resaved(feature_rich_workbook, tmp_path / "out.xlsx")
+    first = change(1, 1, "value", "temporary")
+    second = change(1, 1, "temporary", "value").model_copy(
+        update={"change_id": "c2", "applied_at": first.applied_at + timedelta(seconds=1)}
+    )
+
+    differences = compare_workbooks(feature_rich_workbook, output)
+    assert differences == ()
+    assert _changes_not_present(differences, [first, second], "Main") == ()
+
+
 def test_an_unauthorised_change_elsewhere_survives_reconciliation(
     feature_rich_workbook, tmp_path
 ):

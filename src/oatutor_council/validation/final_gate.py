@@ -29,7 +29,12 @@ from ..models import (
     SourcePath,
     ValidationFinding,
 )
-from ..workbook.diff import WorkbookDifference, compare_workbooks, reconcile
+from ..workbook.diff import (
+    WorkbookDifference,
+    compare_workbooks,
+    net_changes,
+    reconcile,
+)
 from ..workbook.reader import read_workbook
 from ..workbook.writer import sha256_of
 from .rules import run_rules
@@ -194,11 +199,11 @@ def _changes_not_present(
         for d in differences
         if d.sheet == sheet_name and d.row is not None and d.column is not None
     }
+    # Compared per cell rather than per record, for the same reason `reconcile` is: a
+    # cell edited twice has two records and one net difference. A net effect of "no
+    # change" -- a value written and then written back -- correctly expects no difference.
     return tuple(
         change
-        for change in changes
-        if (change.row, change.column) not in changed_cells
-        # An edit whose before and after render identically leaves no difference, and
-        # `CellEdit` already refuses to be constructed that way.
-        and change.before != change.after
+        for cell, change in net_changes(changes).items()
+        if cell not in changed_cells and change.before != change.after
     )

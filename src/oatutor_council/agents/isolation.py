@@ -42,6 +42,14 @@ SHINGLE_SIZE = 12
 
 _TOKEN = re.compile(r"[A-Za-z0-9]+")
 
+#: Below this, a private string carries no argument worth protecting, and matching it
+#: produces false positives on ordinary vocabulary. A one-word derivation of `"d"` would
+#: otherwise match every payload containing the letter d in any word, and a two-word one
+#: would match any payload that happens to use the same two words. The leak this guard
+#: exists to stop -- a reviewer receiving the Writer's reasoning -- cannot fit in four
+#: tokens.
+MIN_PRIVATE_TOKENS = 5
+
 
 class ContextIsolationError(Exception):
     """Private reasoning reached a context that must not contain it."""
@@ -235,18 +243,21 @@ class TaintRegistry:
         if not self.entries:
             return
 
-        haystack = " ".join(_tokens(payload))
+        # Padded so containment matches on token boundaries. Without the padding, the
+        # private string `"d"` matches inside the word `"old"` and every payload is a
+        # violation.
+        haystack = f" {' '.join(_tokens(payload))} "
         payload_shingles = _shingles(_tokens(payload))
 
         for label, private in self.entries.items():
             private_tokens = _tokens(private)
-            if not private_tokens:
+            if len(private_tokens) < MIN_PRIVATE_TOKENS:
                 continue
 
-            # Short reasoning produces no shingles, so exact containment is the only
-            # check available for it -- and is sufficient, since there is little to
-            # paraphrase.
-            if " ".join(private_tokens) in haystack:
+            # Reasoning shorter than a shingle produces none, so exact containment is the
+            # only check available for it -- and is sufficient, since there is little to
+            # paraphrase in a sentence that short.
+            if f" {' '.join(private_tokens)} " in haystack:
                 raise ContextIsolationError(
                     f"{context} payload contains private text registered as {label!r}",
                     label=label,

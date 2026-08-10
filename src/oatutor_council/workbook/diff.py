@@ -464,6 +464,36 @@ def _compare(a: Workbook, b: Workbook) -> list[WorkbookDifference]:
 # --------------------------------------------------------------------------------------
 
 
+def net_changes(
+    changes: Iterable[ChangeRecord],
+) -> dict[tuple[int, int], ChangeRecord]:
+    """Collapse each cell's edit history into its net effect.
+
+    The change log is a *history* and the diff is a *net*, and conflating them fails a
+    perfectly good job. A cell repaired once and then revised after review carries two
+    records -- `'' -> '30'` and `'30' -> '31'` -- while the workbook shows a single
+    difference of `'' -> '31'`. Matching differences against individual records finds
+    neither, calls the change unexplained, and fails the integrity gate on a job that did
+    exactly what it was supposed to.
+
+    Every individual record still appears in the change log a curator reads: this is only
+    how the two views are compared.
+    """
+    ordered: dict[tuple[int, int], list[ChangeRecord]] = {}
+    for change in sorted(changes, key=lambda c: c.applied_at):
+        ordered.setdefault((change.row, change.column), []).append(change)
+
+    return {
+        cell: history[0].model_copy(
+            update={
+                "after": history[-1].after,
+                "column_key": history[-1].column_key,
+            }
+        )
+        for cell, history in ordered.items()
+    }
+
+
 def reconcile(
     differences: Iterable[WorkbookDifference],
     changes: Iterable[ChangeRecord],
@@ -479,7 +509,7 @@ def reconcile(
     The asymmetry is deliberate. An unexplained difference is either a bug or damage,
     and there is no third possibility worth a category of its own.
     """
-    ledger = {(c.row, c.column): c for c in changes}
+    ledger = net_changes(changes)
     edited_rows = {c.row for c in ledger.values()}
     unexplained: list[WorkbookDifference] = []
 

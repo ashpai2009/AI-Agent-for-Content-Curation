@@ -213,6 +213,17 @@ CREATE TABLE IF NOT EXISTS private_blobs (
     text       TEXT NOT NULL
 );
 
+-- Which blocks each phase has finished with. A block audited with zero findings leaves
+-- no issue behind, so without this row the phase could not tell "already examined" from
+-- "not yet reached" and would re-audit it on every resume.
+CREATE TABLE IF NOT EXISTS block_progress (
+    job_id   TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    block_id TEXT NOT NULL,
+    phase    TEXT NOT NULL,
+    at       TEXT NOT NULL,
+    PRIMARY KEY (job_id, block_id, phase)
+);
+
 CREATE TABLE IF NOT EXISTS job_events (
     event_id   TEXT PRIMARY KEY,
     job_id     TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -673,6 +684,22 @@ def insert_attempt(db: Database, attempt: RepairAttempt) -> None:
         )
 
 
+def next_attempt_number(db: Database, issue_id: str) -> int:
+    """The next sequence number for this issue's attempts.
+
+    Deliberately **not** `attempts_used + 1`. Those are different quantities: the budget
+    can be refunded when an attempt is lost to infrastructure, but the sequence number
+    records what actually happened and must keep climbing, or a refunded attempt collides
+    with the row already written for the one it replaces.
+    """
+    row = db.connection.execute(
+        "SELECT COALESCE(MAX(attempt_no), 0) AS highest FROM repair_attempts "
+        "WHERE issue_id = ?",
+        (issue_id,),
+    ).fetchone()
+    return row["highest"] + 1
+
+
 def settle_attempt(db: Database, attempt: RepairAttempt) -> None:
     with db.write() as connection:
         connection.execute(
@@ -956,6 +983,23 @@ def list_artifacts(db: Database, job_id: str) -> dict[ArtifactKind, str]:
         "SELECT kind, relative_path FROM job_artifacts WHERE job_id = ?", (job_id,)
     ).fetchall()
     return {ArtifactKind(row["kind"]): row["relative_path"] for row in rows}
+
+
+def mark_block_done(db: Database, job_id: str, block_id: str, phase: str) -> None:
+    with db.write() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO block_progress (job_id, block_id, phase, at) "
+            "VALUES (?,?,?,?)",
+            (job_id, block_id, phase, _iso(_now())),
+        )
+
+
+def blocks_done(db: Database, job_id: str, phase: str) -> frozenset[str]:
+    rows = db.connection.execute(
+        "SELECT block_id FROM block_progress WHERE job_id = ? AND phase = ?",
+        (job_id, phase),
+    ).fetchall()
+    return frozenset(row["block_id"] for row in rows)
 
 
 def record_event(db: Database, job_id: str, kind: str, detail: str = "") -> None:
