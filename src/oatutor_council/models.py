@@ -272,6 +272,9 @@ class WorkbookRow(BaseModel):
     values: dict[ColumnKey, str] = Field(default_factory=dict)
     raw: dict[ColumnKey, Any] = Field(default_factory=dict, exclude=True)
     is_blank: bool = False
+    #: Columns on this row with wrap enabled. Carried here so the appearance rules stay
+    #: pure functions over the parsed model rather than reaching back into openpyxl.
+    wrap_text_columns: tuple[int, ...] = ()
 
     def get(self, key: ColumnKey) -> str:
         return self.values.get(key, "")
@@ -380,6 +383,7 @@ class ParsedWorkbook(BaseModel):
     column_map: ColumnMap
     blocks: tuple[ProblemBlock, ...]
     orphan_rows: tuple[WorkbookRow, ...] = ()
+    row_heights: dict[int, float] = Field(default_factory=dict)
     conventions: WorkbookConventions = WorkbookConventions()
     findings: tuple[ValidationFinding, ...] = ()
 

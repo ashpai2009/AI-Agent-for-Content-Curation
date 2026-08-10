@@ -56,6 +56,16 @@ _IDENTIFIER_PATTERN = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 _LATEX_MARKERS = ("$$", "\\frac", "\\sqrt", "\\theta", "\\pi", "\\left", "\\right")
 
+#: The columns that are pure mathematics, and therefore the only reliable evidence of
+#: which notation a workbook is written in. Titles and body text are prose in *both*
+#: conventions: including them drags the one genuinely LaTeX workbook in the corpus down
+#: to a 0.55 ratio and misclassifies it, while these two columns alone separate it
+#: cleanly at 0.83 against 0.00 everywhere else.
+_NOTATION_COLUMNS = (ColumnKey.ANSWER, ColumnKey.MC_CHOICES)
+
+#: Share of those cells that must be LaTeX before the whole workbook counts as LaTeX.
+_LATEX_MAJORITY = 0.6
+
 
 class WorkbookReadError(Exception):
     """The file could not be interpreted as an OATutor workbook at all.
@@ -228,11 +238,21 @@ def _read_row(sheet: Worksheet, row: int, column_map: ColumnMap, width: int) -> 
         native = sheet.cell(row=row, column=column).value
         raw[key] = native
         values[key] = render_cell(native)
-    is_blank = not any(
-        render_cell(sheet.cell(row=row, column=column).value).strip()
-        for column in range(1, width + 1)
+    is_blank = True
+    wrapped: list[int] = []
+    for column in range(1, width + 1):
+        cell = sheet.cell(row=row, column=column)
+        if render_cell(cell.value).strip():
+            is_blank = False
+        if cell.alignment.wrap_text:
+            wrapped.append(column)
+    return WorkbookRow(
+        row=row,
+        values=values,
+        raw=raw,
+        is_blank=is_blank,
+        wrap_text_columns=tuple(wrapped),
     )
-    return WorkbookRow(row=row, values=values, raw=raw, is_blank=is_blank)
 
 
 # --------------------------------------------------------------------------------------
@@ -519,7 +539,11 @@ def detect_conventions(blocks: Iterable[ProblemBlock]) -> WorkbookConventions:
         current: list[int] | None = None
 
         for row in block.rows:
-            for text in row.values.values():
+            # Only the columns that carry mathematics or rendered prose count. Including
+            # names, row types and metadata would dilute the ratio so far that a workbook
+            # written entirely in LaTeX still looks mostly ASCII.
+            for key in _NOTATION_COLUMNS:
+                text = row.get(key)
                 if not text.strip():
                     continue
                 text_cells += 1
@@ -555,9 +579,13 @@ def detect_conventions(blocks: Iterable[ProblemBlock]) -> WorkbookConventions:
     else:
         convention = DependencyConvention.UNDECIDED
 
+    # A workbook is LaTeX when it is overwhelmingly LaTeX, ASCII when it contains none at
+    # all, and MIXED otherwise. MIXED is a *defect state*, not a third valid convention:
+    # both real conventions are internally consistent, so a workbook sitting between them
+    # has cells written in the wrong one, which is what the notation rules then report.
     if latex_cells == 0:
         notation = Notation.ASCII if text_cells else Notation.UNKNOWN
-    elif latex_cells >= max(1, text_cells // 10):
+    elif latex_cells >= _LATEX_MAJORITY * text_cells:
         notation = Notation.LATEX
     else:
         notation = Notation.MIXED
@@ -633,6 +661,11 @@ def read_workbook(path: str | Path) -> ParsedWorkbook:
             column_map=column_map,
             blocks=blocks,
             orphan_rows=orphans,
+            row_heights={
+                index: dimension.height
+                for index, dimension in sheet.row_dimensions.items()
+                if dimension.height is not None
+            },
             conventions=detect_conventions(blocks),
             findings=tuple(findings),
         )
