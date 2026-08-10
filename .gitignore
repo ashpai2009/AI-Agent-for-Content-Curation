@@ -8,6 +8,10 @@ __pycache__/
 # Secrets
 .env
 
+# Local agent briefing. Kept out of the repo by choice; it describes machine
+# specific paths to the real curator corpus.
+CLAUDE.md
+
 # --- Curator data must never be committed -----------------------------------
 # Real workbooks, instruction documents, extracted text, and anything the
 # pipeline produces from them stay strictly local. Fixtures used by the test
