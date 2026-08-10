@@ -300,6 +300,89 @@ def test_an_instruction_document_seeds_the_job(client, workbook_bytes, tmp_path)
     assert response.json()["instruction_filename"] == "notes.md"
 
 
+def test_the_instructions_are_durable_before_the_job_is_queued(
+    client, workbook_bytes, tmp_path
+):
+    """The claims exist in the database by the time any worker could pick the job up.
+
+    Passing them to the runner instead means a job resumed by another process audits
+    against no instructions -- and that failure is silent, because a job with zero claims
+    looks exactly like a job whose claims were all refuted.
+    """
+    from oatutor_council.persistence import load_instruction_segments
+
+    notes = write_markdown(tmp_path / "notes.md").read_bytes()
+    job_id = submit(
+        client, workbook_bytes, instructions=("notes.md", notes, "text/markdown")
+    ).json()["job_id"]
+
+    database = Database(client.app_settings.data_root / "council.db")
+    segments = load_instruction_segments(database, job_id)
+    assert segments
+    assert all(s["text"].strip() for s in segments)
+    assert all(s["provenance"] for s in segments)
+    assert len({s["document_sha256"] for s in segments}) == 1
+    assert [s["segment_index"] for s in segments] == sorted(
+        s["segment_index"] for s in segments
+    )
+
+
+def test_a_council_built_fresh_reads_the_same_instructions(
+    client, workbook_bytes, tmp_path
+):
+    """The resume case, stated directly: a council constructed with no knowledge of the
+    upload finds the same claims, because the only place they ever lived is the
+    database."""
+    from oatutor_council.council import CurationCouncil
+    from oatutor_council.workbook.writer import WorkingCopy
+    from oatutor_council.models import SourcePath
+
+    notes = write_markdown(tmp_path / "notes.md").read_bytes()
+    job_id = submit(
+        client, workbook_bytes, instructions=("notes.md", notes, "text/markdown")
+    ).json()["job_id"]
+
+    root = client.app_settings.data_root
+    database = Database(root / "council.db")
+    council = CurationCouncil(
+        db=database,
+        settings=client.app_settings,
+        client=mock_client(client.app_settings),
+        job_id=job_id,
+        copy=WorkingCopy(
+            source=SourcePath(str(root / job_id / "source" / "workbook.xlsx")),
+            source_sha256="",
+            path=root / job_id / "work" / "working.xlsx",
+            tmp_dir=root / job_id / "work" / ".tmp",
+        ),
+    )
+    assert len(council.seed_claims) > 0
+    assert all(claim.text.strip() for claim in council.seed_claims)
+
+
+def test_an_instruction_document_that_changes_under_the_job_is_refused(
+    client, workbook_bytes, tmp_path
+):
+    """The same argument as the source hash. A job's conclusions are only meaningful
+    against the inputs it was given, and every stored claim cites provenance in a file
+    that would no longer exist."""
+    notes = write_markdown(tmp_path / "notes.md").read_bytes()
+    job_id = submit(
+        client, workbook_bytes, instructions=("notes.md", notes, "text/markdown")
+    ).json()["job_id"]
+
+    root = client.app_settings.data_root
+    (root / job_id / "source" / "instructions.md").write_text(
+        "Something else entirely.", encoding="utf-8"
+    )
+
+    client.post(f"/jobs/{job_id}/resume")
+    _wait_for_terminal(client, job_id)
+    status = client.get(f"/jobs/{job_id}").json()
+    assert status["state"] == "failed"
+    assert status["failure_reason"] == "corruption"
+
+
 def test_an_image_only_pdf_is_a_clear_error_and_starts_no_job(
     client, workbook_bytes, tmp_path
 ):

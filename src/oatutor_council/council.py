@@ -35,6 +35,7 @@ from .config import Settings
 from .llm.base import LLMClient, ProviderConfigurationError, ProviderError
 from .models import (
     ArtifactKind,
+    ClaimOutcome,
     AttemptOutcome,
     CurationJob,
     FailureReason,
@@ -62,11 +63,15 @@ from .persistence import (
     insert_patch,
     insert_verdict,
     list_changes,
+    list_artifacts,
+    list_claim_results,
     list_issues,
+    load_instruction_segments,
     load_ledger,
     mark_block_done,
     next_attempt_number,
     record_artifact,
+    record_claim_result,
     record_event,
     record_findings,
     save_issue,
@@ -90,7 +95,12 @@ from .validation.patch_gate import (
 )
 from .validation.rules import run_rules
 from .workbook.reader import read_workbook
-from .workbook.writer import EditRejected, WorkingCopy, create_working_copy
+from .workbook.writer import (
+    EditRejected,
+    WorkingCopy,
+    create_working_copy,
+    sha256_of,
+)
 
 #: States an issue can be picked up from for another Writer call.
 _NEEDS_WRITER = frozenset(
@@ -149,7 +159,6 @@ class CurationCouncil:
         job_id: str,
         copy: WorkingCopy,
         worker_id: str = "worker",
-        seed_claims: Sequence[initial_auditor.SeedClaim] = (),
     ) -> None:
         self.db = db
         self.settings = settings
@@ -157,7 +166,6 @@ class CurationCouncil:
         self.job_id = job_id
         self.copy = copy
         self.worker_id = worker_id
-        self.seed_claims = tuple(seed_claims)
         self.machine = IssueMachine(
             max_attempts=settings.max_repair_attempts,
             interrupted_retry_budget=settings.interrupted_retry_budget,
@@ -172,6 +180,25 @@ class CurationCouncil:
     @property
     def job(self) -> CurationJob:
         return get_job(self.db, self.job_id)
+
+    @property
+    def seed_claims(self) -> tuple[initial_auditor.SeedClaim, ...]:
+        """The curator's claims, read from the database every time they are needed.
+
+        **Never held in worker memory.** Instructions that live only in the process that
+        accepted the upload are instructions a resumed job does not have -- and the
+        failure is silent, because a job auditing against zero claims looks exactly like
+        a job whose claims were all refuted. A curator who reported a defect would be
+        told it was checked and was not there.
+        """
+        return tuple(
+            initial_auditor.SeedClaim(
+                index=row["segment_index"],
+                text=row["text"],
+                provenance=row["provenance"],
+            )
+            for row in load_instruction_segments(self.db, self.job_id)
+        )
 
     def source_workbook(self) -> ParsedWorkbook:
         """The workbook as submitted. Parsed once: the source cannot change."""
@@ -283,6 +310,8 @@ class CurationCouncil:
             self.db, self.job, self.copy, self.machine, list_issues(self.db, self.job_id)
         )
 
+        self._verify_instructions()
+
         parsed = self.current_workbook()
         findings = dedupe(tuple(run_rules(parsed)) + parsed.all_findings)
         opened = self._open_issues(findings, source=IssueSource.INITIAL_AUDITOR)
@@ -318,11 +347,7 @@ class CurationCouncil:
             taint=self.taint,
         )
         opened = self._open_issues(result.findings, source=IssueSource.INITIAL_AUDITOR)
-        for refuted in result.refuted:
-            record_event(
-                self.db, self.job_id, "claim_refuted",
-                f"claim {refuted.claim_index}: {refuted.why}",
-            )
+        self._record_claim_verdicts(block.block_id, result)
         mark_block_done(self.db, self.job_id, block.block_id, "audited")
         return StepOutcome(
             True,
@@ -505,6 +530,8 @@ class CurationCouncil:
             attempts=_attempts(self.db, self.job_id),
             findings=gate.content_findings,
             integrity_findings=gate.integrity_findings,
+            claims=load_instruction_segments(self.db, self.job_id),
+            claim_results=list_claim_results(self.db, self.job_id),
         )
         report_path = outputs / "report.md"
         report_path.write_text(render_markdown(reports), encoding="utf-8")
@@ -742,6 +769,66 @@ class CurationCouncil:
             sorted(LIVE_ISSUE_STATES, key=str),
             reviewer_role=role.value if role else None,
         )
+
+    def _verify_instructions(self) -> None:
+        """The instruction file must still be the one that was read.
+
+        The same argument as the source-hash check, for the same reason: a job's
+        conclusions are only meaningful against the inputs it was given. If the document
+        changed on disk after its segments were extracted, every claim in the database
+        describes a file that no longer exists, and auditing against them would produce a
+        report citing provenance that is now wrong.
+
+        Treated as corruption rather than bad input, so it is not resumable -- resuming
+        would re-read the same mismatched pair and reach the same place.
+        """
+        segments = load_instruction_segments(self.db, self.job_id)
+        if not segments:
+            return
+        expected = segments[0].get("document_sha256") or ""
+        path = list_artifacts(self.db, self.job_id).get(
+            ArtifactKind.INSTRUCTION_DOCUMENT
+        )
+        if not expected or path is None or not Path(path).is_file():
+            return
+        actual = sha256_of(Path(path))
+        if actual != expected:
+            raise JobCorrupted(
+                "the instruction document changed on disk after its contents were "
+                f"read: expected {expected[:12]}, found {actual[:12]}"
+            )
+
+    def _record_claim_verdicts(self, block_id: str, result) -> None:
+        """What this block concluded about each of the curator's claims.
+
+        Structured rows rather than event lines. The final report has to tell a curator
+        whether the defect they described was found, or looked for and not there, and a
+        free-text log entry cannot be counted, grouped, or shown per claim.
+
+        Only blocks that said something are recorded. A claim no block mentions is
+        *unresolved*, and the difference between that and refuted matters: refuted means
+        somebody looked, unresolved means nobody did.
+        """
+        for finding in result.findings:
+            index = finding.detail.get("confirms_claim")
+            if index is not None:
+                record_claim_result(
+                    self.db,
+                    self.job_id,
+                    segment_index=int(index),
+                    block_id=block_id,
+                    outcome=ClaimOutcome.CONFIRMED,
+                    detail=finding.message,
+                )
+        for refuted in result.refuted:
+            record_claim_result(
+                self.db,
+                self.job_id,
+                segment_index=refuted.claim_index,
+                block_id=block_id,
+                outcome=ClaimOutcome.REFUTED,
+                detail=refuted.why,
+            )
 
     def _findings_for_block(
         self, parsed: ParsedWorkbook, block: ProblemBlock

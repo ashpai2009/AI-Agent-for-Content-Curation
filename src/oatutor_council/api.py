@@ -28,7 +28,6 @@ from uuid import uuid4
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from .agents.initial_auditor import SeedClaim
 from .config import ConfigurationError, Settings, load_settings
 from .council import CurationCouncil
 from .ingestion.instruction_documents import (
@@ -45,13 +44,16 @@ from .persistence import (
     get_job,
     list_artifacts,
     list_changes,
+    list_claim_results,
     list_events,
     list_issues,
     list_verdicts,
+    load_instruction_segments,
     load_ledger,
     record_artifact,
     record_event,
     release_lease,
+    save_instruction_segments,
 )
 from .reporting.reports import build_reports
 from .state_machine import is_resumable
@@ -63,7 +65,7 @@ from .uploads import (
     check_archive,
     validate_upload,
 )
-from .workbook.writer import create_working_copy
+from .workbook.writer import create_working_copy, sha256_of
 
 log = logging.getLogger(__name__)
 
@@ -93,10 +95,10 @@ class JobRunner:
             max_workers=settings.max_concurrent_jobs, thread_name_prefix="council"
         )
 
-    def submit(self, job_id: str, job_dir: Path, seed_claims=()) -> None:
-        self._pool.submit(self._run, job_id, job_dir, tuple(seed_claims))
+    def submit(self, job_id: str, job_dir: Path) -> None:
+        self._pool.submit(self._run, job_id, job_dir)
 
-    def _run(self, job_id: str, job_dir: Path, seed_claims) -> None:
+    def _run(self, job_id: str, job_dir: Path) -> None:
         worker = f"{job_id[:8]}-{uuid4().hex[:6]}"
         try:
             job = acquire_lease(
@@ -115,7 +117,6 @@ class JobRunner:
                 job_id=job_id,
                 copy=copy,
                 worker_id=worker,
-                seed_claims=seed_claims,
             )
             council.run()
         except (ConfigurationError, ProviderConfigurationError) as error:
@@ -315,7 +316,8 @@ def create_app(
         source_path.write_bytes(workbook_bytes)
         check_archive(source_path, checked.extension)
 
-        seed_claims: list[SeedClaim] = []
+        parsed_document = None
+        document_path: Path | None = None
         instruction_name: str | None = None
         if instructions is not None and instructions.filename:
             document_bytes = await instructions.read()
@@ -330,14 +332,9 @@ def create_app(
             document_path.write_bytes(document_bytes)
             check_archive(document_path, document.extension)
 
-            parsed = read_instruction_document(
+            parsed_document = read_instruction_document(
                 document_path, display_name=document.display_name
             )
-            seed_claims = [
-                SeedClaim(index=segment.index, text=segment.text,
-                          provenance=segment.provenance)
-                for segment in parsed.segments
-            ]
             instruction_name = document.display_name
 
         copy = create_working_copy(SourcePath(str(source_path)), job_dir)
@@ -354,15 +351,39 @@ def create_app(
             database, job_id, ArtifactKind.SOURCE_WORKBOOK, str(source_path)
         )
 
+        # The document is decomposed and stored **before the job is queued**, so the
+        # claims exist durably by the time any worker can pick it up. Passing them to
+        # the runner instead would mean a job resumed by a different process audits
+        # against no instructions at all -- and that failure is silent, because a job
+        # with zero claims looks exactly like a job whose claims were all refuted.
+        seed_claim_count = 0
+        if parsed_document is not None and document_path is not None:
+            document_hash = sha256_of(document_path)
+            seed_claim_count = save_instruction_segments(
+                database,
+                job_id,
+                segments=parsed_document.segments,
+                document_format=parsed_document.format.value,
+                document_sha256=document_hash,
+                truncated=parsed_document.truncated,
+            )
+            record_artifact(
+                database,
+                job_id,
+                ArtifactKind.INSTRUCTION_DOCUMENT,
+                str(document_path),
+                sha256=document_hash,
+            )
+
         if app.state.autostart:
-            app.state.runner.submit(job_id, job_dir, seed_claims)
+            app.state.runner.submit(job_id, job_dir)
 
         return {
             "job_id": job.job_id,
             "state": job.state.value,
             "source_filename": job.source_filename,
             "instruction_filename": job.instruction_filename,
-            "seed_claims": len(seed_claims),
+            "seed_claims": seed_claim_count,
         }
 
     # -- observation ------------------------------------------------------------------
@@ -427,6 +448,8 @@ def create_app(
             verdicts=list_verdicts(database, job_id),
             attempts=list_attempts(database, job_id),
             findings=(),
+            claims=load_instruction_segments(database, job_id),
+            claim_results=list_claim_results(database, job_id),
         )
 
     @app.get("/jobs/{job_id}/download")

@@ -881,6 +881,20 @@ NON_RESUMABLE_FAILURES: frozenset[FailureReason] = frozenset(
 )
 
 
+class ClaimOutcome(StrEnum):
+    """What became of one statement from the curator's document.
+
+    `REFUTED` and `UNRESOLVED` are deliberately different answers. Refuted means a block
+    was asked about the claim and reported that the defect is not there; unresolved means
+    nothing ever reached a conclusion about it. Collapsing them would tell a curator
+    their report was checked and dismissed when in fact it was never read.
+    """
+
+    CONFIRMED = "confirmed"
+    REFUTED = "refuted"
+    UNRESOLVED = "unresolved"
+
+
 class ArtifactKind(StrEnum):
     SOURCE_WORKBOOK = "source_workbook"
     INSTRUCTION_DOCUMENT = "instruction_document"

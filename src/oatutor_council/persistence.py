@@ -224,6 +224,40 @@ CREATE TABLE IF NOT EXISTS block_progress (
     PRIMARY KEY (job_id, block_id, phase)
 );
 
+-- The curator's instruction document, decomposed. Held here rather than in the worker
+-- because a job that resumes on another process must audit against the *same*
+-- instructions: seed claims living only in worker memory means a resumed job silently
+-- audits against none, and reports "no issues found" for a document nobody read.
+--
+-- `document_sha256` is stored per segment so the file cannot be swapped mid-job without
+-- the change being visible against what was actually read.
+CREATE TABLE IF NOT EXISTS instruction_segments (
+    job_id          TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    segment_index   INTEGER NOT NULL,
+    text            TEXT NOT NULL,
+    provenance      TEXT NOT NULL DEFAULT '',
+    document_format TEXT NOT NULL DEFAULT '',
+    document_sha256 TEXT NOT NULL DEFAULT '',
+    truncated       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (job_id, segment_index)
+);
+
+-- What each block concluded about each claim. Structured records rather than log lines:
+-- the final report has to tell a curator that the defect they described was found, or
+-- looked for and not there, and a free-text event cannot be counted or grouped.
+--
+-- Keyed by (job, claim, block) so re-auditing a block after a crash overwrites its own
+-- verdict instead of appending a second one.
+CREATE TABLE IF NOT EXISTS claim_results (
+    job_id        TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    segment_index INTEGER NOT NULL,
+    block_id      TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    detail        TEXT NOT NULL DEFAULT '',
+    at            TEXT NOT NULL,
+    PRIMARY KEY (job_id, segment_index, block_id)
+);
+
 CREATE TABLE IF NOT EXISTS job_events (
     event_id   TEXT PRIMARY KEY,
     job_id     TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -1000,6 +1034,97 @@ def blocks_done(db: Database, job_id: str, phase: str) -> frozenset[str]:
         (job_id, phase),
     ).fetchall()
     return frozenset(row["block_id"] for row in rows)
+
+
+# --------------------------------------------------------------------------------------
+# Instruction documents and the claims they carry
+# --------------------------------------------------------------------------------------
+
+
+def save_instruction_segments(
+    db: Database,
+    job_id: str,
+    *,
+    segments: Sequence[Any],
+    document_format: str,
+    document_sha256: str,
+    truncated: bool = False,
+) -> int:
+    """Store the decomposed document. Idempotent, keyed by segment index.
+
+    Written once at submission, before the job is queued, so a worker that picks the job
+    up -- the first one or the fourth after three crashes -- reads the same instructions
+    from the same place. There is no path by which a resumed job audits against fewer
+    claims than the original did.
+    """
+    with db.write() as connection:
+        for segment in segments:
+            connection.execute(
+                """INSERT INTO instruction_segments
+                       (job_id, segment_index, text, provenance, document_format,
+                        document_sha256, truncated)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(job_id, segment_index) DO UPDATE SET
+                       text = excluded.text,
+                       provenance = excluded.provenance""",
+                (
+                    job_id,
+                    segment.index,
+                    segment.text,
+                    segment.provenance,
+                    document_format,
+                    document_sha256,
+                    1 if truncated else 0,
+                ),
+            )
+    return len(segments)
+
+
+def load_instruction_segments(db: Database, job_id: str) -> tuple[dict[str, Any], ...]:
+    rows = db.connection.execute(
+        """SELECT segment_index, text, provenance, document_format, document_sha256,
+                  truncated
+           FROM instruction_segments WHERE job_id = ? ORDER BY segment_index""",
+        (job_id,),
+    ).fetchall()
+    return tuple(dict(row) for row in rows)
+
+
+def record_claim_result(
+    db: Database,
+    job_id: str,
+    *,
+    segment_index: int,
+    block_id: str,
+    outcome: str,
+    detail: str = "",
+) -> None:
+    """One block's verdict on one claim.
+
+    `INSERT OR REPLACE` rather than append: a block re-audited after a crash must end up
+    with one verdict, not two. Which is also why the key is (job, claim, block) and not a
+    surrogate id -- the natural key *is* the identity of the judgment.
+    """
+    with db.write() as connection:
+        connection.execute(
+            """INSERT INTO claim_results
+                   (job_id, segment_index, block_id, outcome, detail, at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(job_id, segment_index, block_id) DO UPDATE SET
+                   outcome = excluded.outcome,
+                   detail = excluded.detail,
+                   at = excluded.at""",
+            (job_id, segment_index, block_id, outcome, detail, _iso(_now())),
+        )
+
+
+def list_claim_results(db: Database, job_id: str) -> tuple[dict[str, Any], ...]:
+    rows = db.connection.execute(
+        """SELECT segment_index, block_id, outcome, detail, at FROM claim_results
+           WHERE job_id = ? ORDER BY segment_index, block_id""",
+        (job_id,),
+    ).fetchall()
+    return tuple(dict(row) for row in rows)
 
 
 def record_event(db: Database, job_id: str, kind: str, detail: str = "") -> None:

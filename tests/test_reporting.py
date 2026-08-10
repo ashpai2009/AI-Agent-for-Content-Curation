@@ -306,3 +306,83 @@ def test_markdown_renders_the_outcome_and_the_changes(reports):
     assert "## Needs a person" in text
     assert "`2026-01-02 00:00:00`" in text
     assert "## Changes applied" in text
+
+
+# --------------------------------------------------------------------------------------
+# The curator's own claims
+# --------------------------------------------------------------------------------------
+
+
+def claim(index: int, text: str = "Problem 3 has the wrong answer"):
+    return {"segment_index": index, "text": text, "provenance": f"line {index + 1}"}
+
+
+def verdict(index: int, block: str, outcome: str, detail: str = ""):
+    return {
+        "segment_index": index,
+        "block_id": block,
+        "outcome": outcome,
+        "detail": detail,
+    }
+
+
+def test_every_supplied_claim_appears_in_the_report():
+    """Driven from the claims, not the results. Iterating the results would silently
+    omit any claim nothing concluded about -- exactly the ones a curator needs to know
+    were never reached."""
+    from oatutor_council.reporting.reports import resolve_claims
+
+    resolved = resolve_claims([claim(0), claim(1), claim(2)], [])
+    assert [c["outcome"] for c in resolved] == ["unresolved"] * 3
+
+
+def test_a_confirmation_anywhere_settles_a_claim():
+    """A defect exists if any block has it. The thirty blocks that do not are not
+    evidence against the one that does."""
+    from oatutor_council.reporting.reports import resolve_claims
+
+    resolved = resolve_claims(
+        [claim(0)],
+        [
+            verdict(0, "block-1", "refuted", "not here"),
+            verdict(0, "block-2", "confirmed", "the answer is 1/2, not 2"),
+            verdict(0, "block-3", "refuted", "not here either"),
+        ],
+    )
+    assert resolved[0]["outcome"] == "confirmed"
+    assert resolved[0]["detail"] == "the answer is 1/2, not 2"
+    assert resolved[0]["blocks_considered"] == 3
+
+
+def test_refuted_and_unresolved_are_different_answers():
+    """Refuted means a block looked and the defect was not there. Unresolved means
+    nothing reached a conclusion. Collapsing them tells a curator their report was
+    checked and dismissed when in fact it was never read."""
+    from oatutor_council.reporting.reports import resolve_claims
+
+    resolved = resolve_claims(
+        [claim(0), claim(1)], [verdict(0, "block-1", "refuted", "checked, absent")]
+    )
+    assert [c["outcome"] for c in resolved] == ["refuted", "unresolved"]
+    assert resolved[0]["blocks_considered"] == 1
+    assert resolved[1]["blocks_considered"] == 0
+
+
+def test_the_markdown_report_lists_every_claim_including_the_unread_ones():
+    from oatutor_council.reporting.reports import build_reports, render_markdown
+
+    reports = build_reports(
+        job_id="job-1",
+        state=JobState.SUCCEEDED,
+        ledger=IssueLedger(job_id="job-1", issues=()),
+        changes=(),
+        verdicts=(),
+        attempts=(),
+        findings=(),
+        claims=[claim(0, "Problem 3 is wrong"), claim(1, "Problem 9 is wrong")],
+        claim_results=[verdict(0, "block-1", "confirmed", "found it")],
+    )
+    text = render_markdown(reports)
+    assert "Problem 3 is wrong" in text
+    assert "Problem 9 is wrong" in text
+    assert "not reached" in text

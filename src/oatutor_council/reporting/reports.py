@@ -19,6 +19,7 @@ from typing import Any, Sequence
 from ..models import (
     SUCCESSFUL_ISSUE_STATES,
     ArtifactKind,
+    ClaimOutcome,
     ChangeRecord,
     Issue,
     IssueLedger,
@@ -65,15 +66,61 @@ def build_reports(
     attempts: Sequence[RepairAttempt],
     findings: Sequence[ValidationFinding],
     integrity_findings: Sequence[ValidationFinding] = (),
+    claims: Sequence[dict[str, Any]] = (),
+    claim_results: Sequence[dict[str, Any]] = (),
 ) -> JobReports:
     return JobReports(
         issue_ledger=_issue_ledger(job_id, ledger),
         change_log=_change_log(job_id, changes),
         review_history=_review_history(job_id, ledger, verdicts, attempts),
         validation_report=_validation_report(
-            job_id, state, ledger, findings, integrity_findings, changes
+            job_id, state, ledger, findings, integrity_findings, changes,
+            claims, claim_results,
         ),
     )
+
+
+def resolve_claims(
+    claims: Sequence[dict[str, Any]], results: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Every claim the curator supplied, with what became of it.
+
+    Driven from the *claims*, not from the results, which is the whole point: iterating
+    the results would silently omit any claim nothing ever concluded about, and those are
+    exactly the ones a curator needs to know were never reached. A claim with no verdict
+    is `UNRESOLVED`, which is a different answer from `REFUTED` -- refuted means a block
+    looked and the defect was not there.
+
+    One confirmation anywhere settles a claim. A defect exists if any block has it, and
+    the thirty blocks that do not are not evidence against the one that does.
+    """
+    by_index: dict[int, list[dict[str, Any]]] = {}
+    for result in results:
+        by_index.setdefault(int(result["segment_index"]), []).append(result)
+
+    resolved = []
+    for claim in claims:
+        index = int(claim["segment_index"])
+        verdicts = by_index.get(index, [])
+        confirmations = [v for v in verdicts if v["outcome"] == ClaimOutcome.CONFIRMED]
+        refutations = [v for v in verdicts if v["outcome"] == ClaimOutcome.REFUTED]
+        if confirmations:
+            outcome, evidence = ClaimOutcome.CONFIRMED, confirmations
+        elif refutations:
+            outcome, evidence = ClaimOutcome.REFUTED, refutations
+        else:
+            outcome, evidence = ClaimOutcome.UNRESOLVED, []
+        resolved.append(
+            {
+                "segment_index": index,
+                "text": claim["text"],
+                "provenance": claim["provenance"],
+                "outcome": outcome.value,
+                "blocks_considered": len(verdicts),
+                "detail": evidence[0]["detail"] if evidence else "",
+            }
+        )
+    return resolved
 
 
 # --------------------------------------------------------------------------------------
@@ -201,6 +248,8 @@ def _validation_report(
     findings: Sequence[ValidationFinding],
     integrity_findings: Sequence[ValidationFinding],
     changes: Sequence[ChangeRecord],
+    claims: Sequence[dict[str, Any]] = (),
+    claim_results: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     unresolved = [
         issue for issue in ledger.issues if issue.state is IssueState.NEEDS_HUMAN_REVIEW
@@ -239,6 +288,7 @@ def _validation_report(
                 findings, key=lambda f: (_SEVERITY_ORDER[f.severity], f.row or 0)
             )
         ],
+        "instruction_claims": resolve_claims(claims, claim_results),
         "unresolved_summary": unresolved_summary(state, ledger, integrity_findings),
     }
 
@@ -308,6 +358,23 @@ def render_markdown(reports: JobReports) -> str:
     if validation["integrity_findings"]:
         lines += ["", "## Integrity failures", ""]
         lines += [f"- {f['message']}" for f in validation["integrity_findings"]]
+
+    claims = validation.get("instruction_claims") or []
+    if claims:
+        lines += ["", "## The instructions you supplied", ""]
+        # Every claim, including the ones nothing concluded about. A report that listed
+        # only the confirmed ones would let a claim nobody read pass for a claim nobody
+        # needed to act on.
+        for claim in claims:
+            summary = {
+                "confirmed": "found",
+                "refuted": "looked for, not present",
+                "unresolved": "**not reached** -- no block concluded anything",
+            }[claim["outcome"]]
+            lines.append(
+                f"- [{claim['provenance']}] {claim['text'][:120]} — {summary}"
+                + (f" ({claim['detail'][:80]})" if claim["detail"] else "")
+            )
 
     if validation["issues_needing_a_person"]:
         lines += ["", "## Needs a person", ""]
