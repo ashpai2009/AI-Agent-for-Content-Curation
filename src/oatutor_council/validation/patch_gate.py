@@ -170,6 +170,15 @@ def _conservation_failure(edits: Sequence[CellEdit]) -> str | None:
     )
     written = Counter(edit.after.strip() for edit in edits if edit.after.strip())
 
+    # A patch that only clears cells is a *deletion*, not a move, and deletion is
+    # sometimes the correct repair -- removing a dependency that references an identifier
+    # the block does not contain is the obvious example. Requiring a destination there
+    # would make a dangling reference permanently unfixable. Whether the deletion leaves
+    # the block valid is decided by the invariant and regression checks, which answer
+    # that question properly.
+    if not written:
+        return None
+
     for value, count in vacated.items():
         if written.get(value, 0) < count:
             return (

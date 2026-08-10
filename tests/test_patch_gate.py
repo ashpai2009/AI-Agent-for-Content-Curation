@@ -277,9 +277,37 @@ def test_a_column_shift_repair_that_moves_content_is_accepted(make_workbook):
     assert result.accepted, result.rejection
 
 
-def test_a_shift_repair_that_drops_the_vacated_value_is_refused(make_workbook):
-    """Condition 6. Emptying the source without filling any destination silently deletes
-    a curator's work, and looks fine cell by cell."""
+def test_a_move_that_drops_the_vacated_value_is_refused(make_workbook):
+    """Condition 6. The patch writes a destination but lets a different vacated value
+    disappear -- content deleted in the middle of a move, which looks fine cell by cell."""
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("t1", title="T", oer_src="s", license="CC"),
+                step("t1", answer="1", answer_type="numeric"),
+                cells(problem_name="t1", row_type="scaffold", answer="2",
+                      answer_type="h1", hint_id="1", dependency="s1"),
+                scaffold("t1", "s1", answer="3", answer_type="numeric"),
+            ]
+        )
+    )
+    result = check(
+        make_patch(
+            edit(4, ColumnKey.ANSWER_TYPE, "h1", "numeric"),  # writes a destination
+            edit(4, ColumnKey.DEPENDENCY, "s1", ""),          # drops content instead of moving it
+        ),
+        make_issue(is_structural=True, category=IssueCategory.STRUCTURE),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.rejection.code is RejectionCode.STRUCTURAL_CONTENT_NOT_CONSERVED
+    assert "not drop it" in result.rejection.message
+
+
+def test_a_deletion_that_breaks_the_block_is_judged_on_its_consequences(make_workbook):
+    """Clearing a cell is a deletion, not a move, so conservation does not apply. Whether
+    it is acceptable is decided by what the resulting block looks like -- a more precise
+    answer than counting values."""
     parsed = read_workbook(
         make_workbook(
             [
@@ -296,8 +324,21 @@ def test_a_shift_repair_that_drops_the_vacated_value_is_refused(make_workbook):
         parsed.blocks[0],
         parsed,
     )
-    assert result.rejection.code is RejectionCode.STRUCTURAL_CONTENT_NOT_CONSERVED
-    assert "not drop it" in result.rejection.message
+    assert result.rejection.code is RejectionCode.RULE_VIOLATION
+    assert "ANSWER_WITHOUT_TYPE" in result.rejection.detail["codes"]
+
+
+def test_removing_a_dangling_dependency_is_a_legitimate_deletion(parsed, block):
+    """Requiring a destination for every cleared value would make a reference to an
+    identifier the block does not contain permanently unfixable -- the repair is to
+    delete it, and there is nowhere for it to go."""
+    result = check(
+        make_patch(edit(5, ColumnKey.DEPENDENCY, "s1", "")),
+        make_issue(is_structural=True, category=IssueCategory.STRUCTURE),
+        block,
+        parsed,
+    )
+    assert result.accepted, result.rejection
 
 
 def test_a_shift_repair_that_duplicates_content_is_refused(parsed, block):

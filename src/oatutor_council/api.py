@@ -409,4 +409,7 @@ def _lease_is_live(job: CurationJob) -> bool:
     )
 
 
-app = None  # Built by `create_app()`; see README for the uvicorn command.
+# There is deliberately no module-level `app`. Building one at import time would read
+# settings and open the database as a side effect of importing this module, which makes it
+# untestable and makes a missing API key an import error. Serve it with:
+#   uvicorn "oatutor_council.api:create_app" --factory --app-dir src
