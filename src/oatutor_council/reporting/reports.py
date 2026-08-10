@@ -1,0 +1,358 @@
+"""The four artefacts a curator receives, as data and as prose.
+
+Every report is built from durable records -- issues, change records, verdicts, attempts,
+gate findings -- and never from anything held in memory during the run. That is what
+makes them reproducible after a resume, and it is why nothing here takes a live object.
+
+The reports are written to be read by someone who was not watching. In particular the
+validation report says plainly what is *unresolved*: a job that needed a person must hand
+over the corrected workbook **and** an honest account of what it could not fix, never a
+summary that reads like success.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+from ..models import (
+    ArtifactKind,
+    ChangeRecord,
+    Issue,
+    IssueLedger,
+    IssueState,
+    JobState,
+    RepairAttempt,
+    ReviewVerdict,
+    Severity,
+    ValidationFinding,
+)
+
+#: Reading order for a report: worst first.
+_SEVERITY_ORDER = {
+    Severity.BLOCKING: 0,
+    Severity.ERROR: 1,
+    Severity.WARNING: 2,
+    Severity.OBSERVATION: 3,
+}
+
+
+@dataclass(frozen=True)
+class JobReports:
+    issue_ledger: dict[str, Any]
+    change_log: dict[str, Any]
+    review_history: dict[str, Any]
+    validation_report: dict[str, Any]
+
+    def as_dict(self) -> dict[ArtifactKind, dict[str, Any]]:
+        return {
+            ArtifactKind.ISSUE_LEDGER: self.issue_ledger,
+            ArtifactKind.CHANGE_LOG: self.change_log,
+            ArtifactKind.REVIEW_HISTORY: self.review_history,
+            ArtifactKind.VALIDATION_REPORT: self.validation_report,
+        }
+
+
+def build_reports(
+    *,
+    job_id: str,
+    state: JobState,
+    ledger: IssueLedger,
+    changes: Sequence[ChangeRecord],
+    verdicts: Sequence[ReviewVerdict],
+    attempts: Sequence[RepairAttempt],
+    findings: Sequence[ValidationFinding],
+    integrity_findings: Sequence[ValidationFinding] = (),
+) -> JobReports:
+    return JobReports(
+        issue_ledger=_issue_ledger(job_id, ledger),
+        change_log=_change_log(job_id, changes),
+        review_history=_review_history(job_id, ledger, verdicts, attempts),
+        validation_report=_validation_report(
+            job_id, state, ledger, findings, integrity_findings, changes
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Individual reports
+# --------------------------------------------------------------------------------------
+
+
+def _issue_ledger(job_id: str, ledger: IssueLedger) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "issue_count": len(ledger.issues),
+        "by_state": _count(i.state for i in ledger.issues),
+        "by_source": _count(i.source for i in ledger.issues),
+        "by_severity": _count(i.severity for i in ledger.issues),
+        "issues": [
+            {
+                "issue_id": issue.issue_id,
+                "state": issue.state.value,
+                "source": issue.source.value,
+                "severity": issue.severity.value,
+                "category": issue.category.value,
+                "problem_name": issue.problem_name,
+                "block_id": issue.block_id,
+                "title": issue.title,
+                "description": issue.description,
+                "rule_codes": list(issue.rule_codes),
+                "cells": [list(cell) for cell in issue.cells],
+                "is_structural": issue.is_structural,
+                "reviewer_role": issue.reviewer_role.value,
+                "attempts_used": issue.attempts_used,
+            }
+            for issue in _ordered(ledger.issues)
+        ],
+    }
+
+
+def _change_log(job_id: str, changes: Sequence[ChangeRecord]) -> dict[str, Any]:
+    """Every cell this job wrote, with what was there before.
+
+    The `before` value is kept so the log is independently checkable: a curator can take
+    this file and the original workbook and verify every edit without trusting anything
+    the system says about itself.
+    """
+    return {
+        "job_id": job_id,
+        "change_count": len(changes),
+        "changes": [
+            {
+                "change_id": change.change_id,
+                "issue_id": change.issue_id,
+                "patch_id": change.patch_id,
+                "block_id": change.block_id,
+                "row": change.row,
+                "column": change.column,
+                "column_key": change.column_key.value if change.column_key else None,
+                "before": change.before,
+                "after": change.after,
+                "applied_at": change.applied_at.isoformat(),
+            }
+            for change in sorted(changes, key=lambda c: (c.row, c.column))
+        ],
+    }
+
+
+def _review_history(
+    job_id: str,
+    ledger: IssueLedger,
+    verdicts: Sequence[ReviewVerdict],
+    attempts: Sequence[RepairAttempt],
+) -> dict[str, Any]:
+    """Reviewer decisions and the repair loop, grouped by issue.
+
+    The Writer's rationale is deliberately absent from what reviewers saw and is not
+    reconstructed here either; it belongs in the change log, where it informs a human
+    rather than a reviewer whose independence depends on not having it.
+    """
+    by_issue: dict[str, dict[str, Any]] = {
+        issue.issue_id: {
+            "issue_id": issue.issue_id,
+            "problem_name": issue.problem_name,
+            "reviewer_role": issue.reviewer_role.value,
+            "final_state": issue.state.value,
+            "attempts": [],
+            "verdicts": [],
+        }
+        for issue in ledger.issues
+    }
+
+    for attempt in sorted(attempts, key=lambda a: (a.issue_id, a.attempt_no)):
+        entry = by_issue.get(attempt.issue_id)
+        if entry is None:
+            continue
+        entry["attempts"].append(
+            {
+                "attempt_no": attempt.attempt_no,
+                "outcome": attempt.outcome.value if attempt.outcome else None,
+                "rejection": attempt.rejection.code.value if attempt.rejection else None,
+                "rejection_detail": attempt.rejection.message if attempt.rejection else None,
+                "started_at": attempt.started_at.isoformat(),
+            }
+        )
+
+    for verdict in sorted(verdicts, key=lambda v: (v.issue_id, v.attempt_no)):
+        entry = by_issue.get(verdict.issue_id)
+        if entry is None:
+            continue
+        entry["verdicts"].append(
+            {
+                "attempt_no": verdict.attempt_no,
+                "reviewer_role": verdict.reviewer_role.value,
+                "decision": verdict.decision.value,
+                "feedback": verdict.feedback,
+                "rule_codes": list(verdict.rule_codes),
+                "decided_at": verdict.decided_at.isoformat(),
+            }
+        )
+
+    return {"job_id": job_id, "issues": list(by_issue.values())}
+
+
+def _validation_report(
+    job_id: str,
+    state: JobState,
+    ledger: IssueLedger,
+    findings: Sequence[ValidationFinding],
+    integrity_findings: Sequence[ValidationFinding],
+    changes: Sequence[ChangeRecord],
+) -> dict[str, Any]:
+    unresolved = [
+        issue for issue in ledger.issues if issue.state is IssueState.NEEDS_HUMAN_REVIEW
+    ]
+    return {
+        "job_id": job_id,
+        "state": state.value,
+        "succeeded": state is JobState.SUCCEEDED,
+        "integrity_passed": not integrity_findings,
+        "integrity_findings": [_render_finding(f) for f in integrity_findings],
+        "changes_applied": len(changes),
+        "issues_resolved": len(
+            [i for i in ledger.issues if i.state is IssueState.ACCEPTED]
+        ),
+        "issues_refuted": len(ledger.by_state(IssueState.REFUTED)),
+        "issues_needing_a_person": [
+            {
+                "issue_id": issue.issue_id,
+                "problem_name": issue.problem_name,
+                "title": issue.title,
+                "description": issue.description,
+                "attempts_used": issue.attempts_used,
+            }
+            for issue in unresolved
+        ],
+        "remaining_findings": [
+            _render_finding(f)
+            for f in sorted(
+                findings, key=lambda f: (_SEVERITY_ORDER[f.severity], f.row or 0)
+            )
+        ],
+        "unresolved_summary": unresolved_summary(state, ledger, integrity_findings),
+    }
+
+
+def unresolved_summary(
+    state: JobState,
+    ledger: IssueLedger,
+    integrity_findings: Sequence[ValidationFinding] = (),
+) -> str:
+    """One honest sentence about where the job actually got to.
+
+    Written for the case that matters most: a job that could not finish must say so in
+    the first line a curator reads, not bury it under a count of what did succeed.
+    """
+    if integrity_findings:
+        return (
+            f"The output workbook failed {len(integrity_findings)} integrity check(s). "
+            "It must not be used until a person has reviewed the validation report."
+        )
+    if state is JobState.SUCCEEDED:
+        return (
+            f"All {len(ledger.issues)} issue(s) reached a resolved state and every "
+            "deterministic check passed."
+        )
+    needing = ledger.by_state(IssueState.NEEDS_HUMAN_REVIEW)
+    if needing:
+        return (
+            f"{len(needing)} issue(s) could not be resolved automatically and need a "
+            "person. The corrected workbook contains every change that was accepted; "
+            "the issues listed below were left untouched."
+        )
+    open_issues = ledger.open_issues
+    if open_issues:
+        return (
+            f"The job stopped in state {state.value} with {len(open_issues)} issue(s) "
+            "still open."
+        )
+    return f"The job ended in state {state.value}."
+
+
+# --------------------------------------------------------------------------------------
+# Markdown
+# --------------------------------------------------------------------------------------
+
+
+def render_markdown(reports: JobReports) -> str:
+    """A human-readable summary of all four reports."""
+    validation = reports.validation_report
+    lines = [
+        f"# Curation report — job {validation['job_id']}",
+        "",
+        f"**Outcome:** {validation['state']}",
+        "",
+        validation["unresolved_summary"],
+        "",
+        "## Summary",
+        "",
+        f"- Issues tracked: {reports.issue_ledger['issue_count']}",
+        f"- Issues resolved: {validation['issues_resolved']}",
+        f"- Claims refuted: {validation['issues_refuted']}",
+        f"- Cells changed: {validation['changes_applied']}",
+        f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
+    ]
+
+    if validation["integrity_findings"]:
+        lines += ["", "## Integrity failures", ""]
+        lines += [f"- {f['message']}" for f in validation["integrity_findings"]]
+
+    if validation["issues_needing_a_person"]:
+        lines += ["", "## Needs a person", ""]
+        for issue in validation["issues_needing_a_person"]:
+            lines.append(
+                f"- **{issue['problem_name'] or 'workbook'}** — {issue['description']} "
+                f"({issue['attempts_used']} attempt(s) made)"
+            )
+
+    changes = reports.change_log["changes"]
+    if changes:
+        lines += ["", "## Changes applied", "", "| Row | Column | Before | After |", "| --- | --- | --- | --- |"]
+        for change in changes:
+            lines.append(
+                f"| {change['row']} | {change['column_key'] or change['column']} "
+                f"| `{change['before']}` | `{change['after']}` |"
+            )
+
+    remaining = validation["remaining_findings"]
+    if remaining:
+        lines += ["", "## Remaining findings", ""]
+        for item in remaining[:100]:
+            location = f"row {item['row']}" if item["row"] else "workbook"
+            lines.append(f"- `{item['severity']}` {item['code']} ({location}) — {item['message']}")
+        if len(remaining) > 100:
+            lines.append(f"- …and {len(remaining) - 100} more")
+
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+
+
+def _render_finding(finding: ValidationFinding) -> dict[str, Any]:
+    return {
+        "code": finding.code,
+        "severity": finding.severity.value,
+        "scope": finding.scope.value,
+        "message": finding.message,
+        "row": finding.row,
+        "column": finding.column,
+        "block_id": finding.block_id,
+        "problem_name": finding.problem_name,
+        "repairable": finding.repairable,
+    }
+
+
+def _ordered(issues: Sequence[Issue]) -> list[Issue]:
+    return sorted(
+        issues,
+        key=lambda i: (_SEVERITY_ORDER[i.severity], i.block_id or "", i.title),
+    )
+
+
+def _count(values) -> dict[str, int]:
+    return dict(sorted(Counter(str(v) for v in values).items()))
