@@ -57,36 +57,45 @@ HEADERS = [
 
 def build_demo_workbook(path: Path) -> Path:
     """A synthetic workbook with four planted defects, each of a different kind."""
+    # Every row is well-formed apart from the planted defect it carries. That is the
+    # point of a demonstration: a fixture with incidental faults produces a report in
+    # which the planted defects are indistinguishable from the sloppiness around them.
     rows = [
         # A sound block, to show that correct problems are left alone.
         ["conv1", "problem", "Convert an angle to radians", None, None, None, None,
          None, None, None, None, "example.org/1", "Angles", "Angles", "OpenStax", "CC-BY"],
-        ["conv1", "step", None, "Convert 30 degrees to radians.", "pi/6", "algebra"],
-        ["conv1", "hint", None, "Multiply by pi/180.", None, None, "h1"],
+        ["conv1", "step", "Convert 30 degrees to radians.", "Use the conversion factor.",
+         "pi/6", "algebra"],
+        ["conv1", "hint", "How are degrees converted?", "Multiply by pi/180.",
+         None, None, "h1"],
 
         # Defect 1: a scaffold with no answer. Deterministic rules catch this.
         ["conv2", "problem", "Evaluate a trigonometric value", None, None, None, None,
          None, None, None, None, "example.org/2", "Trig", "Trig", "OpenStax", "CC-BY"],
-        ["conv2", "step", None, "Evaluate cos(theta) at theta = 0.", "1", "numeric"],
-        ["conv2", "scaffold", None, "What is cos(0)?", None, "numeric", "s1"],
+        ["conv2", "step", "Evaluate cos(theta) at theta=0.", "Read the value directly.",
+         "1", "numeric"],
+        ["conv2", "scaffold", "What is cos(0)?", "Start from the definition.",
+         None, "numeric", "s1"],
 
         # Defect 2: Excel coerced the fraction 1/2 into a date.
         ["conv3", "problem", "State a fractional value", None, None, None, None,
          None, None, None, None, "example.org/3", "Frac", "Frac", "OpenStax", "CC-BY"],
-        ["conv3", "step", None, "Give the value as a fraction.", datetime(2026, 1, 2),
-         "numeric"],
+        ["conv3", "step", "Give the value as a fraction.", "Do not use a decimal.",
+         datetime(2026, 1, 2), "numeric"],
 
         # Defect 3: the answer matches no choice exactly, though one is equivalent.
         ["conv4", "problem", "Choose the correct value", None, None, None, None,
          None, None, None, None, "example.org/4", "MC", "MC", "OpenStax", "CC-BY"],
-        ["conv4", "step", None, "Which equals one half?", "1/2", "mc", None, None,
-         "0.5|1/3|1/4"],
+        ["conv4", "step", "Which equals one half?", "Choose exactly one.", "1/2", "mc",
+         None, None, "0.5|1/3|1/4"],
 
         # Defect 4: a dependency pointing at an identifier that does not exist.
         ["conv5", "problem", "Follow the scaffolded steps", None, None, None, None,
          None, None, None, None, "example.org/5", "Dep", "Dep", "OpenStax", "CC-BY"],
-        ["conv5", "step", None, "Work through the parts.", "4", "numeric"],
-        ["conv5", "scaffold", None, "First part.", "2", "numeric", "s1", "s9"],
+        ["conv5", "step", "Work through the parts.", "Take them in order.", "4",
+         "numeric"],
+        ["conv5", "scaffold", "First part.", "Halve the total.", "2", "numeric", "s1",
+         "s9"],
     ]
 
     workbook = Workbook()

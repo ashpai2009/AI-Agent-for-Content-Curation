@@ -107,14 +107,14 @@ src/oatutor_council/
   uploads.py       magic bytes, archive inspection, path containment
   config.py        every setting, read from the environment in one place
   workbook/        reader · writer · diff · styles
-  validation/      rules/ (38 rules) · mathematics · patch_gate · final_gate
+  validation/      rules/ (60 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
                    independent_reviewer · isolation · rendering · schemas
   llm/             base · provider (Gemini) · mock · context · prompts
   ingestion/       instruction_documents
   reporting/       ledger · reports
 prompts/           versioned agent prompts, plus the shared untrusted-data policy
-scripts/           demo.py · evaluate_workbooks.py · recon_workbooks.py
+scripts/           demo.py · evaluate_workbooks.py · smoke_provider.py · recon_workbooks.py
 ```
 
 ### The guarantees, and how each is enforced

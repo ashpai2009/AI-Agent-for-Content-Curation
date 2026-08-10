@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, NewType
+from typing import Any, NamedTuple, NewType
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -294,6 +294,54 @@ class WorkbookRow(BaseModel):
             return None
 
 
+class StepScope(NamedTuple):
+    """One step row and the hint/scaffold rows belonging to it.
+
+    `step` is `None` for sub-rows appearing before the block's first step row -- a
+    defect, but one the caller has to be able to see rather than one this type quietly
+    normalises away.
+    """
+
+    step: WorkbookRow | None
+    rows: tuple[WorkbookRow, ...]
+
+    @property
+    def identified(self) -> tuple[WorkbookRow, ...]:
+        """Every sub-row carrying an identifier, in document order.
+
+        Used for uniqueness and numbering, which apply to hints and scaffolds alike.
+        The *dependency* rules deliberately do not use this: hints and scaffolds play
+        different parts there, and `hints` below is the sequence that chains.
+        """
+        return tuple(
+            row
+            for row in self.rows
+            if row.row_type in (RowType.HINT, RowType.SCAFFOLD)
+            and row.get(ColumnKey.HINT_ID).strip()
+        )
+
+    @property
+    def hints(self) -> tuple[WorkbookRow, ...]:
+        """Hint rows carrying an identifier, in document order. The chain."""
+        return tuple(
+            row
+            for row in self.rows
+            if row.row_type is RowType.HINT and row.get(ColumnKey.HINT_ID).strip()
+        )
+
+    def hint_before(self, row: WorkbookRow) -> WorkbookRow | None:
+        """The nearest hint above `row` in this step. What a scaffold depends on."""
+        found = None
+        for candidate in self.rows:
+            if candidate.row >= row.row:
+                break
+            if candidate.row_type is RowType.HINT and candidate.get(
+                ColumnKey.HINT_ID
+            ).strip():
+                found = candidate
+        return found
+
+
 class ProblemBlock(BaseModel):
     """A problem row and everything under it up to the next problem row.
 
@@ -321,6 +369,39 @@ class ProblemBlock(BaseModel):
 
     def contains_row(self, row: int) -> bool:
         return self.start_row <= row <= self.end_row
+
+    def step_scopes(self) -> tuple[StepScope, ...]:
+        """The block divided at its step rows.
+
+        This is the unit the dependency rules are actually about, and not having it is
+        why they were wrong. A block's hints and scaffolds belong to the step above them,
+        and under the reset-per-step convention every step legitimately restarts at `h1`
+        -- so a block-wide uniqueness check reports a duplicate for every step after the
+        first. That single missing distinction accounts for 312 false findings across the
+        real corpus.
+
+        Rows before the first step row form a leading scope with `step=None`. They are
+        usually nothing, but a hint sitting above every step is a real defect and
+        silently dropping it here would hide it.
+        """
+        scopes: list[StepScope] = []
+        step: WorkbookRow | None = None
+        current: list[WorkbookRow] = []
+
+        for row in self.rows:
+            if row.row_type is RowType.PROBLEM:
+                continue
+            if row.row_type is RowType.STEP:
+                if step is not None or current:
+                    scopes.append(StepScope(step=step, rows=tuple(current)))
+                step, current = row, []
+                continue
+            if not row.is_blank:
+                current.append(row)
+
+        if step is not None or current:
+            scopes.append(StepScope(step=step, rows=tuple(current)))
+        return tuple(scopes)
 
 
 class WorkbookConventions(BaseModel):

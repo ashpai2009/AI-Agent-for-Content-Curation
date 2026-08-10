@@ -70,31 +70,68 @@ def problem(name: str, *, title: str = "", body: str = "", **extra: Any) -> list
     )
 
 
+#: Row types carry a Title in 97-98% of real rows, and the rules require one. Defaulting
+#: it here keeps every fixture a *well-formed* workbook whose only defects are the ones
+#: the test planted -- otherwise each new rule turns every unrelated fixture into a
+#: workbook with several faults and the tests start failing for reasons they are not
+#: about. A test that wants the field missing passes `title=""`.
+DEFAULT_TITLE = "Work through this part"
+DEFAULT_BODY = "Consider what the question is asking."
+
+
 def step(
-    name: str, *, answer: str = "1", answer_type: str = "numeric", **extra: Any
+    name: str,
+    *,
+    answer: str = "1",
+    answer_type: str = "numeric",
+    title: str = DEFAULT_TITLE,
+    **extra: Any,
 ) -> list[Any]:
     return cells(
         problem_name=name,
         row_type="step",
+        title=title,
         answer=answer,
         answer_type=answer_type,
         **extra,
     )
 
 
-def scaffold(name: str, identifier: str, *, dependency: str = "", **extra: Any):
+def scaffold(
+    name: str,
+    identifier: str,
+    *,
+    dependency: str = "",
+    title: str = DEFAULT_TITLE,
+    body_text: str = DEFAULT_BODY,
+    **extra: Any,
+):
     return cells(
         problem_name=name,
         row_type="scaffold",
         hint_id=identifier,
         dependency=dependency,
+        title=title,
+        body_text=body_text,
         **extra,
     )
 
 
-def hint(name: str, identifier: str, *, body: str = "", **extra: Any) -> list[Any]:
+def hint(
+    name: str,
+    identifier: str,
+    *,
+    body: str = "",
+    title: str = DEFAULT_TITLE,
+    **extra: Any,
+) -> list[Any]:
     return cells(
-        problem_name=name, row_type="hint", hint_id=identifier, body_text=body, **extra
+        problem_name=name,
+        row_type="hint",
+        hint_id=identifier,
+        title=title,
+        body_text=body,
+        **extra,
     )
 
 

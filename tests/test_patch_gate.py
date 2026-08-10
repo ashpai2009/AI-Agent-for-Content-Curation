@@ -287,7 +287,7 @@ def test_a_patch_that_edits_the_right_cell_but_does_not_fix_it_is_refused(unansw
     """The edit is in scope, well-formed, breaks nothing, and leaves the scaffold with
     no answer -- because whitespace is not an answer."""
     result = check(
-        make_patch(edit(4, ColumnKey.ANSWER, "", "   ")),
+        make_patch(edit(4, ColumnKey.ANSWER, "", " ")),
         missing_answer_issue(),
         unanswered.blocks[0],
         unanswered,
@@ -580,17 +580,56 @@ def test_a_deletion_that_breaks_the_block_is_judged_on_its_consequences(make_wor
     assert "ANSWER_WITHOUT_TYPE" in result.rejection.detail["codes"]
 
 
-def test_removing_a_dangling_dependency_is_a_legitimate_deletion(parsed, block):
+def test_removing_a_dangling_dependency_is_a_legitimate_deletion(make_workbook):
     """Requiring a destination for every cleared value would make a reference to an
     identifier the block does not contain permanently unfixable -- the repair is to
-    delete it, and there is nowhere for it to go."""
+    delete it, and there is nowhere for it to go.
+
+    The row has to be the *first* under its step for deletion to be the whole repair:
+    anywhere else the chain expects a dependency, so clearing one dangling reference
+    just trades it for a broken chain, and the correct repair is a replacement.
+    """
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("angles1", title="Convert", oer_src="s", license="CC"),
+                step("angles1", answer="pi/6", answer_type="algebra"),
+                scaffold("angles1", "s1", answer="30", answer_type="numeric",
+                         dependency="s9"),
+            ]
+        )
+    )
     result = check(
-        make_patch(edit(5, ColumnKey.DEPENDENCY, "s1", "")),
+        make_patch(edit(4, ColumnKey.DEPENDENCY, "s9", "")),
         make_issue(is_structural=True, category=IssueCategory.STRUCTURE),
-        block,
+        parsed.blocks[0],
         parsed,
     )
     assert result.accepted, result.rejection
+
+
+def test_clearing_a_dependency_the_chain_needs_is_refused(make_workbook):
+    """The mirror case, and the reason the deletion above needs its own fixture. `h2`
+    follows `h1` under one step, so an empty Dependency releases both hints at once --
+    which is exactly what the chain exists to prevent."""
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("angles1", title="Convert", oer_src="s", license="CC"),
+                step("angles1", answer="pi/6", answer_type="algebra"),
+                hint("angles1", "h1", body="Start from the definition."),
+                hint("angles1", "h2", body="Now substitute.", dependency="h1"),
+            ]
+        )
+    )
+    result = check(
+        make_patch(edit(5, ColumnKey.DEPENDENCY, "h1", "")),
+        make_issue(is_structural=True, category=IssueCategory.STRUCTURE),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.rejection.code is RejectionCode.RULE_VIOLATION
+    assert "HINT_DEPENDENCY_NOT_PREVIOUS" in result.rejection.detail["codes"]
 
 
 def test_a_shift_repair_that_duplicates_content_is_refused(parsed, block):

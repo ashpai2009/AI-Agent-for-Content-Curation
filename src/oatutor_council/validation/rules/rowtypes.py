@@ -216,3 +216,147 @@ def mc_type_without_choices(context: RuleContext) -> Iterable[ValidationFinding]
                 column=FIXED_COLUMNS[ColumnKey.MC_CHOICES],
                 column_key=ColumnKey.MC_CHOICES,
             )
+
+
+# --------------------------------------------------------------------------------------
+# Required content, per row type
+# --------------------------------------------------------------------------------------
+
+#: What each row type must carry. Read from the written contract, and corroborated by
+#: the corpus at 92-99% per field -- which is the useful check on a table like this: a
+#: requirement the real workbooks satisfy almost always is one this system has read
+#: correctly, while one they satisfy half the time means the reading is wrong and the
+#: rule would bury every true finding beside it.
+#:
+#: A field with a rule of its own is deliberately absent here. `Body Text` on a hint is
+#: `HINT_MISSING_BODY` and `Answer` on a step or scaffold has its own rule too; listing
+#: them again would open two issues for one empty cell, which then race for the same
+#: repair.
+REQUIRED_CONTENT: dict[RowType, tuple[ColumnKey, ...]] = {
+    RowType.STEP: (ColumnKey.TITLE,),
+    RowType.HINT: (ColumnKey.TITLE,),
+    RowType.SCAFFOLD: (ColumnKey.TITLE, ColumnKey.BODY_TEXT),
+}
+
+#: What each row type must **not** carry. A populated cell here is nearly always
+#: displaced content rather than a deliberate addition -- which is why the messages say
+#: what the value probably is, not merely that it should not be there.
+#:
+#: `mcChoices` is absent from every row here on purpose: `MC_CHOICES_ON_NON_MC_ROW`
+#: already owns it, and owns it better, because it asks about `answerType` rather than
+#: about the row type.
+FORBIDDEN_CONTENT: dict[RowType, tuple[ColumnKey, ...]] = {
+    RowType.PROBLEM: (ColumnKey.HINT_ID, ColumnKey.DEPENDENCY),
+    RowType.STEP: (ColumnKey.HINT_ID,),
+    RowType.HINT: (ColumnKey.ANSWER_TYPE,),
+}
+
+_WHAT_IT_IS_FOR = {
+    ColumnKey.TITLE: "the question or heading a student reads",
+    ColumnKey.BODY_TEXT: "the explanation a student reads",
+}
+
+
+@rule(
+    "ROW_MISSING_REQUIRED_CONTENT",
+    severity=Severity.ERROR,
+    category=IssueCategory.ROW_TYPE,
+    description="A row is missing a field its row type requires.",
+)
+def row_missing_required_content(context: RuleContext) -> Iterable[ValidationFinding]:
+    """A row that renders empty in the tutor.
+
+    Every one of these is invisible in the spreadsheet -- an empty cell among hundreds
+    of populated ones -- and unmissable to a student, who is shown a hint with nothing
+    in it or a step with no question.
+    """
+    block = context.block
+    if block is None:
+        return
+    for row in block.rows:
+        if row.is_blank or row.row_type is None:
+            continue
+        for key in REQUIRED_CONTENT.get(row.row_type, ()):
+            if row.get(key).strip():
+                continue
+            yield finding(
+                context,
+                "ROW_MISSING_REQUIRED_CONTENT",
+                f"{row.row_type.value} row has no {key.value.replace('_', ' ')}, "
+                f"which is {_WHAT_IT_IS_FOR.get(key, 'required for this row type')}",
+                row=row.row,
+                column=FIXED_COLUMNS[key],
+                column_key=key,
+                row_type=row.row_type.value,
+                missing=key.value,
+            )
+
+
+@rule(
+    "ROW_HAS_FORBIDDEN_CONTENT",
+    severity=Severity.ERROR,
+    category=IssueCategory.ROW_TYPE,
+    description="A row carries a field its row type must not have.",
+)
+def row_has_forbidden_content(context: RuleContext) -> Iterable[ValidationFinding]:
+    """A populated cell where this row type has no use for one.
+
+    Reported as a row-type defect rather than silently ignored, because the value is
+    almost never harmless: an identifier on a step row, a dependency on a problem row
+    and a choice list on a hint are all the shape the column-shift corruption takes, and
+    a rule that shrugged at them would be the reason it stayed hidden.
+    """
+    block = context.block
+    if block is None:
+        return
+    for row in block.rows:
+        if row.is_blank or row.row_type is None:
+            continue
+        for key in FORBIDDEN_CONTENT.get(row.row_type, ()):
+            value = row.get(key).strip()
+            if not value:
+                continue
+            yield finding(
+                context,
+                "ROW_HAS_FORBIDDEN_CONTENT",
+                f"{row.row_type.value} row carries "
+                f"{key.value.replace('_', ' ')} {value!r}, which belongs to another "
+                "row type; displaced content is the usual cause",
+                row=row.row,
+                column=FIXED_COLUMNS[key],
+                column_key=key,
+                row_type=row.row_type.value,
+                found=value,
+            )
+
+
+@rule(
+    "ROW_MISSING_PROBLEM_NAME",
+    severity=Severity.ERROR,
+    category=IssueCategory.STRUCTURE,
+    description="A populated row inside a block carries no Problem Name.",
+)
+def row_missing_problem_name(context: RuleContext) -> Iterable[ValidationFinding]:
+    """Every populated row repeats its block's Problem Name.
+
+    A row *disagreeing* with its block is the reader's business -- it bears on where the
+    block boundaries are, so it is reported during parsing where that decision is made.
+    A row that simply has none is this rule's: the block is unambiguous, one cell is
+    empty, and the repair is exact.
+    """
+    block = context.block
+    if block is None:
+        return
+    for row in block.rows[1:]:
+        if row.is_blank or row.row_type is None:
+            continue
+        if not row.get(ColumnKey.PROBLEM_NAME).strip():
+            yield finding(
+                context,
+                "ROW_MISSING_PROBLEM_NAME",
+                f"row carries no Problem Name; the block is {block.problem_name!r}",
+                row=row.row,
+                column=FIXED_COLUMNS[ColumnKey.PROBLEM_NAME],
+                column_key=ColumnKey.PROBLEM_NAME,
+                expected=block.problem_name,
+            )
