@@ -16,13 +16,26 @@ wherever the corpus disagrees with them.
 | --- | --- |
 | Sheets | 1 per workbook, always the active sheet |
 | Header row | Row 1 in all 11 |
-| First data row | Row 2 in 10 files; **row 3 in `7.5`** (blank row 2) |
+| First problem row | Row 2 in 8 files; **row 3 in `7.2`, `7.4`, `7.5`**, which put tool output on row 2 |
 | Columns A–P | Stable across all 11 — safe to address by index |
-| Columns Q–T | **Drift.** `Validator Check` sits at col 18 (`7.2`), 19 (9 files), 20 (`7.5`) |
+| Columns Q–T | **Drift.** `Validator Check` sits at col 18 (`7.2`), 19 (9 files), 20 (`7.5`) — and is **duplicated** in `7.2` (18 *and* 19) and `7.5` (19 *and* 20) |
+| Columns U–Y | **The contract is incomplete.** All 11 carry undocumented tooling columns: `Debug Link`, `Problem ID`, `Lesson ID`, `Image Checksum`, out to column 25 |
 
 **Consequence:** the reader locates the header row by scanning for `Problem Name`, and resolves the
 **trailing validator/metadata columns by header name, not fixed index**. Hardcoding `S`/`T` would
-silently read the wrong cells on two of eleven workbooks.
+silently read the wrong cells on two of eleven workbooks. Name resolution also has to look **past
+column T**: `7.5` duplicates `Validator Check` into column 20 and pushes `Time Last Checked` out to
+column 21, so a lookup bounded at the documented contract would report it missing.
+
+**Row 2 is not blank in `7.2`, `7.4` and `7.5`** — it holds the OATutor validator's own output and a
+`Lesson ID`, i.e. content in columns the curation contract does not describe. Two consequences: a row
+counts as blank only when **every** column is empty, not merely the mapped ones, or a row like this is
+trimmed off a block or dropped from segmentation; and the extra columns must be preserved untouched
+through the write-and-diff cycle even though nothing curates them.
+
+The `Validator Check` text is a prior tool's findings embedded in the file (`"Hint ID is missing"`,
+`"Scaffold ID is missing"`). It is **evidence, not ground truth**, and the council must reach its own
+conclusions rather than trusting it.
 
 ## 2. Conventions vary per workbook
 
@@ -142,8 +155,10 @@ written rules require. It stays a **low-severity observation, never auto-correct
 
 Synthetic workbooks (invented mathematics) must cover:
 
-1. Header at row 1 with data at row 2 **and** at row 3.
-2. `Validator Check` at column 18, 19, and 20.
+1. Header at row 1 with data at row 2 **and** at row 3, the latter with tool output on row 2.
+2. `Validator Check` at column 18, 19, and 20; duplicated; and `Time Last Checked` displaced past
+   column T, plus a workbook missing it entirely.
+2b. Tooling columns beyond the contract, and a row whose only content lives in one of them.
 3. Scaffold namespaces: `s`-only, `h`-only, mixed, and absent.
 4. Single-step blocks (no dependency evidence) alongside multi-step reset-convention blocks.
 5. ASCII and LaTeX workbooks.
