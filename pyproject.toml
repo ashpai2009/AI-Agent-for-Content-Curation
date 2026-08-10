@@ -1,0 +1,45 @@
+[project]
+name = "oatutor-council"
+version = "0.1.0"
+description = "Autonomous multi-agent curation of OATutor/OpenStax mathematics problem workbooks."
+requires-python = ">=3.12"
+
+# Every module the application imports directly is declared here. Nothing is
+# relied upon as a transitive dependency of something else.
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "python-multipart>=0.0.18",  # FastAPI multipart upload parsing
+  "pydantic>=2.9",
+  "openpyxl>=3.1",
+  "sympy>=1.13",
+  "google-genai>=2.17",
+  "tenacity>=8.2",             # 429 backoff; imported directly, not via google-genai
+  "python-dotenv>=1.0",
+  "python-docx>=1.1",
+  "pypdf>=5.1",                # embedded-text extraction only - deliberately not a renderer
+
+  # Build constraint, not an import. google-genai -> google-auth -> cryptography.
+  # cryptography 50.x publishes no x86_64 macOS wheel for cp312, so an unpinned
+  # resolve tries to compile Rust from source and fails without a toolchain.
+  # 48.x has wheels for every platform we target.
+  "cryptography<50",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "httpx>=0.28",
+  "reportlab>=4.2",            # authors text-based PDF fixtures
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
