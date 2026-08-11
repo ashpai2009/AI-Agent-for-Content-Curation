@@ -111,6 +111,9 @@ def audit_block(
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
+    #: The prompt version this job is pinned to. `None` means "whatever is newest", which
+    #: is right for a call made outside a job and wrong for one made inside it.
+    prompt_version: int | None = None,
 ) -> AuditResult:
     sections = [
         DataSection("The problem block", render_block(block)),
@@ -152,7 +155,7 @@ def audit_block(
         client,
         LLMRequest(
             role=AgentRole.INITIAL_AUDITOR,
-            system_prompt=system_prompt(AgentRole.INITIAL_AUDITOR),
+            system_prompt=system_prompt(AgentRole.INITIAL_AUDITOR, prompt_version),
             user_payload=payload,
             schema=AuditorResponse.model_json_schema(),
             seed=seed,

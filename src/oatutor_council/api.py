@@ -37,7 +37,9 @@ from .models import ArtifactKind, CurationJob, JobState, SourcePath
 from .persistence import (
     Database,
     create_job,
+    describe_artifacts,
     get_job,
+    latest_findings,
     list_artifacts,
     list_changes,
     list_claim_results,
@@ -46,7 +48,9 @@ from .persistence import (
     load_instruction_segments,
     load_ledger,
     record_artifact,
+    rediscovery_counts,
     save_instruction_segments,
+    token_usage,
 )
 from .reporting.reports import build_reports
 from .state_machine import is_resumable
@@ -331,6 +335,10 @@ def create_app(
             "validation_rounds_used": job.validation_rounds_used,
             "steps_used": job.steps_used,
             "llm_calls_used": job.llm_calls_used,
+            # From the recorded calls rather than the counter: the counter is a fuse and
+            # is reserved before a call, so it says what was *spent*, while this says what
+            # actually happened -- including the calls that failed.
+            "usage": token_usage(database, job_id),
         }
 
     @app.get("/jobs/{job_id}/issues")
@@ -359,6 +367,15 @@ def create_app(
         return {"job_id": job_id, "events": list(list_events(database, job_id))}
 
     def _reports(job_id: str):
+        """The same reports the job wrote, rebuilt from the same durable rows.
+
+        The findings used to be passed as `()` here, so `GET /report` answered with an
+        empty `remaining_findings` for a job whose own `report.md` listed them -- the API
+        quietly reassuring a curator that a workbook needing work was finished. They are
+        read from `validation_findings` now, latest round only: every round re-runs the
+        whole rule set, so concatenating rounds would report defects fixed two rounds ago
+        as though they were still there.
+        """
         from .persistence import list_attempts
 
         job = get_job(database, job_id)
@@ -369,9 +386,13 @@ def create_app(
             changes=list_changes(database, job_id),
             verdicts=list_verdicts(database, job_id),
             attempts=list_attempts(database, job_id),
-            findings=(),
+            findings=latest_findings(database, job_id, kind="content"),
+            integrity_findings=latest_findings(database, job_id, kind="integrity"),
             claims=load_instruction_segments(database, job_id),
             claim_results=list_claim_results(database, job_id),
+            usage=token_usage(database, job_id),
+            artifacts=describe_artifacts(database, job_id),
+            rediscoveries=rediscovery_counts(database, job_id),
         )
 
     @app.get("/jobs/{job_id}/download")

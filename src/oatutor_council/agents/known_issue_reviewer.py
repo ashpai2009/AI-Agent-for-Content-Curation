@@ -89,6 +89,9 @@ def review(
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
+    #: The prompt version this job is pinned to. `None` means "whatever is newest", which
+    #: is right for a call made outside a job and wrong for one made inside it.
+    prompt_version: int | None = None,
     role: ReviewerRole = ReviewerRole.KNOWN_ISSUE_REVIEWER,
 ) -> ReviewVerdict:
     bundle = ContextBundle.build(INSTRUCTIONS, context.sections())
@@ -108,7 +111,7 @@ def review(
         client,
         LLMRequest(
             role=agent_role,
-            system_prompt=system_prompt(agent_role),
+            system_prompt=system_prompt(agent_role, prompt_version),
             user_payload=payload,
             schema=ReviewerResponse.model_json_schema(),
             seed=seed,

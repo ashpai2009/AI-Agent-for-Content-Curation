@@ -846,3 +846,143 @@ def test_a_recorded_provider_failure_is_bounded_rather_than_a_copy_of_the_workbo
     assert len(detail) < len(leaked) / 10
     assert detail.startswith("400 rejected input:")
     assert detail.endswith("[truncated]")
+
+
+# --------------------------------------------------------------------------------------
+# The audit trail
+# --------------------------------------------------------------------------------------
+
+
+def test_every_model_call_leaves_a_row(setup):
+    """A wrapper rather than a call inside each agent: an audit trail each new agent has
+    to remember to write to is one with invisible holes, because a missing row looks
+    exactly like a call that was never made."""
+    from oatutor_council.persistence import list_llm_calls
+
+    db, _ = setup
+    client = quiet_client()
+    result = council(setup, client).run()
+
+    calls = list_llm_calls(db, "job-1")
+    assert len(calls) == client.call_count()
+    assert result.llm_calls_used == len(calls)
+    assert {c["role"] for c in calls} >= {"initial_auditor", "writer"}
+    assert all(c["prompt_sha256"] for c in calls)
+    assert all(c["payload"]["user_payload"] for c in calls)
+
+
+def test_a_failed_call_is_recorded_with_how_it_failed(setup):
+    """Most of the value is here. A job that spent four calls on an outage and one on a
+    repair is indistinguishable from a job that made one call, unless the four are
+    written down -- and a row that only ever said "error" could not tell an outage from a
+    rejected key from a refusal."""
+    from oatutor_council.persistence import list_llm_calls
+
+    db, _ = setup
+    client = failing_client(ProviderError("503 Service Unavailable", status="unavailable"))
+    council(setup, client, provider_failure_budget=2).run()
+
+    failed = [c for c in list_llm_calls(db, "job-1") if c["status"] != "completed"]
+    assert failed
+    assert {c["status"] for c in failed} == {"unavailable"}
+    assert all("503" in c["payload"]["error"] for c in failed)
+
+
+def test_the_writer_rationale_is_persisted_where_no_reviewer_can_reach_it(setup):
+    from oatutor_council.persistence import load_private_blobs
+
+    db, _ = setup
+    council(setup, quiet_client()).run()
+
+    blobs = load_private_blobs(db, "job-1")
+    reasoning = [b for b in blobs if b["role"] == "writer"]
+    assert reasoning
+    assert any("a scaffold needs an answer" in b["text"] for b in reasoning)
+    assert all(b["label"] for b in reasoning)
+
+
+def test_a_resumed_job_still_catches_a_leak_of_reasoning_it_never_saw(setup):
+    """A taint registry that lives only in the worker is a guarantee that ends at the
+    first crash: the rationale from before it is still on the patch, and a resumed job
+    with an empty registry passes every check it is asked to make."""
+    from oatutor_council.agents.isolation import ContextIsolationError
+
+    db, _ = setup
+    council(setup, quiet_client()).run(max_steps=6)
+
+    # A genuinely new worker. Its registry comes from `private_blobs`, not from memory.
+    successor = council(setup, quiet_client())
+    assert successor.taint.entries
+
+    leaked = next(
+        text for text in successor.taint.entries.values() if len(text.split()) >= 5
+    )
+    with pytest.raises(ContextIsolationError):
+        successor.taint.assert_clean(leaked, context="known_issue_reviewer")
+
+
+def test_a_job_keeps_the_prompt_version_it_started_with(setup, monkeypatch):
+    """Deploying `writer.v2.md` mid-job must not mean attempt one was made under one set
+    of instructions and attempt two under another, with nothing in the record to say so."""
+    from oatutor_council.persistence import list_llm_calls, load_prompt_versions
+
+    db, _ = setup
+    council(setup, quiet_client()).run(max_steps=3)
+    pinned = load_prompt_versions(db, "job-1")
+    assert pinned["writer"] >= 1
+
+    # The world moves on: a new version of every prompt appears on disk.
+    monkeypatch.setattr(
+        "oatutor_council.llm.prompts.current_prompt_versions",
+        lambda: {role: (99, "deadbeef") for role in pinned},
+    )
+    monkeypatch.setattr(
+        "oatutor_council.council.current_prompt_versions",
+        lambda: {role: (99, "deadbeef") for role in pinned},
+    )
+    council(setup, quiet_client()).run()
+
+    assert load_prompt_versions(db, "job-1") == pinned
+    assert {c["payload"]["prompt_version"] for c in list_llm_calls(db, "job-1")} == {
+        pinned["writer"]
+    }
+
+
+def test_the_audit_trail_never_contains_the_api_key(setup):
+    """The key reaches the SDK client directly from settings. Nothing in the recording
+    path has access to it, and this is the assertion that keeps it that way."""
+    from oatutor_council.persistence import list_llm_calls
+
+    db, _ = setup
+    council(setup, quiet_client(), gemini_api_key="AIzaSyD-a-real-looking-secret").run()
+
+    recorded = str(list_llm_calls(db, "job-1"))
+    assert "AIzaSyD" not in recorded
+    assert "a-real-looking-secret" not in recorded
+
+
+def test_no_persisted_reviewer_prompt_contains_the_writers_rationale(setup):
+    """The isolation claim, made against what was actually transmitted and stored.
+
+    Every other isolation test asserts over the mock's memory of the requests it was
+    handed. This one reads the rows: if the guarantee held only in the object graph and
+    the text still went out on the wire, this is the test that would notice."""
+    from oatutor_council.persistence import list_llm_calls, load_private_blobs
+
+    db, _ = setup
+    council(setup, quiet_client()).run()
+
+    reviewer_prompts = [
+        c["payload"]["system_prompt"] + "\n" + c["payload"]["user_payload"]
+        for c in list_llm_calls(db, "job-1")
+        if c["role"].endswith("reviewer")
+    ]
+    assert reviewer_prompts
+
+    private = [
+        b["text"] for b in load_private_blobs(db, "job-1") if b["role"] == "writer"
+    ]
+    assert private
+    for text in private:
+        for prompt in reviewer_prompts:
+            assert text not in prompt

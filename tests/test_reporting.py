@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import pytest
 
 from oatutor_council.models import (
+    CurationJob,
     AttemptOutcome,
     ChangeRecord,
     ColumnKey,
@@ -386,3 +387,80 @@ def test_the_markdown_report_lists_every_claim_including_the_unread_ones():
     assert "Problem 3 is wrong" in text
     assert "Problem 9 is wrong" in text
     assert "not reached" in text
+
+
+def test_only_the_latest_round_of_findings_is_reported(tmp_path):
+    """Every round re-runs the whole rule set over the whole workbook, so round two's
+    findings are not additional to round one's -- they are what is left after the repairs
+    round one asked for. Concatenating rounds would report defects fixed two rounds ago
+    as still present, which is the success lie pointed the other way."""
+    from oatutor_council.persistence import (
+        Database,
+        create_job,
+        latest_findings,
+        record_findings,
+    )
+
+    db = Database(tmp_path / "c.db")
+    create_job(db, CurationJob(job_id="job-1", source_filename="w.xlsx"))
+
+    first = _finding("MC_ANSWER_NOT_IN_CHOICES", row=4)
+    second = _finding("SCAFFOLD_MISSING_ANSWER", row=7)
+    record_findings(db, "job-1", 0, [first, second], ["a", "b"])
+    record_findings(db, "job-1", 1, [second], ["b"])
+
+    assert [f.code for f in latest_findings(db, "job-1")] == ["SCAFFOLD_MISSING_ANSWER"]
+
+
+def test_content_and_integrity_findings_are_kept_apart(tmp_path):
+    """They mean opposite things to a curator: one is work still to do, the other is a
+    reason not to use the file at all."""
+    from oatutor_council.persistence import (
+        Database,
+        create_job,
+        latest_findings,
+        record_findings,
+    )
+
+    db = Database(tmp_path / "c.db")
+    create_job(db, CurationJob(job_id="job-1", source_filename="w.xlsx"))
+    record_findings(db, "job-1", 1, [_finding("MC_CHOICE_COUNT", row=3)], ["a"])
+    record_findings(
+        db, "job-1", 1, [_finding("UNRECORDED_CHANGE", row=9)], ["b"], kind="integrity"
+    )
+
+    assert [f.code for f in latest_findings(db, "job-1", kind="content")] == [
+        "MC_CHOICE_COUNT"
+    ]
+    assert [f.code for f in latest_findings(db, "job-1", kind="integrity")] == [
+        "UNRECORDED_CHANGE"
+    ]
+
+
+def test_re_recording_a_round_replaces_it_rather_than_doubling_it(tmp_path):
+    """A round re-run after a crash must not report every finding twice."""
+    from oatutor_council.persistence import (
+        Database,
+        create_job,
+        latest_findings,
+        record_findings,
+    )
+
+    db = Database(tmp_path / "c.db")
+    create_job(db, CurationJob(job_id="job-1", source_filename="w.xlsx"))
+    finding = _finding("MC_CHOICE_COUNT", row=3)
+    record_findings(db, "job-1", 1, [finding], ["a"])
+    record_findings(db, "job-1", 1, [finding], ["a"])
+
+    assert len(latest_findings(db, "job-1")) == 1
+
+
+def _finding(code: str, *, row: int) -> ValidationFinding:
+    return ValidationFinding(
+        code=code,
+        message=f"{code} at row {row}",
+        severity=Severity.ERROR,
+        scope=FindingScope.BLOCK,
+        row=row,
+        problem_name="angles1",
+    )

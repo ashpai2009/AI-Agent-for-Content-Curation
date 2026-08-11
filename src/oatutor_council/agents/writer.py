@@ -87,6 +87,9 @@ def propose_patch(
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
+    #: The prompt version this job is pinned to. `None` means "whatever is newest", which
+    #: is right for a call made outside a job and wrong for one made inside it.
+    prompt_version: int | None = None,
 ) -> WriterResult:
     sections = [
         DataSection("The issue to resolve", render_issue(issue)),
@@ -119,7 +122,7 @@ def propose_patch(
         client,
         LLMRequest(
             role=AgentRole.WRITER,
-            system_prompt=system_prompt(AgentRole.WRITER),
+            system_prompt=system_prompt(AgentRole.WRITER, prompt_version),
             user_payload=payload,
             schema=WriterResponse.model_json_schema(),
             seed=seed,

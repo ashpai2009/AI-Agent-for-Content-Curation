@@ -250,6 +250,12 @@ class GeminiClient:
                     "schema": request.schema,
                 },
                 generation_config=generation_config,
+                # Nothing needs the interaction to exist server-side after the response
+                # comes back. `previous_interaction_id` is the only feature that would use
+                # it, and threading interactions is exactly what context isolation
+                # forbids -- so retention here would be a copy of curator workbook content
+                # held by a third party for a capability this system will never use.
+                store=False,
                 # A call with no timeout is a worker that can hang for the lifetime of the
                 # process holding a lease over a job nobody else may touch.
                 timeout=self._settings.provider_timeout_seconds,

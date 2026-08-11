@@ -185,6 +185,10 @@ CREATE TABLE IF NOT EXISTS validation_findings (
     code       TEXT NOT NULL,
     severity   TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
+    -- `content` (the workbook is wrong) or `integrity` (the output is not an accounted-for
+    -- descendant of the source). Kept apart because they mean opposite things to a
+    -- curator: one is work still to do, the other is a reason not to use the file at all.
+    kind       TEXT NOT NULL DEFAULT 'content',
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS validation_findings_round ON validation_findings(job_id, round_no);
@@ -209,8 +213,25 @@ CREATE TABLE IF NOT EXISTS private_blobs (
     job_id     TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
     issue_id   TEXT,
     role       TEXT NOT NULL,
+    -- The taint-registry label. Stored so a resumed job can rebuild the registry with
+    -- the same labels it had, which is what makes a violation message name the thing
+    -- that leaked rather than an anonymous blob.
+    label      TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     text       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS private_blobs_job ON private_blobs(job_id);
+
+-- Which prompt version each role is pinned to **for this job**. Without this, adding
+-- `writer.v2.md` mid-flight would mean a job's first repair was made under v1 and its
+-- second under v2, and the audit trail would say v2 for both.
+CREATE TABLE IF NOT EXISTS job_prompts (
+    job_id     TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    role       TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    sha256     TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, role)
 );
 
 -- Which blocks each phase has finished with. A block audited with zero findings leaves
@@ -992,16 +1013,24 @@ def record_findings(
     round_no: int,
     findings: Sequence[ValidationFinding],
     fingerprints: Sequence[str],
+    *,
+    kind: str = "content",
 ) -> None:
+    """Replace this round's findings of this kind.
+
+    Replace rather than append: a round re-run after a crash must not double every
+    finding it already recorded, and a half-finished round has nothing worth keeping.
+    """
     with db.write() as connection:
         connection.execute(
-            "DELETE FROM validation_findings WHERE job_id = ? AND round_no = ?",
-            (job_id, round_no),
+            "DELETE FROM validation_findings WHERE job_id = ? AND round_no = ? AND kind = ?",
+            (job_id, round_no, kind),
         )
         for finding, mark in zip(findings, fingerprints):
             connection.execute(
                 """INSERT INTO validation_findings (finding_id, job_id, round_no, code,
-                       severity, fingerprint, payload_json) VALUES (?,?,?,?,?,?,?)""",
+                       severity, fingerprint, kind, payload_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
                 (
                     uuid4().hex,
                     job_id,
@@ -1009,26 +1038,75 @@ def record_findings(
                     finding.code,
                     finding.severity.value,
                     mark,
+                    kind,
                     finding.model_dump_json(),
                 ),
             )
 
 
 def list_findings(
-    db: Database, job_id: str, round_no: int | None = None
+    db: Database, job_id: str, round_no: int | None = None, *, kind: str = "content"
 ) -> tuple[ValidationFinding, ...]:
     if round_no is None:
         rows = db.connection.execute(
-            "SELECT payload_json FROM validation_findings WHERE job_id = ? "
+            "SELECT payload_json FROM validation_findings WHERE job_id = ? AND kind = ? "
             "ORDER BY round_no DESC",
-            (job_id,),
+            (job_id, kind),
         ).fetchall()
     else:
         rows = db.connection.execute(
-            "SELECT payload_json FROM validation_findings WHERE job_id = ? AND round_no = ?",
-            (job_id, round_no),
+            "SELECT payload_json FROM validation_findings WHERE job_id = ? "
+            "AND round_no = ? AND kind = ?",
+            (job_id, round_no, kind),
         ).fetchall()
     return tuple(ValidationFinding.model_validate_json(r["payload_json"]) for r in rows)
+
+
+def latest_findings(
+    db: Database, job_id: str, *, kind: str = "content"
+) -> tuple[ValidationFinding, ...]:
+    """The most recent round's findings, which are the only ones still true.
+
+    Every round re-runs the whole rule set over the whole workbook, so round two's
+    findings are not additional to round one's -- they are what is left after the repairs
+    round one asked for. Concatenating rounds would report defects that were fixed two
+    rounds ago as though they were still there, which is the same lie as reporting
+    success over a broken workbook, pointed the other way.
+    """
+    row = db.connection.execute(
+        "SELECT MAX(round_no) AS latest FROM validation_findings "
+        "WHERE job_id = ? AND kind = ?",
+        (job_id, kind),
+    ).fetchone()
+    if row is None or row["latest"] is None:
+        return ()
+    return list_findings(db, job_id, int(row["latest"]), kind=kind)
+
+
+def token_usage(db: Database, job_id: str) -> dict[str, int]:
+    """What this job actually cost, added up from the recorded calls.
+
+    Derived rather than stored: a running total kept on the job would be a second source
+    of truth that a crash between the call and the increment could put permanently out of
+    step with the rows it is meant to summarise.
+    """
+    totals = {"calls": 0, "failed_calls": 0, "input_tokens": 0, "output_tokens": 0,
+              "thought_tokens": 0, "total_tokens": 0}
+    for call in list_llm_calls(db, job_id):
+        totals["calls"] += 1
+        if call["status"] != "completed":
+            totals["failed_calls"] += 1
+        usage = call["payload"].get("usage") or {}
+        for source, target in (
+            ("total_input_tokens", "input_tokens"),
+            ("total_output_tokens", "output_tokens"),
+            ("total_thought_tokens", "thought_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(source)
+            if isinstance(value, int):
+                totals[target] += value
+    return totals
 
 
 def record_artifact(
@@ -1169,6 +1247,146 @@ def record_event(db: Database, job_id: str, kind: str, detail: str = "") -> None
             "INSERT INTO job_events (event_id, job_id, at, kind, detail) VALUES (?,?,?,?,?)",
             (uuid4().hex, job_id, _iso(_now()), kind, detail),
         )
+
+
+# --------------------------------------------------------------------------------------
+# The model-call audit trail
+# --------------------------------------------------------------------------------------
+
+
+def record_llm_call(
+    db: Database,
+    job_id: str,
+    *,
+    role: str,
+    model: str,
+    status: str,
+    prompt_sha256: str,
+    issue_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    """One row per request, successful or not.
+
+    Failures are recorded too, and that is most of the value: a job that spent four calls
+    on an outage and one on a repair looks identical to a job that made one call, unless
+    the four are written down.
+    """
+    call_id = uuid4().hex
+    with db.write() as connection:
+        connection.execute(
+            """INSERT INTO llm_calls
+               (call_id, job_id, issue_id, role, model, status, prompt_sha256,
+                created_at, payload_json) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                call_id,
+                job_id,
+                issue_id,
+                role,
+                model,
+                status,
+                prompt_sha256,
+                _iso(_now()),
+                json.dumps(payload or {}),
+            ),
+        )
+    return call_id
+
+
+def list_llm_calls(db: Database, job_id: str) -> tuple[dict[str, Any], ...]:
+    rows = db.connection.execute(
+        "SELECT * FROM llm_calls WHERE job_id = ? ORDER BY created_at, rowid", (job_id,)
+    ).fetchall()
+    return tuple(
+        {**dict(row), "payload": json.loads(row["payload_json"])} for row in rows
+    )
+
+
+def save_private_blob(
+    db: Database,
+    job_id: str,
+    *,
+    role: str,
+    label: str,
+    text: str,
+    issue_id: str | None = None,
+) -> None:
+    """Persist agent reasoning where no reviewer context can reach it.
+
+    The separation is structural rather than careful: `ReviewerContext` has no field whose
+    type closure could name this table's contents, and `assert_no_private_fields` fails at
+    import if one is ever added.
+    """
+    if not text.strip():
+        return
+    with db.write() as connection:
+        connection.execute(
+            """INSERT INTO private_blobs
+               (blob_id, job_id, issue_id, role, label, created_at, text)
+               VALUES (?,?,?,?,?,?,?)""",
+            (uuid4().hex, job_id, issue_id, role, label, _iso(_now()), text),
+        )
+
+
+def load_private_blobs(db: Database, job_id: str) -> tuple[dict[str, Any], ...]:
+    rows = db.connection.execute(
+        "SELECT * FROM private_blobs WHERE job_id = ? ORDER BY created_at, rowid",
+        (job_id,),
+    ).fetchall()
+    return tuple(dict(row) for row in rows)
+
+
+def pin_prompt_versions(
+    db: Database, job_id: str, versions: dict[str, tuple[int, str]]
+) -> None:
+    """Fix this job's prompt versions on first use, and never move them again.
+
+    `INSERT OR IGNORE`, so a resumed job keeps what it started with. The failure this
+    prevents is quiet: deploy `writer.v2.md` while a job is mid-repair and its first
+    attempt was made under one set of instructions and its second under another, with
+    nothing in the record to say so.
+    """
+    with db.write() as connection:
+        connection.executemany(
+            """INSERT OR IGNORE INTO job_prompts (job_id, role, version, sha256, created_at)
+               VALUES (?,?,?,?,?)""",
+            [
+                (job_id, role, version, digest, _iso(_now()))
+                for role, (version, digest) in versions.items()
+            ],
+        )
+
+
+def load_prompt_versions(db: Database, job_id: str) -> dict[str, int]:
+    rows = db.connection.execute(
+        "SELECT role, version FROM job_prompts WHERE job_id = ?", (job_id,)
+    ).fetchall()
+    return {row["role"]: row["version"] for row in rows}
+
+
+def describe_artifacts(db: Database, job_id: str) -> list[dict[str, Any]]:
+    """What this job produced, by kind and hash -- **never by path**.
+
+    The same dictionary feeds the markdown report and the HTTP report, which is why the
+    filesystem layout is absent: a curator has no use for it and anyone probing for it
+    should learn nothing. The hash is the useful part, since it is how someone checks the
+    file they downloaded is the file the report is about.
+    """
+    rows = db.connection.execute(
+        "SELECT kind, sha256, created_at FROM job_artifacts WHERE job_id = ? ORDER BY kind",
+        (job_id,),
+    ).fetchall()
+    return [
+        {"kind": row["kind"], "sha256": row["sha256"] or "", "created_at": row["created_at"]}
+        for row in rows
+    ]
+
+
+def rediscovery_counts(db: Database, job_id: str) -> dict[str, int]:
+    """How many closed issues had their defect found again, and how many were given up on."""
+    return {
+        kind: count_events(db, job_id, kind)
+        for kind in ("issue_reopened", "finding_absorbed")
+    }
 
 
 def count_events(db: Database, job_id: str, kind: str) -> int:

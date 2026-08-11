@@ -40,8 +40,13 @@ from oatutor_council.persistence import (  # noqa: E402
     create_job,
     list_changes,
     list_events,
+    describe_artifacts,
+    latest_findings,
     list_issues,
+    list_llm_calls,
     list_verdicts,
+    rediscovery_counts,
+    token_usage,
 )
 from oatutor_council.reporting.reports import build_reports, render_markdown  # noqa: E402
 from oatutor_council.workbook.reader import read_workbook  # noqa: E402
@@ -277,7 +282,12 @@ def main() -> int:
             attempts=__import__(
                 "oatutor_council.persistence", fromlist=["list_attempts"]
             ).list_attempts(db, "demo"),
-            findings=(),
+            # Read back from the rows the job wrote, exactly as `GET /report` does.
+            findings=latest_findings(db, "demo", kind="content"),
+            integrity_findings=latest_findings(db, "demo", kind="integrity"),
+            usage=token_usage(db, "demo"),
+            artifacts=describe_artifacts(db, "demo"),
+            rediscoveries=rediscovery_counts(db, "demo"),
         )
 
         print("\n--- final report --------------------------------------------------")
@@ -290,11 +300,16 @@ def main() -> int:
         print(f"  final state: {job.state.value}")
         print(f"  model calls: {job.llm_calls_used}, steps: {job.steps_used}")
 
+        # Read from `llm_calls`, not from the mock's memory. The isolation claim is
+        # about what was transmitted, and the rows are the record of that.
         reviewer_payloads = [
-            r.user_payload
-            for r in council.client.requests
-            if r.role
-            in (AgentRole.KNOWN_ISSUE_REVIEWER, AgentRole.INDEPENDENT_REVIEWER)
+            call["payload"]["user_payload"]
+            for call in list_llm_calls(db, "demo")
+            if call["role"]
+            in (
+                AgentRole.KNOWN_ISSUE_REVIEWER.value,
+                AgentRole.INDEPENDENT_REVIEWER.value,
+            )
         ]
         leaked = [p for p in reviewer_payloads if "Excel turned the fraction" in p]
         print(f"  reviewer payloads inspected: {len(reviewer_payloads)}, leaks: {len(leaked)}")

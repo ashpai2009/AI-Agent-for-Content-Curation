@@ -63,6 +63,9 @@ def sweep_block(
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
+    #: The prompt version this job is pinned to. `None` means "whatever is newest", which
+    #: is right for a call made outside a job and wrong for one made inside it.
+    prompt_version: int | None = None,
 ) -> SweepResult:
     sections = [
         DataSection("The problem block", render_block(block)),
@@ -90,7 +93,7 @@ def sweep_block(
         client,
         LLMRequest(
             role=AgentRole.INDEPENDENT_REVIEWER,
-            system_prompt=system_prompt(AgentRole.INDEPENDENT_REVIEWER),
+            system_prompt=system_prompt(AgentRole.INDEPENDENT_REVIEWER, prompt_version),
             user_payload=payload,
             schema=IndependentReviewResponse.model_json_schema(),
             seed=seed,

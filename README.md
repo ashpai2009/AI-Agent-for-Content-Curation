@@ -94,7 +94,8 @@ curl -s -X POST localhost:8000/jobs \
 # Poll — never blocks on an in-flight write
 curl -s localhost:8000/jobs/9f2c...
 
-# Artefacts
+# Artefacts. `/report` is rebuilt from the same rows the job wrote, so it always
+# agrees with the report.md in the download.
 curl -s  localhost:8000/jobs/9f2c.../issues
 curl -s  localhost:8000/jobs/9f2c.../changes
 curl -s  localhost:8000/jobs/9f2c.../reviews
@@ -123,7 +124,7 @@ src/oatutor_council/
   validation/      rules/ (60 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
                    independent_reviewer · isolation · rendering · schemas
-  llm/             base · provider (Gemini) · mock · context · prompts
+  llm/             base · provider (Gemini) · mock · context · prompts · audit
   ingestion/       instruction_documents
   reporting/       ledger · reports
 prompts/           versioned agent prompts, plus the shared untrusted-data policy
@@ -155,7 +156,17 @@ accepted edit or to the approved edited-row rule **fails the gate**. There is no
 checked at import time and cannot reference a private type anywhere in its field closure;
 and a `TaintRegistry` compares every outgoing payload against registered private text by
 exact match *and* 12-token shingle, catching the paraphrase that exact matching misses. A
-violation fails the job — never a warning, never a retry.
+violation fails the job — never a warning, never a retry. The registry is rebuilt from the
+database on every resume: one that lived only in the worker would be a guarantee that ended
+at the first crash, since the reasoning it was watching for is still on the patch.
+
+**Every model call is written down.** One row per request — role, model, status, prompt
+hash, pinned prompt version, latency, token usage, and the exact prompt text — including
+the calls that failed, with the provider's own status. The recording is a wrapper around
+the client rather than a call inside each agent, so no agent can forget it. Prompt versions
+are pinned per job, so deploying a new prompt mid-job cannot mean one attempt ran under one
+set of instructions and the next under another. The API key reaches the SDK directly from
+settings and is not reachable from anything in that path.
 
 **Workbook cells are hostile input.** They reach every agent inside fenced, labelled data
 sections with a **per-call random delimiter**, and anything resembling a fence is

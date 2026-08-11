@@ -68,6 +68,9 @@ def build_reports(
     integrity_findings: Sequence[ValidationFinding] = (),
     claims: Sequence[dict[str, Any]] = (),
     claim_results: Sequence[dict[str, Any]] = (),
+    usage: dict[str, int] | None = None,
+    artifacts: Sequence[dict[str, Any]] = (),
+    rediscoveries: dict[str, int] | None = None,
 ) -> JobReports:
     return JobReports(
         issue_ledger=_issue_ledger(job_id, ledger),
@@ -75,7 +78,7 @@ def build_reports(
         review_history=_review_history(job_id, ledger, verdicts, attempts),
         validation_report=_validation_report(
             job_id, state, ledger, findings, integrity_findings, changes,
-            claims, claim_results,
+            claims, claim_results, usage or {}, artifacts, rediscoveries or {},
         ),
     )
 
@@ -256,13 +259,21 @@ def _validation_report(
     changes: Sequence[ChangeRecord],
     claims: Sequence[dict[str, Any]] = (),
     claim_results: Sequence[dict[str, Any]] = (),
+    usage: dict[str, int] | None = None,
+    artifacts: Sequence[dict[str, Any]] = (),
+    rediscoveries: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     unresolved = [
         issue for issue in ledger.issues if issue.state is IssueState.NEEDS_HUMAN_REVIEW
     ]
+    resolved_claims = resolve_claims(claims, claim_results)
     return {
         "job_id": job_id,
         "state": state.value,
+        # Read from the state rather than recomputed, and that is not a shortcut:
+        # `SUCCEEDED` is set in exactly one place under three conditions -- integrity
+        # passed, every issue resolved, no unresolved findings. A second derivation here
+        # would be a second definition of success, and the two would eventually disagree.
         "succeeded": state is JobState.SUCCEEDED,
         "integrity_passed": not integrity_findings,
         "integrity_findings": [_render_finding(f) for f in integrity_findings],
@@ -294,9 +305,29 @@ def _validation_report(
                 findings, key=lambda f: (_SEVERITY_ORDER[f.severity], f.row or 0)
             )
         ],
-        "instruction_claims": resolve_claims(claims, claim_results),
+        # A defect that was repaired, came back at final validation, and was repaired
+        # again ends in the same state as one that was simply repaired. The counts are
+        # the only place the difference shows, and it is the part a curator most needs.
+        "issues_reopened": (rediscoveries or {}).get("issue_reopened", 0),
+        "findings_absorbed": (rediscoveries or {}).get("finding_absorbed", 0),
+        "instruction_claims": resolved_claims,
+        "instruction_claims_confirmed": _count_claims(
+            resolved_claims, ClaimOutcome.CONFIRMED
+        ),
+        "instruction_claims_refuted": _count_claims(
+            resolved_claims, ClaimOutcome.REFUTED
+        ),
+        "instruction_claims_unresolved": _count_claims(
+            resolved_claims, ClaimOutcome.UNRESOLVED
+        ),
+        "model_usage": usage or {},
+        "artifacts": list(artifacts),
         "unresolved_summary": unresolved_summary(state, ledger, integrity_findings),
     }
+
+
+def _count_claims(resolved: Sequence[dict[str, Any]], outcome: ClaimOutcome) -> int:
+    return len([claim for claim in resolved if claim["outcome"] == outcome])
 
 
 def unresolved_summary(
@@ -360,6 +391,33 @@ def render_markdown(reports: JobReports) -> str:
         f"- Cells changed: {validation['changes_applied']}",
         f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
     ]
+
+    # Said out loud rather than left to be inferred from a state. "Repaired, came back,
+    # repaired again" and "repaired, came back, gave up" are different stories, and both
+    # end in a row that looks like every other row.
+    if validation.get("issues_reopened") or validation.get("findings_absorbed"):
+        lines.append(
+            f"- Defects that came back after being repaired: "
+            f"{validation.get('issues_reopened', 0)} reopened for another attempt, "
+            f"{validation.get('findings_absorbed', 0)} left for a person"
+        )
+
+    usage = validation.get("model_usage") or {}
+    if usage.get("calls"):
+        lines.append(
+            f"- Model calls: {usage['calls']}"
+            + (f" ({usage['failed_calls']} failed)" if usage.get("failed_calls") else "")
+            + (f", {usage['total_tokens']} tokens" if usage.get("total_tokens") else "")
+        )
+
+    artifacts = validation.get("artifacts") or []
+    if artifacts:
+        lines += ["", "## Files produced", ""]
+        # Hashes, not paths. A curator checks the file they downloaded is the file this
+        # report is about; the storage layout is nobody's business.
+        for artifact in artifacts:
+            digest = artifact["sha256"][:16] or "not hashed"
+            lines.append(f"- `{artifact['kind']}` — sha256 {digest}…")
 
     if validation["integrity_findings"]:
         lines += ["", "## Integrity failures", ""]

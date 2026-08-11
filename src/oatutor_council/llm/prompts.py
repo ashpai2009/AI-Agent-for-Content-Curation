@@ -13,7 +13,9 @@ at load time rather than a security hole nobody noticed.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -109,3 +111,40 @@ def load_prompt(name: str, version: int | None = None) -> str:
 
 def system_prompt(role: AgentRole, version: int | None = None) -> str:
     return load_prompt(role.value, version)
+
+
+@dataclass(frozen=True)
+class ResolvedPrompt:
+    """A prompt together with *which* prompt it was.
+
+    The version and the hash travel with the text because the audit trail has to be able
+    to answer "what was this call actually made with" months later, when the file on disk
+    has moved on. A hash of the composed text, not the file: the untrusted-data policy and
+    the curation rules are substituted in, so the file alone does not identify what was
+    sent.
+    """
+
+    role: AgentRole
+    version: int
+    text: str
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.text.encode()).hexdigest()
+
+
+def resolve_prompt(role: AgentRole, version: int | None = None) -> ResolvedPrompt:
+    versions = available_versions(role.value)
+    if not versions:
+        raise PromptNotFound(f"no prompt file for {role.value!r} in {_root()}")
+    chosen = versions[-1] if version is None else version
+    return ResolvedPrompt(role=role, version=chosen, text=load_prompt(role.value, chosen))
+
+
+def current_prompt_versions() -> dict[str, tuple[int, str]]:
+    """What every role would resolve to right now, for pinning at the start of a job."""
+    resolved = {}
+    for role in AgentRole:
+        prompt = resolve_prompt(role)
+        resolved[role.value] = (prompt.version, prompt.sha256)
+    return resolved

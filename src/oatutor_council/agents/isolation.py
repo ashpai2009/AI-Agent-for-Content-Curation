@@ -233,6 +233,25 @@ class TaintRegistry:
             if isinstance(value, str):
                 self.register(f"{label}.{name}", value)
 
+    def labelled_entries(self) -> tuple[tuple[str, str], ...]:
+        """Everything registered, for persisting. The only way text leaves this object."""
+        return tuple(self.entries.items())
+
+    @classmethod
+    def rebuilt(cls, entries: Iterable[tuple[str, str]]) -> TaintRegistry:
+        """Reconstruct a registry from durable rows.
+
+        **A registry that only lives in the worker is a guarantee that ends at the first
+        crash.** The Writer's rationale from before the crash is still in the database and
+        still on the patch, so a resumed job could hand it to a reviewer with nothing left
+        to object -- and the leak would be invisible, because a registry with no entries
+        passes every check it is asked to make.
+        """
+        registry = cls()
+        for label, text in entries:
+            registry.register(label, text)
+        return registry
+
     def assert_clean(self, payload: str, *, context: str) -> None:
         """Refuse to dispatch a payload carrying registered private text.
 

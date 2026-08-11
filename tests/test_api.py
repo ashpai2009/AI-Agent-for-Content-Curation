@@ -619,3 +619,78 @@ def _wait_for_state(client, job_id: str, expected: str, limit: int = 200) -> Non
         f"job stayed in {client.get(f'/jobs/{job_id}').json()['state']}, "
         f"never reached {expected}"
     )
+
+
+def test_the_report_endpoint_shows_the_findings_the_report_file_shows(tmp_path):
+    """The bug this replaces: findings were passed as `()` here, so `GET /report`
+    answered with an empty `remaining_findings` for a job whose own `report.md` listed
+    them -- the API quietly reassuring a curator that a workbook needing work was
+    finished."""
+    from conftest import write_workbook
+
+    # A workbook with a defect no scripted repair will fix, so findings survive to the end.
+    path = write_workbook(
+        tmp_path / "broken.xlsx",
+        [
+            problem("angles1", title="Convert", oer_src="s", license="CC"),
+            step("angles1", answer="pi/6", answer_type="algebra"),
+            scaffold("angles1", "s1", answer="", answer_type="numeric"),
+        ],
+    )
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    db = Database(settings.data_root / "council.db")
+    app = create_app(
+        settings=settings, db=db, client_factory=_client_that_never_repairs, autostart=True
+    )
+    with TestClient(app) as client:
+        job_id = submit(client, path.read_bytes()).json()["job_id"]
+        _wait_for_terminal(client, job_id)
+
+        report = client.get(f"/jobs/{job_id}/report").json()
+        rendered = (settings.data_root / job_id / "outputs" / "report.md").read_text()
+
+        assert report["state"] == "needs_human_attention"
+        assert report["succeeded"] is False
+        assert report["remaining_findings"], "the endpoint reported no findings"
+        assert report["remaining_findings"][0]["code"] in rendered
+
+
+def _client_that_never_repairs(_settings) -> ScriptedLLMClient:
+    """A Writer that escalates instead of editing, so the defect is still there at the end."""
+    replies = {
+        AgentRole.INITIAL_AUDITOR: AuditorResponse(),
+        AgentRole.INDEPENDENT_REVIEWER: IndependentReviewResponse(block_is_sound=True),
+        AgentRole.WRITER: WriterResponse(
+            needs_human_review=True, human_review_reason="I cannot determine the answer"
+        ),
+        AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(decision="accept"),
+    }
+    client = ScriptedLLMClient()
+    client.default = lambda request: replies[request.role]
+    return client
+
+
+def test_the_report_accounts_for_the_files_it_produced(client, workbook_bytes):
+    """Hashes, not paths: a curator checks the file they downloaded is the file the
+    report is about, and the storage layout is nobody's business."""
+    job_id = submit(client, workbook_bytes).json()["job_id"]
+    client.app.state.runner.submit(job_id, client.app_settings.data_root / job_id)
+    _wait_for_terminal(client, job_id)
+
+    report = client.get(f"/jobs/{job_id}/report").json()
+    kinds = {a["kind"]: a for a in report["artifacts"]}
+    assert "corrected_workbook" in kinds
+    assert len(kinds["corrected_workbook"]["sha256"]) == 64
+    assert not any("/" in str(value) for value in kinds["corrected_workbook"].values())
+
+
+def test_the_status_and_report_agree_about_what_the_job_cost(client, workbook_bytes):
+    job_id = submit(client, workbook_bytes).json()["job_id"]
+    client.app.state.runner.submit(job_id, client.app_settings.data_root / job_id)
+    _wait_for_terminal(client, job_id)
+
+    status = client.get(f"/jobs/{job_id}").json()
+    report = client.get(f"/jobs/{job_id}/report").json()
+    assert status["usage"]["calls"] == report["model_usage"]["calls"] > 0
+    assert status["usage"]["calls"] == status["llm_calls_used"]

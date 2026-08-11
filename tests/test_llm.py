@@ -580,3 +580,62 @@ def test_a_provider_message_never_carries_the_whole_workbook():
     cleaned = sanitize_provider_message(payload)
     assert len(cleaned) < len(payload) / 4
     assert cleaned.endswith("[truncated]")
+
+
+# --------------------------------------------------------------------------------------
+# Prompt pinning
+# --------------------------------------------------------------------------------------
+
+
+def test_a_resolved_prompt_reports_which_prompt_it_was():
+    """The version and hash travel with the text because the audit trail has to answer
+    "what was this call made with" months later, when the file has moved on."""
+    from oatutor_council.llm.prompts import resolve_prompt
+
+    resolved = resolve_prompt(AgentRole.WRITER)
+    assert resolved.version >= 1
+    assert len(resolved.sha256) == 64
+    assert POLICY_PLACEHOLDER not in resolved.text
+
+
+def test_the_prompt_hash_covers_the_composed_text_not_the_file(tmp_path, monkeypatch):
+    """The untrusted-data policy and the curation rules are substituted in, so the file
+    alone does not identify what was sent."""
+    from oatutor_council.llm.prompts import resolve_prompt
+
+    before = resolve_prompt(AgentRole.WRITER)
+    assert _policy_text() in before.text
+    assert before.sha256 != _sha256_of_file(AgentRole.WRITER, before.version)
+
+
+def _policy_text() -> str:
+    from oatutor_council.llm.prompts import POLICY_FILE, PROMPT_ROOT
+
+    return (PROMPT_ROOT / POLICY_FILE).read_text(encoding="utf-8").strip()
+
+
+def _sha256_of_file(role, version) -> str:
+    import hashlib
+
+    from oatutor_council.llm.prompts import PROMPT_ROOT
+
+    raw = (PROMPT_ROOT / f"{role.value}.v{version}.md").read_bytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def test_every_role_resolves_so_a_job_can_pin_all_four():
+    from oatutor_council.llm.prompts import current_prompt_versions
+
+    versions = current_prompt_versions()
+    assert set(versions) == {role.value for role in AgentRole}
+    assert all(version >= 1 and len(digest) == 64 for version, digest in versions.values())
+
+
+def test_the_provider_asks_the_model_not_to_retain_the_interaction():
+    """`previous_interaction_id` is the only feature server-side retention would serve,
+    and threading interactions is exactly what context isolation forbids -- so retention
+    would be a copy of curator content held for a capability this system never uses."""
+    calls: list[dict] = []
+    client = gemini(FakeInteraction(), calls, [])
+    client.complete(request())
+    assert calls[0]["store"] is False

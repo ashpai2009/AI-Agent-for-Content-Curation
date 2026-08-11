@@ -33,7 +33,9 @@ from .agents import independent_reviewer, initial_auditor, known_issue_reviewer,
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
 from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
+from .llm.audit import RecordingClient
 from .llm.base import (
+    AgentRole,
     LLMClient,
     MalformedResponse,
     ProviderConfigurationError,
@@ -41,6 +43,7 @@ from .llm.base import (
     ProviderRefused,
     sanitize_provider_message,
 )
+from .llm.prompts import current_prompt_versions
 from .models import (
     ArtifactKind,
     ClaimOutcome,
@@ -67,6 +70,7 @@ from .persistence import (
     assert_lease_held,
     blocks_done,
     count_events,
+    describe_artifacts,
     get_job,
     increment_counters,
     insert_attempt,
@@ -79,14 +83,20 @@ from .persistence import (
     list_issues,
     load_instruction_segments,
     load_ledger,
+    load_private_blobs,
+    load_prompt_versions,
+    pin_prompt_versions,
+    save_private_blob,
     mark_block_done,
     next_attempt_number,
     record_artifact,
     record_claim_result,
     record_event,
     record_findings,
+    rediscovery_counts,
     save_issue,
     settle_attempt,
+    token_usage,
     transition_job,
 )
 from .reporting.ledger import (
@@ -134,6 +144,11 @@ MAX_CURATOR_RULE_CHARACTERS = 4_000
 
 #: The durable event kind counted against `provider_failure_budget`.
 PROVIDER_FAILURE_EVENT = "provider_failure"
+
+#: The round number the final gate's findings are stored under. Deliberately above any
+#: repair round: it is what the workbook looked like when it was handed over, which is the
+#: only answer to "is this file finished" that is still true afterwards.
+FINAL_GATE_ROUND = 1_000
 
 
 class BudgetExhausted(Exception):
@@ -192,7 +207,6 @@ class CurationCouncil:
     ) -> None:
         self.db = db
         self.settings = settings
-        self.client = client
         self.job_id = job_id
         self.copy = copy
         self.worker_id = worker_id
@@ -207,9 +221,31 @@ class CurationCouncil:
             max_attempts=settings.max_repair_attempts,
             interrupted_retry_budget=settings.interrupted_retry_budget,
         )
+        # The prompt versions this job is pinned to. Pinned on the first step that runs
+        # and read from the database thereafter, so deploying `writer.v2.md` mid-job does
+        # not mean attempt one was made under one set of instructions and attempt two
+        # under another with nothing in the record to say so.
+        self.prompt_versions = load_prompt_versions(db, job_id)
+
         # One registry per job. Two jobs share no reasoning, and a global one would make
         # a different job's rationale a false positive here.
-        self.taint = TaintRegistry()
+        #
+        # **Rebuilt from `private_blobs`, not started empty.** A registry that lives only
+        # in the worker is a guarantee that ends at the first crash: the Writer's
+        # rationale from before it is still on the patch, and a resumed job with an empty
+        # registry would pass every check it was asked to make while handing that
+        # rationale to a reviewer.
+        self.taint = TaintRegistry.rebuilt(
+            (blob["label"] or f"{blob['role']}.{blob['blob_id'][:8]}", blob["text"])
+            for blob in load_private_blobs(db, job_id)
+        )
+
+        # Wrapped last, so every agent gets the audit trail without any of them knowing
+        # about it. An audit trail each new agent has to remember to write to is one with
+        # invisible holes: a missing row looks exactly like a call never made.
+        self.client = RecordingClient(
+            client, db, job_id, prompt_versions=self.prompt_versions
+        )
         self._source_parse: ParsedWorkbook | None = None
 
     # -- helpers ----------------------------------------------------------------------
@@ -307,6 +343,75 @@ class CurationCouncil:
         transition_job(
             self.db, self.job_id, target, run_epoch=self.run_epoch, failure_reason=reason
         )
+
+    def _note_rediscovery(self, kind: str, issue: Issue, finding: ValidationFinding) -> None:
+        """Write down that a closed issue's defect came back.
+
+        A count the report can show, rather than a state change a reader has to infer.
+        "Repaired, rediscovered, repaired again" and "repaired, rediscovered, gave up" end
+        in visibly different places, but nothing in the final row says the rediscovery
+        happened at all -- and that is the part a curator most needs to know about.
+        """
+        record_event(
+            self.db,
+            self.job_id,
+            kind,
+            f"{issue.issue_id} ({finding.code} at row {finding.row}) in "
+            f"{issue.problem_name} after {issue.attempts_used} attempt(s)",
+        )
+
+    def _record_gate_findings(self, gate) -> None:
+        """Store the final gate's verdict where the API can read it.
+
+        Written under `FINAL_GATE_ROUND` rather than a repair round, so `latest_findings`
+        returns *this* -- the state of the workbook as it was handed over -- rather than
+        whatever the last repair round happened to see before its repairs were applied.
+        """
+        for kind, findings in (
+            ("content", gate.content_findings),
+            ("integrity", gate.integrity_findings),
+        ):
+            deduped = dedupe(tuple(findings))
+            record_findings(
+                self.db,
+                self.job_id,
+                FINAL_GATE_ROUND,
+                deduped,
+                [fingerprint(f) for f in deduped],
+                kind=kind,
+            )
+
+    def _pin_prompts(self) -> None:
+        """Fix this job's prompt versions, once, at the first step that runs.
+
+        `INSERT OR IGNORE`, so a resumed job keeps what it started with rather than
+        adopting whatever is on disk now. The in-memory copy is refreshed from the write
+        so the recording client labels calls with the pinned version, not the current one.
+        """
+        pin_prompt_versions(self.db, self.job_id, current_prompt_versions())
+        self.prompt_versions = load_prompt_versions(self.db, self.job_id)
+        self.client.prompt_versions = self.prompt_versions
+
+    def _prompt_version(self, role: AgentRole) -> int | None:
+        return self.prompt_versions.get(role.value)
+
+    def _keep_private(self, role: AgentRole, label: str, model, issue_id=None) -> None:
+        """Register reasoning with the taint registry *and* write it down.
+
+        Both, always, and in that order. The registry is what stops the text reaching a
+        reviewer in this process; the row is what stops it reaching one in the next.
+        """
+        self.taint.register_model(label, model)
+        for field, value in model.model_dump().items():
+            if isinstance(value, str) and value.strip():
+                save_private_blob(
+                    self.db,
+                    self.job_id,
+                    role=role.value,
+                    label=f"{label}.{field}",
+                    text=value,
+                    issue_id=issue_id,
+                )
 
     def _check_deadline(self) -> None:
         """Bound this *run*, not the job's whole existence.
@@ -459,6 +564,7 @@ class CurationCouncil:
     def _ingest(self) -> StepOutcome:
         """Recover anything a crash left behind, then open the deterministic issues."""
         self._spend()
+        self._pin_prompts()
         recover_job(
             self.db, self.job, self.copy, self.machine, list_issues(self.db, self.job_id)
         )
@@ -499,6 +605,10 @@ class CurationCouncil:
             curator_rules=self.curator_rules,
             job_id=self.job_id,
             taint=self.taint,
+            prompt_version=self._prompt_version(AgentRole.INITIAL_AUDITOR),
+        )
+        self._keep_private(
+            AgentRole.INITIAL_AUDITOR, f"auditor.{block.block_id}", result.private
         )
         opened = self._open_issues(result.findings, source=IssueSource.INITIAL_AUDITOR)
         self._record_claim_verdicts(block.block_id, result)
@@ -535,6 +645,7 @@ class CurationCouncil:
                 curator_rules=self.curator_rules,
                 job_id=self.job_id,
                 taint=self.taint,
+                prompt_version=self._prompt_version(AgentRole.INDEPENDENT_REVIEWER),
             )
             opened = self._open_issues(
                 result.findings,
@@ -655,8 +766,21 @@ class CurationCouncil:
         corrected = outputs / "corrected.xlsx"
         corrected.write_bytes(self.copy.path.read_bytes())
         record_artifact(
-            self.db, self.job_id, ArtifactKind.CORRECTED_WORKBOOK, str(corrected)
+            self.db,
+            self.job_id,
+            ArtifactKind.CORRECTED_WORKBOOK,
+            str(corrected),
+            # Hashed so a curator can tell the file they downloaded is the file this
+            # report is about. An artefact with no hash is a claim about a file nobody
+            # can check they are holding.
+            sha256=sha256_of(corrected),
         )
+
+        # **Persisted, not just rendered.** These used to exist only inside the markdown
+        # report, so `GET /report` answered with zero remaining findings for a job whose
+        # own report listed them -- the API quietly reassuring a curator that the file the
+        # report says needs work is fine.
+        self._record_gate_findings(gate)
 
         # Three conditions, and all three are load-bearing. Integrity says the output is
         # an accounted-for descendant of the source. The ledger says every claim reached
@@ -687,11 +811,18 @@ class CurationCouncil:
             integrity_findings=gate.integrity_findings,
             claims=load_instruction_segments(self.db, self.job_id),
             claim_results=list_claim_results(self.db, self.job_id),
+            usage=token_usage(self.db, self.job_id),
+            artifacts=describe_artifacts(self.db, self.job_id),
+            rediscoveries=rediscovery_counts(self.db, self.job_id),
         )
         report_path = outputs / "report.md"
         report_path.write_text(render_markdown(reports), encoding="utf-8")
         record_artifact(
-            self.db, self.job_id, ArtifactKind.VALIDATION_REPORT, str(report_path)
+            self.db,
+            self.job_id,
+            ArtifactKind.VALIDATION_REPORT,
+            str(report_path),
+            sha256=sha256_of(report_path),
         )
 
         # `SUCCEEDED` is set here and nowhere else, guarded by every gate.
@@ -774,6 +905,7 @@ class CurationCouncil:
                 curator_rules=self.curator_rules,
                 job_id=self.job_id,
                 taint=self.taint,
+                prompt_version=self._prompt_version(AgentRole.WRITER),
             )
         except ProviderConfigurationError:
             # Not an interrupted attempt. Refunding it would hand the budget back so the
@@ -826,6 +958,17 @@ class CurationCouncil:
                 # the provider was unavailable, and the job should say so.
                 return self._provider_failed(error)
             return StepOutcome(True, f"writer call failed: {error}", state)
+
+        # Written down before anything is decided about the patch. A rationale persisted
+        # only for accepted patches would leave the rejected ones -- the interesting ones,
+        # when someone asks why the council did what it did -- with no record at all, and
+        # would leave the taint registry blind to reasoning a resumed job never saw.
+        self._keep_private(
+            AgentRole.WRITER,
+            f"writer.{issue.issue_id}.{attempt.attempt_no}",
+            result.private,
+            issue_id=issue.issue_id,
+        )
 
         patch = result.patch
         if patch.needs_human_review:
@@ -944,6 +1087,11 @@ class CurationCouncil:
             job_id=self.job_id,
             taint=self.taint,
             role=issue.reviewer_role,
+            prompt_version=self._prompt_version(
+                AgentRole.KNOWN_ISSUE_REVIEWER
+                if issue.reviewer_role is ReviewerRole.KNOWN_ISSUE_REVIEWER
+                else AgentRole.INDEPENDENT_REVIEWER
+            ),
         )
         insert_verdict(self.db, verdict)
 
@@ -1092,12 +1240,15 @@ class CurationCouncil:
                     result.still_open += 1
                 elif seen.state is IssueState.NEEDS_HUMAN_REVIEW:
                     result.absorbed += 1
+                    self._note_rediscovery("finding_absorbed", seen, finding)
                 elif self.machine.can_attempt(seen):
                     save_issue(self.db, self.machine.reopen(seen))
                     result.reopened += 1
+                    self._note_rediscovery("issue_reopened", seen, finding)
                 else:
                     save_issue(self.db, self.machine.reopen(seen))
                     result.absorbed += 1
+                    self._note_rediscovery("finding_absorbed", seen, finding)
                 continue
 
             role = (
