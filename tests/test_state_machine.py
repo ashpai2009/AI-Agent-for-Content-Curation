@@ -62,10 +62,25 @@ def test_every_issue_state_appears_in_the_table():
     assert set(LEGAL_ISSUE_TRANSITIONS) == set(IssueState)
 
 
-@pytest.mark.parametrize("state", sorted(TERMINAL_JOB_STATES, key=str))
-def test_terminal_job_states_go_nowhere(state):
+@pytest.mark.parametrize(
+    "state", sorted(TERMINAL_JOB_STATES - {JobState.FAILED}, key=str)
+)
+def test_finished_job_states_go_nowhere(state):
     """Including to CANCELLED. A finished job cannot be un-finished."""
     assert LEGAL_JOB_TRANSITIONS[state] == frozenset()
+
+
+def test_a_failed_job_can_only_re_enter_at_the_beginning():
+    """The one terminal state with a way out, because some failures are worth another
+    run. It re-enters at `INGESTING` rather than where it failed: every phase is a queue
+    predicate over durable rows, so ingestion is idempotent, and restoring the exact
+    state would need a second record of a position that is meant to be derivable.
+
+    The table permits the edge for every failure; which failures may take it is
+    `is_resumable`'s decision, tested below.
+    """
+    assert LEGAL_JOB_TRANSITIONS[JobState.FAILED] == frozenset({JobState.INGESTING})
+
 
 
 def test_an_escalated_issue_goes_nowhere():
@@ -105,6 +120,10 @@ def test_the_only_cycle_is_the_validation_repair_edge():
         for target in targets
         if source in LEGAL_JOB_TRANSITIONS.get(target, frozenset())
         and target not in TERMINAL_JOB_STATES
+        # `FAILED -> INGESTING` closes a loop on paper only. Nothing takes it
+        # automatically: `claimable_jobs` excludes failed jobs, so a failed job re-enters
+        # the pipeline when a person asks it to and at no other time.
+        and source is not JobState.FAILED
     ]
     assert set(cycles) == {
         (JobState.FINAL_VALIDATION, JobState.REPAIRING_VALIDATION),

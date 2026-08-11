@@ -441,7 +441,6 @@ def test_the_full_run_is_observable_through_the_api(client, workbook_bytes):
     client.app.state.runner.submit(
         job_id, client.app_settings.data_root / job_id
     )
-    client.app.state.runner.shutdown()
     _wait_for_terminal(client, job_id)
 
     status = client.get(f"/jobs/{job_id}").json()
@@ -510,7 +509,6 @@ def test_no_response_ever_leaks_a_filesystem_path(client, workbook_bytes, tmp_pa
 def test_a_finished_job_cannot_be_resumed(client, workbook_bytes):
     job_id = submit(client, workbook_bytes).json()["job_id"]
     client.app.state.runner.submit(job_id, client.app_settings.data_root / job_id)
-    client.app.state.runner.shutdown()
     _wait_for_terminal(client, job_id)
 
     response = client.post(f"/jobs/{job_id}/resume")
@@ -534,6 +532,90 @@ def test_an_interrupted_job_can_be_resumed(client, workbook_bytes):
     job_id = submit(client, workbook_bytes).json()["job_id"]
     response = client.post(f"/jobs/{job_id}/resume")
     assert response.status_code == 202
-    client.app.state.runner.shutdown()
     _wait_for_terminal(client, job_id)
     assert client.get(f"/jobs/{job_id}").json()["state"] == "succeeded"
+
+
+def test_the_lifespan_starts_a_poller(tmp_path):
+    """Without one, a job whose worker died sits in the database with an expired lease
+    and nobody ever looks at it -- crash recovery would exist in `recover_job` and never
+    actually run."""
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "council.db"),
+        client_factory=mock_client,
+        autostart=True,
+    )
+    with TestClient(app) as test_client:
+        assert test_client.get("/readyz").json()["checks"]["poller"] is True
+        assert app.state.poller._thread is not None
+    assert app.state.poller._thread is None
+
+
+def test_a_job_orphaned_by_a_dead_worker_is_picked_up_at_startup(tmp_path, workbook_bytes):
+    """The durable queue in action. The submitting process is gone; the row is not."""
+    from oatutor_council.persistence import acquire_lease
+
+    settings = settings_for(tmp_path, poll_interval_seconds=0.05)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    db = Database(settings.data_root / "council.db")
+
+    submitter = create_app(
+        settings=settings, db=db, client_factory=mock_client, autostart=False
+    )
+    with TestClient(submitter) as first:
+        job_id = submit(first, workbook_bytes).json()["job_id"]
+    # A worker took it and died: the lease is expired and nothing is running.
+    acquire_lease(db, job_id, "a-worker-that-died", lease_seconds=0)
+
+    restarted = create_app(
+        settings=settings, db=db, client_factory=mock_client, autostart=True
+    )
+    with TestClient(restarted) as second:
+        _wait_for_terminal(second, job_id)
+        assert second.get(f"/jobs/{job_id}").json()["state"] == "succeeded"
+
+
+def test_resuming_a_failed_job_actually_moves_it(tmp_path, workbook_bytes):
+    """`is_resumable` was a promise nothing kept: the endpoint returned 202, the worker
+    found `FAILED` -- a state with no outgoing edge -- reported "nothing to do", and the
+    job never moved. The curator saw an accepted request and no progress."""
+    from oatutor_council.models import FailureReason, JobState
+    from oatutor_council.persistence import get_job, transition_job
+
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    db = Database(settings.data_root / "council.db")
+    app = create_app(
+        settings=settings, db=db, client_factory=mock_client, autostart=False
+    )
+    with TestClient(app) as test_client:
+        job_id = submit(test_client, workbook_bytes).json()["job_id"]
+        job = get_job(db, job_id)
+        transition_job(
+            db,
+            job_id,
+            JobState.FAILED,
+            run_epoch=job.run_epoch,
+            failure_reason=FailureReason.PROVIDER,
+        )
+
+        assert test_client.post(f"/jobs/{job_id}/resume").status_code == 202
+        # Deliberately not `_wait_for_terminal`: `failed` *is* terminal, so it would
+        # return at once and the assertion would pass on a job that never moved.
+        _wait_for_state(test_client, job_id, "succeeded")
+
+
+def _wait_for_state(client, job_id: str, expected: str, limit: int = 200) -> None:
+    import time
+
+    for _ in range(limit):
+        if client.get(f"/jobs/{job_id}").json()["state"] == expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"job stayed in {client.get(f'/jobs/{job_id}').json()['state']}, "
+        f"never reached {expected}"
+    )

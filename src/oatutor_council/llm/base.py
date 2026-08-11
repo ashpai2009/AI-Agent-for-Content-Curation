@@ -14,6 +14,7 @@ the provider module stays small enough to check against the SDK notes line by li
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TypeVar
@@ -38,12 +39,67 @@ class ProviderError(Exception):
     Distinct from a malformed response: this means the call itself failed or the
     interaction never reached `completed`, which is infrastructure rather than content
     and is therefore eligible for an attempt refund.
+
+    `retry_after` carries a server-supplied delay in seconds when there was one. Honouring
+    it matters: backing off less than the provider asked for is how a rate-limited client
+    converts one 429 into a sustained stream of them.
     """
 
-    def __init__(self, message: str, *, status: str = "", retryable: bool = True) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str = "",
+        retryable: bool = True,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        self.retry_after = retry_after
+
+
+class RateLimited(ProviderError):
+    """A 429. Retried with exponential backoff, or with the server's own delay."""
+
+    def __init__(
+        self, message: str, *, status: str = "rate_limited", retry_after: float | None = None
+    ) -> None:
+        super().__init__(message, status=status, retryable=True, retry_after=retry_after)
+
+
+class ProviderTimeout(ProviderError):
+    """The call did not return within the per-call timeout.
+
+    Retryable, but bounded like everything else: a model that times out three times is a
+    model that will time out on the fourth call too, and the job is better off failing
+    with an explanation than spending its budget discovering that.
+    """
+
+    def __init__(self, message: str, *, status: str = "timeout") -> None:
+        super().__init__(message, status=status, retryable=True)
+
+
+class ProviderUnavailable(ProviderError):
+    """A 5xx, or a transport failure that never reached the model. Retryable."""
+
+    def __init__(
+        self, message: str, *, status: str = "unavailable", retry_after: float | None = None
+    ) -> None:
+        super().__init__(message, status=status, retryable=True, retry_after=retry_after)
+
+
+class ProviderRefused(ProviderError):
+    """The model declined to answer -- a safety block, a recitation stop, a filtered prompt.
+
+    **Never retried**, and deliberately not treated as an outage. The same workbook cell
+    will trip the same filter on every call, so retrying spends the budget to arrive at
+    the same refusal. It is content, not infrastructure: the right response is to hand
+    that block to a person, which is what the caller does with it.
+    """
+
+    def __init__(self, message: str, *, status: str = "refused") -> None:
+        super().__init__(message, status=status, retryable=False)
 
 
 class ProviderConfigurationError(ProviderError):
@@ -61,6 +117,31 @@ class ProviderConfigurationError(ProviderError):
 
     def __init__(self, message: str, *, status: str = "") -> None:
         super().__init__(message, status=status, retryable=False)
+
+
+#: Anything shaped like a Google API key. The SDK echoes the failing request URL in some
+#: error messages, and that URL can carry `?key=...`.
+_KEY_PATTERN = re.compile(r"(AIza[0-9A-Za-z_\-]{10,})|((?i:key|api[_-]?key)=)[^\s&\"']+")
+
+#: How much of a provider message is worth keeping. A provider error can quote the request
+#: body back at you, and the request body is a curator's workbook.
+MAX_PROVIDER_MESSAGE_CHARACTERS = 400
+
+
+def sanitize_provider_message(message: str) -> str:
+    """Make a provider error safe to persist, log, and serve.
+
+    Two separate hazards, and both are real. The message may contain the API key, because
+    the SDK sometimes includes the request URL. It may also contain the payload, which is
+    workbook content -- so an error string that gets logged is a copy of a curator's
+    material sitting in a log aggregator nobody scoped for it. Redact the first, truncate
+    the second, and keep enough to diagnose the failure.
+    """
+    redacted = _KEY_PATTERN.sub(lambda m: (m.group(2) or "") + "[redacted]", message)
+    collapsed = " ".join(redacted.split())
+    if len(collapsed) > MAX_PROVIDER_MESSAGE_CHARACTERS:
+        return collapsed[:MAX_PROVIDER_MESSAGE_CHARACTERS] + "… [truncated]"
+    return collapsed
 
 
 class MalformedResponse(Exception):

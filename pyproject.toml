@@ -14,7 +14,6 @@ dependencies = [
   "openpyxl>=3.1",
   "sympy>=1.13",
   "google-genai>=2.17",
-  "tenacity>=8.2",             # 429 backoff; imported directly, not via google-genai
   "python-dotenv>=1.0",
   "python-docx>=1.1",
   "pypdf>=5.1",                # embedded-text extraction only - deliberately not a renderer

@@ -48,7 +48,17 @@ _JOB_FLOW: dict[JobState, frozenset[JobState]] = {
     ),
     JobState.SUCCEEDED: frozenset(),
     JobState.NEEDS_HUMAN_ATTENTION: frozenset(),
-    JobState.FAILED: frozenset(),
+    # A resumable failure -- an outage, a run that overran its ceiling -- re-enters at
+    # `INGESTING` rather than at whatever state it failed in. Every phase is a queue
+    # predicate over durable rows, so ingestion is idempotent: recovery settles what the
+    # crash left open, audited blocks are already recorded as done, and deduplication by
+    # fingerprint means re-derived findings reopen nothing. Restoring the exact state
+    # would need a second record of where it got to, and a job's position is meant to be
+    # derivable from its rows rather than remembered alongside them.
+    #
+    # Which failures may take this edge is `is_resumable`'s decision, not this table's:
+    # corruption, an isolation violation and a misconfiguration must never re-enter.
+    JobState.FAILED: frozenset({JobState.INGESTING}),
     JobState.CANCELLED: frozenset(),
 }
 

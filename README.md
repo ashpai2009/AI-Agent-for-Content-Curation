@@ -61,7 +61,8 @@ and prints every artefact.
 
 ```bash
 export GEMINI_API_KEY=...            # see .env.example for every setting
-.venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src --port 8000
+.venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src \
+  --port 8000 --workers 1
 
 # Verify the provider with one live call carrying no workbook content
 .venv/bin/python scripts/smoke_provider.py
@@ -70,6 +71,18 @@ export GEMINI_API_KEY=...            # see .env.example for every setting
 Without credentials the service **refuses to start**, rather than accepting uploads it
 can never process. `GET /health` is liveness; `GET /readyz` answers the different and more
 useful question of whether a job submitted right now could actually run.
+
+**One worker process.** The lease protocol itself is safe across processes — epoch fencing
+and `BEGIN IMMEDIATE` are not in-process locks — but SQLite in WAL mode over a single file
+wants one writer, and the working copies live on a local filesystem. Concurrency within the
+process is `MAX_CONCURRENT_JOBS`. Scaling horizontally means a shared database and shared
+storage, which is a different design rather than a flag.
+
+Jobs survive the process that started them. A worker renews its lease from a background
+thread, so a model call that outlasts the lease does not lose the job; if the process dies,
+the lease expires and a poller in the next process picks the job up — on startup and then
+every `POLL_INTERVAL_SECONDS`. Shutdown asks running jobs to stop at a step boundary and
+releases their leases, so a restart resumes immediately instead of waiting the lease out.
 
 ```bash
 # Submit
@@ -213,9 +226,23 @@ corpus read-only, hashing every file before and after, and reports what it finds
 ## Provider
 
 Google Gemini through `google-genai`, default model `gemini-3.6-flash`, overridable with
-`GEMINI_MODEL`. Structured outputs with Pydantic schemas for every agent response,
-exponential backoff on 429, and a scripted mock client that drives the entire council
-offline.
+`GEMINI_MODEL`. Structured outputs with Pydantic schemas for every agent response, and a
+scripted mock client that drives the entire council offline.
+
+Failures are classified rather than lumped together, because they need opposite handling:
+
+| Failure | Handling |
+| --- | --- |
+| 429, 5xx, timeout, transport | Retried with exponential backoff, honouring `Retry-After` where the server sends one and capping it where it exceeds our patience |
+| Rejected key, unknown model, malformed request | Never retried — it fails identically until the settings change. `FAILED(CONFIG)`, non-resumable |
+| Safety block, recitation | Never retried either: the same cell trips the same filter every time. That one issue goes to a person and the job carries on |
+| Anything unrecognised | Treated as transient — the conservative reading, since a bounded few retries costs less than failing a job that would have worked |
+
+Every call carries a timeout. Lost calls are counted against a per-job budget stored in the
+database rather than in the worker, because a provider outage routinely takes the worker
+with it and an in-memory counter would reset exactly when it mattered. Persisted error
+messages are truncated and stripped of anything key-shaped: a provider can quote your
+workbook back at you in an error, and errors end up in logs.
 
 **There is no `Conversation` object anywhere in the codebase**, and a test greps the whole
 package to keep it that way. Context isolation is not a discipline anyone has to remember;

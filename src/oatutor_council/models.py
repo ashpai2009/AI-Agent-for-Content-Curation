@@ -865,6 +865,10 @@ class FailureReason(StrEnum):
     ISOLATION_VIOLATION = "isolation_violation"
     CONFIG = "config"
     PROVIDER = "provider"
+    #: Ran past its wall-clock ceiling. Resumable: the work is intact and the next run
+    #: starts from where this one stopped, which is the right answer for a job that was
+    #: merely slow.
+    TIMEOUT = "timeout"
     BUDGET_EXHAUSTED = "budget_exhausted"
     INVALID_INPUT = "invalid_input"
     INTERNAL = "internal"

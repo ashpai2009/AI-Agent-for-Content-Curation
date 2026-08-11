@@ -33,7 +33,14 @@ from .agents import independent_reviewer, initial_auditor, known_issue_reviewer,
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
 from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
-from .llm.base import LLMClient, ProviderConfigurationError, ProviderError
+from .llm.base import (
+    LLMClient,
+    MalformedResponse,
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderRefused,
+    sanitize_provider_message,
+)
 from .models import (
     ArtifactKind,
     ClaimOutcome,
@@ -55,8 +62,11 @@ from .models import (
 )
 from .orchestrator import JobCorrupted, apply_patch, failure_for, recover_job
 from .persistence import (
+    ConcurrencyError,
     Database,
+    assert_lease_held,
     blocks_done,
+    count_events,
     get_job,
     increment_counters,
     insert_attempt,
@@ -122,8 +132,21 @@ LIVE_ISSUE_STATES = _NEEDS_WRITER | _NEEDS_APPLY | _NEEDS_REVIEW
 MAX_CURATOR_RULE_CHARACTERS = 4_000
 
 
+#: The durable event kind counted against `provider_failure_budget`.
+PROVIDER_FAILURE_EVENT = "provider_failure"
+
+
 class BudgetExhausted(Exception):
     """A global fuse blew. Always terminal, never retried."""
+
+
+class JobDeadlineExceeded(Exception):
+    """The job ran past its wall-clock ceiling.
+
+    Distinct from the step and call fuses, which bound *work*. This bounds *time*, and it
+    is the only brake that catches a job whose worker is alive, within budget, and simply
+    not getting anywhere -- a provider degraded to one call a minute, say.
+    """
 
 
 @dataclass(frozen=True)
@@ -165,6 +188,7 @@ class CurationCouncil:
         job_id: str,
         copy: WorkingCopy,
         worker_id: str = "worker",
+        run_epoch: int | None = None,
     ) -> None:
         self.db = db
         self.settings = settings
@@ -172,6 +196,13 @@ class CurationCouncil:
         self.job_id = job_id
         self.copy = copy
         self.worker_id = worker_id
+        # **Pinned at construction, and never re-read.** This is the whole fencing
+        # mechanism: every write carries the epoch this worker started with, so once
+        # another worker steals the lease and bumps the epoch, this one's writes match
+        # zero rows and it stops. Reading `self.job.run_epoch` at each write instead --
+        # which is what this used to do -- always agrees with itself and fences nothing.
+        self.run_epoch = get_job(db, job_id).run_epoch if run_epoch is None else run_epoch
+        self.started_at = datetime.now(timezone.utc)
         self.machine = IssueMachine(
             max_attempts=settings.max_repair_attempts,
             interrupted_retry_budget=settings.interrupted_retry_budget,
@@ -265,23 +296,64 @@ class CurationCouncil:
                 f"job exceeded its model-call budget of {self.settings.llm_call_budget}"
             )
         increment_counters(
-            self.db, self.job_id, run_epoch=job.run_epoch, steps=steps, llm_calls=llm_calls
+            self.db,
+            self.job_id,
+            run_epoch=self.run_epoch,
+            steps=steps,
+            llm_calls=llm_calls,
         )
 
     def _advance(self, target: JobState, reason: FailureReason | None = None) -> None:
         transition_job(
-            self.db, self.job_id, target, run_epoch=self.job.run_epoch, failure_reason=reason
+            self.db, self.job_id, target, run_epoch=self.run_epoch, failure_reason=reason
         )
+
+    def _check_deadline(self) -> None:
+        """Bound this *run*, not the job's whole existence.
+
+        Anchoring to `created_at` was the first reading and it is a trap: a job that timed
+        out would fail again the instant anyone resumed it, since the age that tripped the
+        ceiling only grows. Anchoring to when this worker started bounds the thing that
+        actually needs bounding -- a worker holding a lease and getting nowhere -- and
+        gives a resumed job a fresh window, which is right, because somebody decided to
+        resume it.
+        """
+        limit = self.settings.run_deadline_seconds
+        if limit <= 0:
+            return
+        elapsed = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+        if elapsed > limit:
+            raise JobDeadlineExceeded(
+                f"this run has been going for {int(elapsed)}s, past its "
+                f"{int(limit)}s ceiling"
+            )
 
     # -- the loop ---------------------------------------------------------------------
 
-    def run(self, *, max_steps: int | None = None) -> CurationJob:
-        """Drain steps until the job reaches a terminal state."""
+    def run(self, *, max_steps: int | None = None, should_stop=None) -> CurationJob:
+        """Drain steps until the job reaches a terminal state.
+
+        `should_stop` is the cooperative half of shutdown. A pool that cancels futures can
+        only cancel the ones that have not started; a worker already inside a step has to
+        be asked, and asking it between steps is exactly right because the step contract
+        makes every boundary a consistent point.
+
+        Losing the lease is not a failure of the job -- somebody else owns it now, and the
+        correct behaviour is to stop touching it and say so, not to mark it failed and
+        overwrite the new owner's work.
+        """
         taken = 0
         while not self.job.is_terminal:
             if max_steps is not None and taken >= max_steps:
                 break
-            self.step()
+            if should_stop is not None and should_stop():
+                record_event(self.db, self.job_id, "worker_stopped", "shutdown requested")
+                break
+            try:
+                self.step()
+            except ConcurrencyError as error:
+                record_event(self.db, self.job_id, "lease_lost", str(error))
+                break
             taken += 1
         return self.job
 
@@ -289,20 +361,35 @@ class CurationCouncil:
         """One unit of progress. See the module docstring for the contract."""
         job = self.job
         try:
+            self._check_deadline()
             return self._dispatch(job)
+        except JobDeadlineExceeded as error:
+            record_event(self.db, self.job_id, "deadline_exceeded", str(error))
+            self._advance(JobState.FAILED, FailureReason.TIMEOUT)
+            return StepOutcome(False, str(error), self.job.state)
         except BudgetExhausted as error:
             record_event(self.db, self.job_id, "budget_exhausted", str(error))
             self._advance(JobState.FAILED, FailureReason.BUDGET_EXHAUSTED)
             return StepOutcome(False, str(error), self.job.state)
         except ProviderConfigurationError as error:
-            # Handled here rather than in `_write` so it covers all four agents: the
-            # auditor and the reviewers make the same call against the same settings, and
-            # a key that is wrong for one is wrong for every one of them. Retrying is a
-            # loop that spends the whole job budget to arrive at the same message, so the
-            # job fails as CONFIG -- non-resumable until somebody changes the settings.
+            # Caught **before** the general provider clause, because it is a subclass of
+            # it and the two need opposite handling. Handled here rather than in `_write`
+            # so it covers all four agents: the auditor and the reviewers make the same
+            # call against the same settings, and a key that is wrong for one is wrong for
+            # every one of them. Retrying is a loop that spends the whole job budget to
+            # arrive at the same message, so the job fails as CONFIG -- non-resumable
+            # until somebody changes the settings.
             record_event(self.db, self.job_id, "provider_misconfigured", str(error))
             self._advance(JobState.FAILED, FailureReason.CONFIG)
             return StepOutcome(False, str(error), self.job.state)
+        except (ProviderError, MalformedResponse) as error:
+            # Every agent's calls land here, not just the Writer's. The auditor and both
+            # reviewers call the same provider with the same settings, and an outage that
+            # interrupts one interrupts all four -- so the accounting has to be in one
+            # place or three quarters of the failures go unbudgeted. `_write` handles the
+            # cases it can do something better with -- a refusal escalates the issue, an
+            # outage refunds the attempt -- and only what it re-raises reaches here.
+            return self._provider_failed(error)
         except ContextIsolationError as error:
             # Never a warning and never a retry: the same tainted payload would be sent
             # again, and a leaked review would still count as a review.
@@ -313,6 +400,33 @@ class CurationCouncil:
             record_event(self.db, self.job_id, "corruption", str(error))
             self._advance(JobState.FAILED, failure_for(error))
             return StepOutcome(False, str(error), self.job.state)
+
+    def _provider_failed(self, error: Exception) -> StepOutcome:
+        """Record one lost model call, and fail the job once too many are lost.
+
+        The step is *not* retried here. Every phase is a queue predicate over durable
+        rows, so the work this step was going to do is still queued and the next step
+        picks it up -- which means a transient outage costs a step and nothing else, and
+        no retry logic has to be written twice.
+
+        The budget is what stops that from being an infinite loop. It is counted from
+        durable events rather than an instance attribute, because the failure mode being
+        bounded here -- a provider that is down -- routinely takes the worker down with
+        it, and a counter that resets on every crash bounds nothing.
+        """
+        message = sanitize_provider_message(str(error))
+        record_event(self.db, self.job_id, PROVIDER_FAILURE_EVENT, message)
+        spent = count_events(self.db, self.job_id, PROVIDER_FAILURE_EVENT)
+        if spent >= self.settings.provider_failure_budget:
+            self._advance(JobState.FAILED, FailureReason.PROVIDER)
+            return StepOutcome(
+                False,
+                f"the provider failed {spent} times: {message}",
+                self.job.state,
+            )
+        return StepOutcome(
+            True, f"provider failure {spent}, retrying next step: {message}", self.job.state
+        )
 
     def _dispatch(self, job: CurationJob) -> StepOutcome:
         if job.state is JobState.CREATED:
@@ -665,7 +779,33 @@ class CurationCouncil:
             # Not an interrupted attempt. Refunding it would hand the budget back so the
             # same misconfiguration could spend it again; `step` fails the job instead.
             raise
-        except (ProviderError, writer.WriterProposedNothing) as error:
+        except ProviderRefused as error:
+            # The model declined to answer for this block's content. Not an outage and not
+            # a refundable interruption: the same cells will trip the same filter on the
+            # next call, so refunding the attempt would buy three identical refusals. It
+            # is also not a reason to fail the whole job -- one block a filter dislikes
+            # says nothing about the other twenty-nine. The issue goes to a person and the
+            # council carries on, which is what escalation is for.
+            settle_attempt(
+                self.db,
+                attempt.model_copy(
+                    update={
+                        "outcome": AttemptOutcome.ESCALATED,
+                        "finished_at": datetime.now(timezone.utc),
+                    }
+                ),
+            )
+            save_issue(self.db, self.machine.exhausted(issue))
+            record_event(
+                self.db,
+                self.job_id,
+                "provider_refused",
+                f"{issue.issue_id}: {sanitize_provider_message(str(error))}",
+            )
+            return StepOutcome(
+                True, f"{issue.issue_id} escalated: the model declined to answer", state
+            )
+        except (ProviderError, MalformedResponse, writer.WriterProposedNothing) as error:
             # Infrastructure or an unusable response. The attempt is refunded within the
             # bounded budget, because neither is the Writer failing at the task.
             settle_attempt(
@@ -678,6 +818,13 @@ class CurationCouncil:
                 ),
             )
             save_issue(self.db, self.machine.refund_interrupted(issue))
+            if isinstance(error, (ProviderError, MalformedResponse)):
+                # Refunded *and* counted against the job. The refund budget alone bounds
+                # this per issue, but a provider that is down would then walk every issue
+                # in the workbook to `NEEDS_HUMAN_REVIEW` one refund at a time and hand
+                # the curator a report saying their content needs a person. It does not;
+                # the provider was unavailable, and the job should say so.
+                return self._provider_failed(error)
             return StepOutcome(True, f"writer call failed: {error}", state)
 
         patch = result.patch
@@ -738,8 +885,22 @@ class CurationCouncil:
             issue = advance_issue(issue, IssueState.APPLYING)
             save_issue(self.db, issue)
 
+        # The last thing before a byte is written. Database writes are fenced by the epoch
+        # and a fenced worker simply updates nothing; `os.replace` consults no table, so
+        # without this check a worker whose lease was stolen mid-step could still rewrite
+        # the workbook the new owner is reading.
+        assert_lease_held(
+            self.db, self.job_id, self.worker_id, run_epoch=self.run_epoch
+        )
+
         try:
-            apply_patch(self.db, self.job, self.copy, patch, block_id=issue.block_id)
+            apply_patch(
+                self.db,
+                self.job.model_copy(update={"run_epoch": self.run_epoch}),
+                self.copy,
+                patch,
+                block_id=issue.block_id,
+            )
         except EditRejected as error:
             code = error.rejection.code
             # A `before` mismatch here means the block changed underneath the patch --

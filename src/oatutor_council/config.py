@@ -21,6 +21,16 @@ from dotenv import load_dotenv
 #: `state_machine.IssueMachine.reserve_attempt` -- so there is one place to audit.
 DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 
+#: Liveness and provider-failure defaults. Named constants rather than literals in two
+#: places, so the dataclass default and the environment default cannot drift apart.
+DEFAULT_HEARTBEAT_DIVISOR = 4
+DEFAULT_POLL_INTERVAL_SECONDS = 15.0
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 120.0
+DEFAULT_PROVIDER_MAX_ATTEMPTS = 4
+DEFAULT_PROVIDER_BACKOFF_CEILING_SECONDS = 60.0
+DEFAULT_PROVIDER_FAILURE_BUDGET = 12
+DEFAULT_RUN_DEADLINE_SECONDS = 21_600.0
+
 
 class ConfigurationError(RuntimeError):
     """The service is not configured well enough to do the work it accepts.
@@ -39,6 +49,16 @@ def _int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as error:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from error
+
+
+def _float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from error
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -64,9 +84,41 @@ class Settings:
     max_upload_bytes: int
     lease_seconds: int
 
+    #: How often a running worker renews its lease. Must be comfortably shorter than
+    #: `lease_seconds` or a worker loses a job it is actively working on -- see
+    #: `heartbeat_seconds` below, which enforces exactly that rather than trusting it.
+    heartbeat_divisor: int = DEFAULT_HEARTBEAT_DIVISOR
+    #: How often the poller looks for jobs whose worker died.
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
+
+    #: Per model call. A call with no ceiling can hold a lease for the life of the process.
+    provider_timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS
+    #: Total attempts per call, including the first. Bounded because every class of
+    #: transient failure this system retries is one that repeats when it is not transient.
+    provider_max_attempts: int = DEFAULT_PROVIDER_MAX_ATTEMPTS
+    provider_backoff_ceiling_seconds: float = DEFAULT_PROVIDER_BACKOFF_CEILING_SECONDS
+    #: How many model calls a job may lose to provider failure before the job is failed.
+    #: Counted from durable events, so it survives the crash of the worker that spent them.
+    provider_failure_budget: int = DEFAULT_PROVIDER_FAILURE_BUDGET
+    #: Wall-clock ceiling for one worker's run of a job. Zero disables it.
+    run_deadline_seconds: float = DEFAULT_RUN_DEADLINE_SECONDS
+
     #: Decision 1: reviewers judge the artefact, not the Writer's argument for it. Kept
     #: as a flag so the opposite reading stays testable rather than unimaginable.
     reviewer_sees_writer_rationale: bool = False
+
+    @property
+    def heartbeat_seconds(self) -> float:
+        """The renewal interval, derived so it *cannot* be longer than the lease.
+
+        Kept as a derived property rather than its own setting on purpose. Two independent
+        numbers where one must stay under the other is a configuration mistake waiting to
+        be made in an incident, and the failure it produces is subtle: a worker that is
+        alive and mid-model-call loses its job to the poller, which starts a second worker
+        on the same job. One number, and the relationship holds by construction.
+        """
+        divisor = max(2, self.heartbeat_divisor)
+        return max(1.0, self.lease_seconds / divisor)
 
     @property
     def provider_configured(self) -> bool:
@@ -120,5 +172,22 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         max_concurrent_jobs=_int("MAX_CONCURRENT_JOBS", 2),
         max_upload_bytes=_int("MAX_UPLOAD_BYTES", 52_428_800),
         lease_seconds=_int("LEASE_SECONDS", 120),
+        heartbeat_divisor=_int("HEARTBEAT_DIVISOR", DEFAULT_HEARTBEAT_DIVISOR),
+        poll_interval_seconds=_float(
+            "POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL_SECONDS
+        ),
+        provider_timeout_seconds=_float(
+            "PROVIDER_TIMEOUT_SECONDS", DEFAULT_PROVIDER_TIMEOUT_SECONDS
+        ),
+        provider_max_attempts=_int(
+            "PROVIDER_MAX_ATTEMPTS", DEFAULT_PROVIDER_MAX_ATTEMPTS
+        ),
+        provider_backoff_ceiling_seconds=_float(
+            "PROVIDER_BACKOFF_CEILING_SECONDS", DEFAULT_PROVIDER_BACKOFF_CEILING_SECONDS
+        ),
+        provider_failure_budget=_int(
+            "PROVIDER_FAILURE_BUDGET", DEFAULT_PROVIDER_FAILURE_BUDGET
+        ),
+        run_deadline_seconds=_float("RUN_DEADLINE_SECONDS", DEFAULT_RUN_DEADLINE_SECONDS),
         reviewer_sees_writer_rationale=_bool("REVIEWER_SEES_WRITER_RATIONALE", False),
     )

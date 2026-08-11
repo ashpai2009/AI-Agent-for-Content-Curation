@@ -520,6 +520,35 @@ def heartbeat(
             )
 
 
+def assert_lease_held(db: Database, job_id: str, owner: str, *, run_epoch: int) -> None:
+    """Refuse to continue if this worker no longer owns the job.
+
+    Every *database* write is already fenced by `run_epoch`, so a fenced worker cannot
+    corrupt durable state. The working copy is not a database write: `os.replace` does not
+    consult the `jobs` table, so a worker whose lease was stolen mid-step could still
+    rewrite a workbook the new owner is reading. This is the check that closes that gap,
+    and it belongs immediately before the file is touched rather than at the top of the
+    step -- the whole point is the time that passed since then.
+
+    Ownership is only compared when the job *has* an owner. A job with no lease at all is
+    a job nobody is competing for -- an embedded run, the offline demo, a test driving the
+    council directly -- and demanding a lease there would make leasing mandatory to do any
+    work rather than mandatory to do it concurrently. The epoch is checked unconditionally,
+    because a bumped epoch means somebody took the job whatever the row says now.
+    """
+    row = db.connection.execute(
+        "SELECT run_epoch, lease_owner FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    if row is None:
+        raise ConcurrencyError(f"job {job_id} does not exist")
+    stolen = row["lease_owner"] and row["lease_owner"] != owner
+    if row["run_epoch"] != run_epoch or stolen:
+        raise ConcurrencyError(
+            f"job {job_id} is now owned by {row['lease_owner']!r} at epoch "
+            f"{row['run_epoch']}; this worker holds {owner!r} at {run_epoch} and must stop"
+        )
+
+
 def release_lease(db: Database, job_id: str, owner: str, *, run_epoch: int) -> None:
     with db.write() as connection:
         connection.execute(
@@ -1140,6 +1169,22 @@ def record_event(db: Database, job_id: str, kind: str, detail: str = "") -> None
             "INSERT INTO job_events (event_id, job_id, at, kind, detail) VALUES (?,?,?,?,?)",
             (uuid4().hex, job_id, _iso(_now()), kind, detail),
         )
+
+
+def count_events(db: Database, job_id: str, kind: str) -> int:
+    """How many times something has happened to this job, durably.
+
+    Used for the provider-failure budget. A counter in worker memory would reset every
+    time the worker that was burning it died -- which is precisely the case the budget
+    exists to bound, since a provider failure and a crashed worker often have the same
+    cause. The events are already written for the audit trail; counting them costs a row
+    scan on an indexed column and needs no second source of truth to keep in step.
+    """
+    row = db.connection.execute(
+        "SELECT COUNT(*) AS n FROM job_events WHERE job_id = ? AND kind = ?",
+        (job_id, kind),
+    ).fetchone()
+    return int(row["n"]) if row else 0
 
 
 def list_events(db: Database, job_id: str) -> tuple[dict[str, str], ...]:

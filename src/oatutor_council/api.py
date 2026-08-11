@@ -19,41 +19,33 @@ probing for it should learn nothing.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from .config import ConfigurationError, Settings, load_settings
-from .council import CurationCouncil
+from .config import Settings, load_settings
 from .ingestion.instruction_documents import (
     SegmentPurpose,
     UnsupportedDocumentError,
     read_instruction_document,
 )
-from .llm.base import LLMClient, ProviderConfigurationError
-from .models import ArtifactKind, CurationJob, FailureReason, JobState, SourcePath
+from .models import ArtifactKind, CurationJob, JobState, SourcePath
 from .persistence import (
     Database,
-    acquire_lease,
-    claimable_jobs,
     create_job,
     get_job,
     list_artifacts,
     list_changes,
     list_claim_results,
     list_events,
-    list_issues,
     list_verdicts,
     load_instruction_segments,
     load_ledger,
     record_artifact,
-    record_event,
-    release_lease,
     save_instruction_segments,
 )
 from .reporting.reports import build_reports
@@ -67,89 +59,15 @@ from .uploads import (
     validate_upload,
 )
 from .workbook.writer import create_working_copy, sha256_of
+from .workers import (
+    ClientFactory,
+    JobPoller,
+    JobRunner,
+    default_client_factory,
+    job_dir_for,
+)
 
 log = logging.getLogger(__name__)
-
-ClientFactory = Callable[[Settings], LLMClient]
-
-
-def _default_client_factory(settings: Settings) -> LLMClient:
-    from .llm.provider import GeminiClient
-
-    return GeminiClient(settings)
-
-
-class JobRunner:
-    """Runs jobs on a bounded pool, one lease each."""
-
-    def __init__(
-        self,
-        *,
-        db: Database,
-        settings: Settings,
-        client_factory: ClientFactory,
-    ) -> None:
-        self.db = db
-        self.settings = settings
-        self.client_factory = client_factory
-        self._pool = ThreadPoolExecutor(
-            max_workers=settings.max_concurrent_jobs, thread_name_prefix="council"
-        )
-
-    def submit(self, job_id: str, job_dir: Path) -> None:
-        self._pool.submit(self._run, job_id, job_dir)
-
-    def _run(self, job_id: str, job_dir: Path) -> None:
-        worker = f"{job_id[:8]}-{uuid4().hex[:6]}"
-        try:
-            job = acquire_lease(
-                self.db, job_id, worker, lease_seconds=self.settings.lease_seconds
-            )
-        except Exception:
-            log.exception("could not acquire a lease for job %s", job_id)
-            return
-
-        try:
-            copy = _working_copy_for(self.db, job, job_dir)
-            council = CurationCouncil(
-                db=self.db,
-                settings=self.settings,
-                client=self.client_factory(self.settings),
-                job_id=job_id,
-                copy=copy,
-                worker_id=worker,
-            )
-            council.run()
-        except (ConfigurationError, ProviderConfigurationError) as error:
-            # The client could not even be built. Left as a generic worker error the job
-            # would sit in `created` with an expired lease, be swept, fail the same way,
-            # and be swept again -- looking like work in progress forever. `CONFIG` is
-            # non-resumable, so the sweep leaves it alone until the settings change.
-            log.error("job %s cannot run: %s", job_id, error)
-            record_event(self.db, job_id, "provider_misconfigured", str(error))
-            _fail_job(self.db, job_id, FailureReason.CONFIG)
-        except Exception as error:  # pragma: no cover - defence in depth
-            log.exception("job %s failed", job_id)
-            record_event(self.db, job_id, "worker_error", str(error))
-        finally:
-            # The epoch acquired above, so a worker that was fenced out mid-run releases
-            # nothing rather than clearing the new owner's lease.
-            release_lease(self.db, job_id, worker, run_epoch=job.run_epoch)
-
-    def sweep(self) -> int:
-        """Re-submit anything whose lease has expired.
-
-        The durable queue in action: a job whose worker died reappears here without any
-        coordination, because claimability is a property of rows rather than of memory.
-        """
-        resumed = 0
-        for job in claimable_jobs(self.db, limit=self.settings.max_concurrent_jobs):
-            self.submit(job.job_id, _job_dir(self.settings, job.job_id))
-            resumed += 1
-        return resumed
-
-    def shutdown(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _declared_purpose(value: str) -> SegmentPurpose | None:
@@ -172,41 +90,6 @@ def _database_reachable(db: Database) -> bool:
     except Exception:  # noqa: BLE001 - any failure here means the same thing
         return False
     return True
-
-
-def _fail_job(db: Database, job_id: str, reason: FailureReason) -> None:
-    from .persistence import transition_job
-
-    job = get_job(db, job_id)
-    if job is None or job.is_terminal:
-        return
-    transition_job(db, job_id, JobState.FAILED, run_epoch=job.run_epoch,
-                   failure_reason=reason)
-
-
-def _job_dir(settings: Settings, job_id: str) -> Path:
-    return settings.data_root / job_id
-
-
-def _working_copy_for(db: Database, job: CurationJob, job_dir: Path):
-    """Rebuild the working-copy handle from durable state.
-
-    Nothing about the copy is held in memory between steps, so a resumed job reconstructs
-    it from the recorded source path and hash exactly as the first worker did.
-    """
-    from .workbook.writer import WorkingCopy
-
-    source = SourcePath(str(job_dir / "source" / f"workbook{_extension(job)}"))
-    return WorkingCopy(
-        source=source,
-        source_sha256=job.source_sha256,
-        path=job_dir / "work" / "working.xlsx",
-        tmp_dir=job_dir / "work" / ".tmp",
-    )
-
-
-def _extension(job: CurationJob) -> str:
-    return Path(job.source_filename).suffix.lower() or ".xlsx"
 
 
 # --------------------------------------------------------------------------------------
@@ -240,15 +123,25 @@ def create_app(
 
     resolved.data_root.mkdir(parents=True, exist_ok=True)
     database = db or Database(resolved.data_root / "council.db")
-    factory = client_factory or _default_client_factory
+    factory = client_factory or default_client_factory
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.runner = JobRunner(
-            db=database, settings=resolved, client_factory=factory
-        )
+        runner = JobRunner(db=database, settings=resolved, client_factory=factory)
+        app.state.runner = runner
+        # The poller is what makes the `jobs` table a queue rather than a log. Without it
+        # a job whose worker died sits with an expired lease and nobody ever looks: crash
+        # recovery would exist in `recover_job` and never actually run. One sweep on
+        # startup too, so a process restarted after a crash resumes immediately instead of
+        # waiting out the first interval.
+        poller = JobPoller(runner, interval=resolved.poll_interval_seconds)
+        app.state.poller = poller
+        if autostart:
+            runner.sweep()
+            poller.start()
         yield
-        app.state.runner.shutdown()
+        poller.stop()
+        runner.shutdown()
 
     app = FastAPI(title="OATutor Curation Council", lifespan=lifespan)
     app.state.db = database
@@ -292,6 +185,10 @@ def create_app(
             "provider_configured": offline or resolved.provider_configured,
             "database": _database_reachable(database),
             "worker_pool": getattr(app.state, "runner", None) is not None,
+            # A process with a pool but no poller accepts work and runs it, then never
+            # picks up anything its predecessor left behind. That is a half-working
+            # service, and a probe that called it ready would hide the half that is not.
+            "poller": getattr(app.state, "poller", None) is not None,
         }
         ready = all(checks.values())
         return JSONResponse(
@@ -329,7 +226,7 @@ def create_app(
         )
 
         job_id = uuid4().hex
-        job_dir = _job_dir(resolved, job_id)
+        job_dir = job_dir_for(resolved, job_id)
         source_dir = job_dir / "source"
         source_dir.mkdir(parents=True, exist_ok=True)
 
@@ -520,7 +417,7 @@ def create_app(
                 status_code=409, detail="the job is already being worked on"
             )
 
-        app.state.runner.submit(job_id, _job_dir(resolved, job_id))
+        app.state.runner.submit(job_id, job_dir_for(resolved, job_id))
         return {"job_id": job_id, "state": job.state.value, "resumed": True}
 
     return app

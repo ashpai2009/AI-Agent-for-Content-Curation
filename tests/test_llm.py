@@ -21,7 +21,12 @@ from oatutor_council.llm.base import (
     MalformedResponse,
     ProviderConfigurationError,
     ProviderError,
+    ProviderRefused,
+    ProviderTimeout,
+    ProviderUnavailable,
+    RateLimited,
     call_structured,
+    sanitize_provider_message,
 )
 from oatutor_council.llm.context import ContextBundle, DataSection, neutralise
 from oatutor_council.llm.mock import ScriptedLLMClient
@@ -33,7 +38,11 @@ from oatutor_council.llm.prompts import (
     load_prompt,
     system_prompt,
 )
-from oatutor_council.llm.provider import GeminiClient, RateLimited
+from oatutor_council.llm.provider import (
+    GeminiClient,
+    classify_provider_error,
+    retry_after_of,
+)
 
 
 class Reply(BaseModel):
@@ -286,8 +295,8 @@ def test_the_mock_records_every_request_for_the_isolation_tests():
 # --------------------------------------------------------------------------------------
 
 
-def settings() -> Settings:
-    return Settings(
+def settings(**overrides) -> Settings:
+    return Settings(**{**dict(
         gemini_api_key="test-key",
         gemini_model="gemini-3.6-flash",
         data_root=Path("."),
@@ -299,7 +308,7 @@ def settings() -> Settings:
         max_concurrent_jobs=1,
         max_upload_bytes=1024,
         lease_seconds=60,
-    )
+    ), **overrides})
 
 
 class FakeInteractions:
@@ -317,6 +326,20 @@ class FakeInteractions:
 class FakeClient:
     def __init__(self, interaction, recorder):
         self.interactions = FakeInteractions(interaction, recorder)
+
+
+def gemini(interaction, calls, waits=None, **overrides):
+    """A provider whose sleeps are recorded rather than slept.
+
+    The retry policy is worth testing for what it *decides* -- how many attempts, how long
+    each wait, whether the server's own delay was honoured. A test that actually waited
+    would assert the same thing and take a minute to do it.
+    """
+    return GeminiClient(
+        settings(**overrides),
+        client=FakeClient(interaction, calls),
+        sleep=(waits if waits is None else waits.append),
+    )
 
 
 class FakeInteraction:
@@ -347,24 +370,17 @@ def test_the_provider_uses_the_verified_sdk_shape():
 
 def test_the_provider_checks_status_before_reading_output():
     calls: list[dict] = []
-    client = GeminiClient(
-        settings(),
-        client=FakeClient(FakeInteraction(status="incomplete", output_text='{"ver'), calls),
-    )
+    client = gemini(FakeInteraction(status="incomplete", output_text='{"ver'), calls, [])
     with pytest.raises(ProviderError, match="did not complete"):
         client.complete(request())
 
 
-def test_a_rate_limit_is_classified_for_backoff():
+def test_a_rate_limit_is_retried_and_then_given_up_on():
     calls: list[dict] = []
-    client = GeminiClient(
-        settings(),
-        client=FakeClient(RuntimeError("429 RESOURCE_EXHAUSTED"), calls),
-    )
+    client = gemini(RuntimeError("429 RESOURCE_EXHAUSTED"), calls, [], provider_max_attempts=3)
     with pytest.raises(RateLimited):
         client.complete(request())
-    # tenacity retried rather than giving up on the first 429.
-    assert len(calls) == 5
+    assert len(calls) == 3
 
 
 def test_missing_credentials_fail_before_any_call_is_made():
@@ -388,21 +404,19 @@ def test_a_configuration_error_is_not_treated_as_an_outage(message):
     key fails identically for as long as the settings say what they say, so retrying it
     spends the job's whole budget to arrive at the same message."""
     calls: list[dict] = []
-    client = GeminiClient(settings(), client=FakeClient(RuntimeError(message), calls))
+    client = gemini(RuntimeError(message), calls, [])
 
     with pytest.raises(ProviderConfigurationError) as error:
         client.complete(request())
     assert error.value.retryable is False
-    assert len(calls) == 1  # tried once, not five times
+    assert len(calls) == 1  # tried once, not four times
 
 
 def test_an_outage_stays_retryable():
     """The other side of the same judgment: a 503 is exactly the case retrying exists
     for, and misclassifying it as configuration would fail jobs that would have worked."""
     calls: list[dict] = []
-    client = GeminiClient(
-        settings(), client=FakeClient(RuntimeError("503 Service Unavailable"), calls)
-    )
+    client = gemini(RuntimeError("503 Service Unavailable"), calls, [])
     with pytest.raises(ProviderError) as error:
         client.complete(request())
     assert not isinstance(error.value, ProviderConfigurationError)
@@ -435,3 +449,134 @@ def test_the_api_key_is_passed_explicitly_rather_than_read_from_the_environment(
     client = GeminiClient(settings())
     assert client.client is not None
     assert captured == {"api_key": "test-key"}
+
+
+# --------------------------------------------------------------------------------------
+# Provider failure classification
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("429 RESOURCE_EXHAUSTED", RateLimited),
+        ("Quota exceeded for requests", RateLimited),
+        ("504 Deadline Exceeded", ProviderTimeout),
+        ("the request timed out", ProviderTimeout),
+        ("503 Service Unavailable", ProviderUnavailable),
+        ("500 Internal error encountered", ProviderUnavailable),
+        ("502 Bad Gateway", ProviderUnavailable),
+        ("Response blocked: PROHIBITED_CONTENT", ProviderRefused),
+        ("finish_reason: RECITATION", ProviderRefused),
+        ("403 PERMISSION_DENIED", ProviderConfigurationError),
+        ("something nobody has seen before", ProviderError),
+    ],
+)
+def test_every_failure_the_sdk_can_raise_lands_in_one_class(message, expected):
+    """The SDK raises a wide, undocumented set of exception types, so the classification
+    is by message -- and the fallback is *retryable*, which is the conservative reading:
+    treating an unknown outage as permanent fails jobs that would have succeeded, while
+    treating an unknown permanent failure as transient costs a bounded few retries."""
+    classified = classify_provider_error(RuntimeError(message))
+    assert isinstance(classified, expected)
+
+
+def test_a_refusal_is_content_not_an_outage():
+    """A cell that trips a safety filter trips it on every call. Retrying spends the
+    budget to arrive at the same refusal, so a refusal is never retried -- the block goes
+    to a person instead."""
+    calls: list[dict] = []
+    client = gemini(RuntimeError("blocked by safety settings"), calls, [])
+    with pytest.raises(ProviderRefused) as error:
+        client.complete(request())
+    assert error.value.retryable is False
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ('429 {"retryDelay": "31s"}', 31.0),
+        ("429 rate limited; retry after 12 seconds", 12.0),
+        ("Retry-After: 5", 5.0),
+    ],
+)
+def test_the_server_s_own_delay_is_read_off_the_failure(message, expected):
+    """Three spellings because the delay arrives in the body, in a stringified header, or
+    in prose depending on which layer produced the failure."""
+    assert retry_after_of(RuntimeError(message)) == expected
+
+
+def test_a_server_supplied_delay_is_honoured_over_our_own_backoff():
+    """The server knows about the quota window and we do not. Backing off less than it
+    asked for is how one 429 becomes a sustained stream of them."""
+    waits: list[float] = []
+    client = gemini(
+        RuntimeError('429 RESOURCE_EXHAUSTED {"retryDelay": "30s"}'),
+        [],
+        waits,
+        provider_max_attempts=2,
+    )
+    with pytest.raises(RateLimited):
+        client.complete(request())
+    assert waits == [30.0]
+
+
+def test_a_server_delay_longer_than_our_patience_is_capped():
+    """A provider asking for ten minutes during a job with a deadline is a failure to
+    report, not a wait to sit through."""
+    waits: list[float] = []
+    client = gemini(
+        RuntimeError('429 {"retryDelay": "600s"}'),
+        [],
+        waits,
+        provider_max_attempts=2,
+        provider_backoff_ceiling_seconds=45.0,
+    )
+    with pytest.raises(RateLimited):
+        client.complete(request())
+    assert waits == [45.0]
+
+
+def test_backoff_grows_and_never_exceeds_the_ceiling():
+    waits: list[float] = []
+    client = gemini(
+        RuntimeError("503 Service Unavailable"),
+        [],
+        waits,
+        provider_max_attempts=6,
+        provider_backoff_ceiling_seconds=8.0,
+    )
+    with pytest.raises(ProviderUnavailable):
+        client.complete(request())
+    assert len(waits) == 5
+    assert all(0 < wait <= 8.0 for wait in waits)
+    assert waits[-1] > waits[0]
+
+
+def test_every_call_carries_a_timeout():
+    """A call with no ceiling is a worker that can hang for the life of the process,
+    holding a lease over a job nobody else may touch."""
+    calls: list[dict] = []
+    client = gemini(FakeInteraction(), calls, [], provider_timeout_seconds=42.0)
+    client.complete(request())
+    assert calls[0]["timeout"] == 42.0
+
+
+def test_a_provider_message_never_carries_the_api_key():
+    """The SDK includes the request URL in some errors, and the request URL carries the
+    key. An error string is a thing that ends up in a log aggregator."""
+    leaked = "401 UNAUTHENTICATED calling https://x/v1?key=AIzaSyD-notarealkey123456"
+    cleaned = sanitize_provider_message(leaked)
+    assert "AIzaSyD" not in cleaned
+    assert "notarealkey" not in cleaned
+    assert "401" in cleaned
+
+
+def test_a_provider_message_never_carries_the_whole_workbook():
+    """A provider error can quote the request body back at you, and the request body is a
+    curator's workbook."""
+    payload = "Invalid argument: " + "Problem 3 answer 5pi/6 " * 200
+    cleaned = sanitize_provider_message(payload)
+    assert len(cleaned) < len(payload) / 4
+    assert cleaned.endswith("[truncated]")

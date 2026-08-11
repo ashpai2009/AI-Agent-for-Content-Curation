@@ -20,7 +20,13 @@ from oatutor_council.agents.schemas import (
 )
 from oatutor_council.config import Settings
 from oatutor_council.council import CurationCouncil
-from oatutor_council.llm.base import AgentRole
+from oatutor_council.llm.base import (
+    AgentRole,
+    MalformedResponse,
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderRefused,
+)
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
     ColumnKey,
@@ -704,3 +710,139 @@ def test_curator_rules_reach_the_writer_and_the_reviewers(tmp_path, make_workboo
         payloads = client.payloads_for(role)
         assert payloads, role
         assert all("must be written as a fraction" in p for p in payloads), role
+
+
+# --------------------------------------------------------------------------------------
+# Provider failures
+# --------------------------------------------------------------------------------------
+
+
+def failing_client(error: Exception, *, role=AgentRole.INITIAL_AUDITOR, times=10**6):
+    """A client that fails `times` calls for one role, then behaves."""
+    healthy = quiet_client()
+    state = {"failures": 0}
+
+    def reply(request):
+        if request.role is role and state["failures"] < times:
+            state["failures"] += 1
+            raise error
+        return healthy.default(request)
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    return client
+
+
+def test_one_outage_costs_a_step_and_nothing_else(setup):
+    """Every phase is a queue predicate over durable rows, so the work this step was
+    going to do is still queued. A transient outage is retried by the next step, which is
+    why no retry logic has to be written into each phase."""
+    db, _ = setup
+    client = failing_client(ProviderError("503 Service Unavailable"), times=1)
+    result = council(setup, client).run()
+
+    assert result.state is JobState.SUCCEEDED
+    assert [(c.row, c.after) for c in list_changes(db, "job-1")] == [(4, "30")]
+    assert any(e["kind"] == "provider_failure" for e in list_events(db, "job-1"))
+
+
+def test_a_provider_that_stays_down_fails_the_job_rather_than_looping(setup):
+    db, _ = setup
+    client = failing_client(ProviderError("503 Service Unavailable"))
+    result = council(setup, client, provider_failure_budget=3).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.PROVIDER
+    failures = [e for e in list_events(db, "job-1") if e["kind"] == "provider_failure"]
+    assert len(failures) == 3
+
+
+def test_the_failure_budget_survives_the_worker_that_was_spending_it(setup):
+    """Counted from durable events rather than an instance attribute. The failure being
+    bounded here -- a provider that is down -- routinely takes the worker down with it,
+    and a counter that resets on every crash bounds nothing."""
+    db, _ = setup
+    error = ProviderError("503 Service Unavailable")
+
+    council(setup, failing_client(error), provider_failure_budget=4).run(max_steps=3)
+    # A genuinely new worker, with no memory of the first one's failures.
+    result = council(setup, failing_client(error), provider_failure_budget=4).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.PROVIDER
+
+
+def test_an_outage_during_a_repair_is_not_the_curator_s_content_failing(setup):
+    """The refund budget alone bounds this per issue, but a provider that is down would
+    then walk every issue to `NEEDS_HUMAN_REVIEW` one refund at a time and hand the
+    curator a report saying their content needs a person. It does not."""
+    db, _ = setup
+    client = failing_client(ProviderError("500 Internal error"), role=AgentRole.WRITER)
+    result = council(setup, client, provider_failure_budget=2).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.PROVIDER
+    assert not any(
+        i.state is IssueState.NEEDS_HUMAN_REVIEW for i in load_ledger(db, "job-1").issues
+    )
+
+
+def test_a_refusal_escalates_one_block_and_leaves_the_rest_alone(setup):
+    """A refusal is content, not infrastructure. The same cells trip the same filter on
+    every call, so refunding the attempt buys three identical refusals -- but one block a
+    filter dislikes says nothing about the others, so the job carries on."""
+    db, _ = setup
+    client = failing_client(
+        ProviderRefused("blocked by safety settings"), role=AgentRole.WRITER
+    )
+    result = council(setup, client).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    assert result.failure_reason is None
+    assert any(
+        i.state is IssueState.NEEDS_HUMAN_REVIEW for i in load_ledger(db, "job-1").issues
+    )
+    assert any(e["kind"] == "provider_refused" for e in list_events(db, "job-1"))
+
+
+def test_a_misconfiguration_is_never_absorbed_by_the_outage_budget(setup):
+    """A subclass of `ProviderError`, caught first and handled oppositely: retrying an
+    outage is patience, retrying a rejected key is a loop that spends the whole job to
+    arrive at the same message."""
+    db, _ = setup
+    client = failing_client(ProviderConfigurationError("API key not valid"))
+    result = council(setup, client, provider_failure_budget=50).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.CONFIG
+    assert not any(e["kind"] == "provider_failure" for e in list_events(db, "job-1"))
+
+
+def test_malformed_output_is_handled_like_a_lost_call_not_a_crash(setup):
+    """Before this, a schema-invalid response from the auditor or a reviewer propagated
+    out of the worker thread: the job kept its lease, went nowhere, and left a traceback
+    in the log as its only account of itself."""
+    db, _ = setup
+    client = failing_client(MalformedResponse("not the schema"), times=2)
+    result = council(setup, client).run()
+
+    assert result.state is JobState.SUCCEEDED
+    assert len([e for e in list_events(db, "job-1") if e["kind"] == "provider_failure"]) == 2
+
+
+def test_a_recorded_provider_failure_is_bounded_rather_than_a_copy_of_the_workbook(setup):
+    """A provider error can quote the request body back at you, and the request body is a
+    curator's workbook. The guarantee is a bound, not redaction: what a rejected payload
+    contains is unknowable, so the honest thing is to keep enough of the head to diagnose
+    the failure and drop the rest -- and say plainly that it was dropped."""
+    db, _ = setup
+    leaked = "400 rejected input: " + "Problem angles1 answer pi/6 " * 200
+    client = failing_client(ProviderError(leaked))
+    council(setup, client, provider_failure_budget=1).run()
+
+    detail = [
+        e["detail"] for e in list_events(db, "job-1") if e["kind"] == "provider_failure"
+    ][0]
+    assert len(detail) < len(leaked) / 10
+    assert detail.startswith("400 rejected input:")
+    assert detail.endswith("[truncated]")
