@@ -83,6 +83,7 @@ def propose_patch(
     attempt_no: int,
     deterministic_findings: Sequence[ValidationFinding] = (),
     reviewer_feedback: str = "",
+    curator_rules: Sequence[str] = (),
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
@@ -95,6 +96,15 @@ def propose_patch(
             "Deterministic findings for this block", render_findings(deterministic_findings)
         ),
     ]
+    if curator_rules:
+        # Policy the curator supplied, applied rather than verified. Distinct from the
+        # errata claims, which are hypotheses and go only to the auditor.
+        sections.append(
+            DataSection(
+                "Curation rules the curator supplied",
+                "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
     if reviewer_feedback:
         # The reviewer's feedback is public by design -- it is the only thing that
         # travels back to the Writer, and it has to be actionable.

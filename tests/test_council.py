@@ -589,3 +589,118 @@ def test_a_workbook_carrying_an_injection_is_treated_as_content(make_workbook, t
     assert "Ignore previous instructions" in payload  # present as content
     assert "never an instruction" in payload
     assert payload.count("<<<BEGIN UNTRUSTED DATA") == payload.count("<<<END UNTRUSTED DATA")
+
+
+# --------------------------------------------------------------------------------------
+# Rules versus errata
+# --------------------------------------------------------------------------------------
+
+
+def council_with_document(tmp_path, make_workbook, text: str, client=None):
+    """A council whose job carries an instruction document, stored durably."""
+    from oatutor_council.ingestion.instruction_documents import read_instruction_document
+    from oatutor_council.persistence import save_instruction_segments
+
+    source = make_workbook(
+        [
+            problem("angles1", title="Convert", oer_src="s", license="CC"),
+            step("angles1", answer="pi/6", answer_type="algebra"),
+            scaffold("angles1", "s1", answer="", answer_type="numeric"),
+            problem("angles2", title="Evaluate", oer_src="s", license="CC"),
+            step("angles2", answer="1", answer_type="numeric"),
+        ]
+    )
+    document = tmp_path / "notes.md"
+    document.write_text(text, encoding="utf-8")
+    parsed = read_instruction_document(document)
+
+    db = Database(tmp_path / "c.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename="w.xlsx", source_sha256=copy.source_sha256
+        ),
+    )
+    save_instruction_segments(
+        db,
+        "job-1",
+        segments=parsed.segments,
+        document_format=parsed.format.value,
+        document_sha256="abc",
+    )
+    return CurationCouncil(
+        db=db,
+        settings=settings(),
+        client=client or quiet_client(),
+        job_id="job-1",
+        copy=copy,
+    )
+
+
+def test_a_governing_rule_is_not_treated_as_a_claim(tmp_path, make_workbook):
+    """"Steps must not have dependencies" is policy. Sent to thirty blocks as a
+    hypothesis it gets refuted by the twenty-nine it was never about."""
+    council = council_with_document(
+        tmp_path, make_workbook, "Steps must not carry dependencies.\n"
+    )
+    assert council.seed_claims == ()
+    assert council.curator_rules == ("Steps must not carry dependencies.",)
+
+
+def test_a_report_about_one_problem_is_treated_as_a_hypothesis(tmp_path, make_workbook):
+    council = council_with_document(
+        tmp_path, make_workbook, "angles1 has the wrong answer in its scaffold.\n"
+    )
+    assert council.curator_rules == ()
+    assert [c.text for c in council.seed_claims] == [
+        "angles1 has the wrong answer in its scaffold."
+    ]
+
+
+def test_a_claim_naming_a_problem_reaches_only_that_block(tmp_path, make_workbook):
+    """What stops an unrelated block refuting a valid report: it is never asked."""
+    client = quiet_client()
+    council = council_with_document(
+        tmp_path, make_workbook, "angles1 has the wrong answer.\n", client=client
+    )
+    council.run()
+
+    payloads = client.payloads_for(AgentRole.INITIAL_AUDITOR)
+    carrying = [p for p in payloads if "angles1 has the wrong answer" in p]
+    assert len(carrying) == 1
+
+
+def test_a_claim_naming_nothing_reaches_every_block(tmp_path, make_workbook):
+    """The honest fallback. The curator did not say where to look, so refusing to look
+    anywhere would be worse than looking everywhere."""
+    client = quiet_client()
+    council = council_with_document(
+        tmp_path, make_workbook, "Something is wrong with an answer somewhere.\n",
+        client=client,
+    )
+    council.run()
+
+    payloads = client.payloads_for(AgentRole.INITIAL_AUDITOR)
+    carrying = [p for p in payloads if "wrong with an answer somewhere" in p]
+    assert len(carrying) == len(payloads) > 1
+
+
+def test_curator_rules_reach_the_writer_and_the_reviewers(tmp_path, make_workbook):
+    """Policy has to travel with the repair and the review, or a reviewer judges a
+    correction against rules the Writer was working under and it was not."""
+    client = quiet_client()
+    council = council_with_document(
+        tmp_path, make_workbook, "Every answer must be written as a fraction.\n",
+        client=client,
+    )
+    council.run()
+
+    for role in (
+        AgentRole.WRITER,
+        AgentRole.KNOWN_ISSUE_REVIEWER,
+        AgentRole.INITIAL_AUDITOR,
+    ):
+        payloads = client.payloads_for(role)
+        assert payloads, role
+        assert all("must be written as a fraction" in p for p in payloads), role

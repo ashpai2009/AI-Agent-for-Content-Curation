@@ -144,16 +144,25 @@ class ReviewerContext:
     conventions: str
     deterministic_findings: str
     rules_reminder: str = ""
+    #: Policy the curator supplied. A reviewer has to judge a repair against the rules it
+    #: was made under, so these travel here -- unlike the errata claims, which are
+    #: hypotheses for the auditor and would invite a reviewer to re-litigate them.
+    curator_rules: str = ""
 
     def sections(self) -> tuple[DataSection, ...]:
-        return (
+        sections = [
             DataSection("The issue under review", self.issue_summary),
             DataSection("The block as originally submitted", self.original_block),
             DataSection("The block as it stands now", self.current_block),
             DataSection("What changed, across the whole block", self.block_diff),
             DataSection("Conventions this workbook follows", self.conventions),
             DataSection("Deterministic findings still open", self.deterministic_findings),
-        )
+        ]
+        if self.curator_rules.strip():
+            sections.append(
+                DataSection("Curation rules the curator supplied", self.curator_rules)
+            )
+        return tuple(sections)
 
 
 assert_no_private_fields(ReviewerContext)

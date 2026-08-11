@@ -25,12 +25,13 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from .config import ConfigurationError, Settings, load_settings
 from .council import CurationCouncil
 from .ingestion.instruction_documents import (
+    SegmentPurpose,
     UnsupportedDocumentError,
     read_instruction_document,
 )
@@ -149,6 +150,20 @@ class JobRunner:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _declared_purpose(value: str) -> SegmentPurpose | None:
+    """`auto` means classify per passage; anything else labels the whole document."""
+    cleaned = (value or "auto").strip().lower()
+    if cleaned in ("", "auto"):
+        return None
+    try:
+        return SegmentPurpose(cleaned)
+    except ValueError:
+        raise UploadRejected(
+            f"instructions_purpose must be one of auto, rules, errata, notes "
+            f"(got {cleaned!r})"
+        ) from None
 
 
 def _database_reachable(db: Database) -> bool:
@@ -295,7 +310,15 @@ def create_app(
     async def submit_job(
         workbook: UploadFile = File(...),
         instructions: UploadFile | None = File(default=None),
+        instructions_purpose: str = Form(default="auto"),
     ) -> dict[str, Any]:
+        """`instructions_purpose` says what the attached document *is*.
+
+        `auto` classifies each passage on its own wording, which is right for the mixed
+        notes curators actually write. Naming `rules`, `errata` or `notes` overrides that
+        for the whole document -- someone who uploads a formatting guide and says so
+        knows something the phrasing does not always reveal.
+        """
         workbook_bytes = await workbook.read()
         checked = validate_upload(
             filename=workbook.filename or "",
@@ -333,7 +356,9 @@ def create_app(
             check_archive(document_path, document.extension)
 
             parsed_document = read_instruction_document(
-                document_path, display_name=document.display_name
+                document_path,
+                display_name=document.display_name,
+                declared_purpose=_declared_purpose(instructions_purpose),
             )
             instruction_name = document.display_name
 

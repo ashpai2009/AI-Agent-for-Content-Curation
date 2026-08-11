@@ -30,3 +30,8 @@ whether the issue is resolved and the block still works as a whole, exactly as y
 for any other block. Do not defer to the fact that the finding was originally yours.
 
 {untrusted_data_policy}
+
+
+## The curation rules
+
+{curation_rules}

@@ -100,6 +100,12 @@ def resolve_claims(
 
     resolved = []
     for claim in claims:
+        # Only errata are claims. A governing rule ("steps must not have dependencies")
+        # is not something a block confirms or refutes, and listing it here as
+        # `UNRESOLVED` would report policy the agents applied correctly as a question
+        # nobody answered.
+        if claim.get("purpose", "errata") != "errata":
+            continue
         index = int(claim["segment_index"])
         verdicts = by_index.get(index, [])
         confirmations = [v for v in verdicts if v["outcome"] == ClaimOutcome.CONFIRMED]

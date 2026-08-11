@@ -29,3 +29,8 @@ Verify the mathematics yourself. Do not accept a correction because it looks lik
 of thing that would be right.
 
 {untrusted_data_policy}
+
+
+## The curation rules
+
+{curation_rules}

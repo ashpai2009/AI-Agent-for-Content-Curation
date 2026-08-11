@@ -41,3 +41,8 @@ Every finding must name the exact rows and columns it concerns, state what is wr
 sentence, and state what the correct content would be if you know it.
 
 {untrusted_data_policy}
+
+
+## The curation rules
+
+{curation_rules}

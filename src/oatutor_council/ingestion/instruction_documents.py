@@ -67,6 +67,99 @@ class UnsupportedDocumentError(Exception):
         self.filename = filename
 
 
+class SegmentPurpose(StrEnum):
+    """What a passage of the curator's document is *for*.
+
+    The distinction the whole of this module turns on: "Problem 3 has the wrong answer"
+    is a **hypothesis** about one block, to be checked and confirmed or refuted, while
+    "Steps must not carry dependencies" is a **governing rule** that applies to every
+    block and is not something any block can refute. Treating the second as the first is
+    why a policy statement was being sent to thirty problems and marked refuted by
+    twenty-nine of them.
+    """
+
+    #: Authoritative instruction. Goes to the Writer and both reviewers as policy.
+    RULES = "rules"
+    #: A suspected defect. Goes to the Initial Auditor as a claim to verify.
+    ERRATA = "errata"
+    #: Context that is neither. Recorded, shown to the auditor, never treated as a claim.
+    NOTES = "notes"
+
+
+#: Phrasing that makes a passage a general instruction rather than a report about one
+#: problem. Modal obligation ("must", "should never") is the strongest single signal: a
+#: curator describing a specific defect says what *is* wrong, not what *must* be true.
+_RULE_MARKERS = (
+    "must ", "must not", "should ", "should not", "never ", "always ",
+    "are required", "is required", "do not ", "don't ", "ensure ", "every ",
+    "all rows", "all answers", "all problems", "convention", "policy",
+)
+
+#: A reference to a specific location. The presence of one is what makes a passage a
+#: claim about a particular block rather than a statement about all of them.
+_PROBLEM_REFERENCE = re.compile(
+    r"\b(?:problem|question|row|line|item)\s*#?\s*([A-Za-z]*\d+)\b", re.IGNORECASE
+)
+
+#: A bare identifier that looks like a Problem Name, e.g. `angles12`, `Unitcirc3`.
+_NAME_REFERENCE = re.compile(r"\b([A-Za-z]{3,}\d+)\b")
+
+#: Language that reports a defect rather than describing one location or stating a rule.
+#: Needed because a curator writing "something is wrong with one of the answers" has
+#: reported a real problem in words that name neither a place nor an obligation -- and
+#: filing that as background notes means nobody ever checks it.
+_DEFECT_MARKERS = (
+    "wrong", "incorrect", "missing", "error", "typo", "mistake", "broken",
+    "does not match", "doesn't match", "no longer", "fails", "bad ",
+)
+
+
+def classify_segment(text: str) -> SegmentPurpose:
+    """Decide what one passage is, from its own wording.
+
+    Deliberately deterministic, and applied in a fixed order: a passage naming a specific
+    problem or row is errata; a passage stating an obligation is a rule; a passage
+    reporting a defect without saying where is errata too; anything left is notes, which
+    are recorded and shown but never become claims a block can refute.
+
+    Where both signals appear -- "Problem 3 must have an answer" -- the *reference* wins.
+    A statement about one named problem is checkable against that problem, and treating
+    it as universal policy would apply it to twenty-nine blocks it was never about.
+    """
+    lowered = text.lower()
+    if _PROBLEM_REFERENCE.search(text) or _NAME_REFERENCE.search(text):
+        return SegmentPurpose.ERRATA
+    if any(marker in lowered for marker in _RULE_MARKERS):
+        return SegmentPurpose.RULES
+    if any(marker in lowered for marker in _DEFECT_MARKERS):
+        # A defect report that named no location. It goes to every block, which is
+        # wasteful and honest: the curator said something is wrong, and filing that as
+        # background notes means nobody ever looks.
+        return SegmentPurpose.ERRATA
+    return SegmentPurpose.NOTES
+
+
+def referenced_locations(text: str) -> tuple[frozenset[str], frozenset[int]]:
+    """Problem names and row numbers a passage points at.
+
+    Used to send a claim only to the blocks it could possibly be about. A claim that
+    names nothing is returned empty and goes to every block, which is the honest fallback
+    -- there is no way to target what the curator did not identify.
+    """
+    names: set[str] = set()
+    rows: set[int] = set()
+
+    for match in _PROBLEM_REFERENCE.finditer(text):
+        token = match.group(1)
+        if token.isdigit():
+            rows.add(int(token))
+        else:
+            names.add(token.casefold())
+    for match in _NAME_REFERENCE.finditer(text):
+        names.add(match.group(1).casefold())
+    return frozenset(names), frozenset(rows)
+
+
 @dataclass(frozen=True)
 class DocumentSegment:
     """One passage of the document, with enough provenance to cite it."""
@@ -74,6 +167,7 @@ class DocumentSegment:
     index: int
     text: str
     provenance: str
+    purpose: SegmentPurpose = SegmentPurpose.ERRATA
 
 
 @dataclass(frozen=True)
@@ -246,9 +340,17 @@ def detect_format(filename: str) -> DocumentFormat:
 
 
 def read_instruction_document(
-    path: Path, *, display_name: str | None = None
+    path: Path,
+    *,
+    display_name: str | None = None,
+    declared_purpose: SegmentPurpose | None = None,
 ) -> InstructionDocument:
-    """Read one instruction document, or explain clearly why it cannot be read."""
+    """Read one instruction document, or explain clearly why it cannot be read.
+
+    `declared_purpose` is the curator saying what the whole document is. It overrides the
+    per-segment classification, because someone who uploads a file and labels it a rules
+    document knows something the wording does not always reveal.
+    """
     name = display_name or path.name
 
     if not path.is_file():
@@ -274,7 +376,7 @@ def read_instruction_document(
             filename=name,
         )
 
-    segments, truncated = _bound(passages)
+    segments, truncated = _bound(passages, declared_purpose)
     return InstructionDocument(
         filename=name, format=fmt, segments=segments, truncated=truncated
     )
@@ -282,6 +384,7 @@ def read_instruction_document(
 
 def _bound(
     passages: list[tuple[str, str]],
+    declared: SegmentPurpose | None = None,
 ) -> tuple[tuple[DocumentSegment, ...], bool]:
     """Split oversized passages and stop at the document budget.
 
@@ -298,7 +401,14 @@ def _bound(
             if used + len(part) > MAX_DOCUMENT_CHARACTERS:
                 truncated = True
                 return tuple(segments), truncated
-            segments.append(DocumentSegment(len(segments), part, label))
+            segments.append(
+                DocumentSegment(
+                    len(segments),
+                    part,
+                    label,
+                    declared or classify_segment(part),
+                )
+            )
             used += len(part)
     return tuple(segments), truncated
 

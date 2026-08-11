@@ -43,3 +43,8 @@ block and the rules, not your reasoning, so a revision that re-argues the previo
 rather than changing the content will be rejected again.
 
 {untrusted_data_policy}
+
+
+## The curation rules
+
+{curation_rules}

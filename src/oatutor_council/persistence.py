@@ -239,6 +239,11 @@ CREATE TABLE IF NOT EXISTS instruction_segments (
     document_format TEXT NOT NULL DEFAULT '',
     document_sha256 TEXT NOT NULL DEFAULT '',
     truncated       INTEGER NOT NULL DEFAULT 0,
+    -- rules | errata | notes. What the passage is *for*, which decides who sees it: a
+    -- governing rule goes to the Writer and reviewers as policy, a suspected defect goes
+    -- to the auditor as a claim. Sending a rule to thirty blocks as a claim is how a
+    -- policy statement ends up marked refuted by twenty-nine of them.
+    purpose         TEXT NOT NULL DEFAULT 'errata',
     PRIMARY KEY (job_id, segment_index)
 );
 
@@ -1062,8 +1067,8 @@ def save_instruction_segments(
             connection.execute(
                 """INSERT INTO instruction_segments
                        (job_id, segment_index, text, provenance, document_format,
-                        document_sha256, truncated)
-                   VALUES (?,?,?,?,?,?,?)
+                        document_sha256, truncated, purpose)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(job_id, segment_index) DO UPDATE SET
                        text = excluded.text,
                        provenance = excluded.provenance""",
@@ -1075,6 +1080,7 @@ def save_instruction_segments(
                     document_format,
                     document_sha256,
                     1 if truncated else 0,
+                    getattr(segment, "purpose", "errata"),
                 ),
             )
     return len(segments)
@@ -1083,7 +1089,7 @@ def save_instruction_segments(
 def load_instruction_segments(db: Database, job_id: str) -> tuple[dict[str, Any], ...]:
     rows = db.connection.execute(
         """SELECT segment_index, text, provenance, document_format, document_sha256,
-                  truncated
+                  truncated, purpose
            FROM instruction_segments WHERE job_id = ? ORDER BY segment_index""",
         (job_id,),
     ).fetchall()

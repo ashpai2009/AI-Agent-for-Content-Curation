@@ -41,11 +41,36 @@ from ..models import FIXED_COLUMNS
 
 @dataclass(frozen=True)
 class SeedClaim:
-    """One statement from the curator's document, with where it came from."""
+    """One *hypothesis* from the curator's document, with where it came from.
+
+    A claim is something a block can confirm or refute. Governing rules from the same
+    document are deliberately not claims and never arrive here -- see
+    `CurationCouncil.curator_rules`, which routes them to the Writer and reviewers as
+    policy instead. A rule sent to thirty blocks as a hypothesis is refuted by the
+    twenty-nine it was never about.
+    """
 
     index: int
     text: str
     provenance: str
+    #: Problem names and rows the claim points at, if it named any. Empty means it named
+    #: none and there is no honest way to narrow it.
+    problem_names: frozenset[str] = frozenset()
+    rows: frozenset[int] = frozenset()
+
+    def applies_to(self, block) -> bool:
+        """Whether this claim could be about this block.
+
+        A claim naming nothing applies everywhere: the curator did not say where to look,
+        so refusing to look anywhere would be worse than looking everywhere. A claim that
+        *did* name a problem or a row is checked only against blocks matching it, which
+        is what stops twenty-nine unrelated blocks from refuting a valid report.
+        """
+        if not self.problem_names and not self.rows:
+            return True
+        if block.problem_name.casefold() in self.problem_names:
+            return True
+        return any(block.contains_row(row) for row in self.rows)
 
 
 @dataclass(frozen=True)
@@ -64,7 +89,12 @@ cover formatting, notation, identifiers and delimiters, and their current findin
 included so you can see what has been handled.
 
 If seed claims are present, check each one against the block. Confirm it by reporting a
-finding with `confirms_claim` set to its index, or refute it with a reason.
+finding with `confirms_claim` set to its index, or refute it with a reason. A claim is a
+hypothesis about this block: refute it only if you checked and the defect is not here,
+never merely because the claim seems to be about something else.
+
+Curation rules, where present, are policy rather than hypotheses. Apply them; do not
+confirm or refute them.
 
 Zero findings is a valid answer. A block that is correct should be reported as correct.
 """
@@ -77,6 +107,7 @@ def audit_block(
     conventions: WorkbookConventions,
     deterministic_findings: Sequence[ValidationFinding] = (),
     seed_claims: Sequence[SeedClaim] = (),
+    curator_rules: Sequence[str] = (),
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
@@ -89,14 +120,24 @@ def audit_block(
             render_findings(deterministic_findings),
         ),
     ]
-    if seed_claims:
+    # Only claims that could be about *this* block. Sending all of them and asking the
+    # model to sort it out is how a claim about problem 3 gets refuted by problem 17.
+    applicable = [claim for claim in seed_claims if claim.applies_to(block)]
+    if applicable:
         sections.append(
             DataSection(
                 "Claims from the curator's document (hypotheses, not facts)",
                 "\n".join(
                     f"[{claim.index}] ({claim.provenance}) {claim.text}"
-                    for claim in seed_claims
+                    for claim in applicable
                 ),
+            )
+        )
+    if curator_rules:
+        sections.append(
+            DataSection(
+                "Curation rules the curator supplied (policy, not hypotheses)",
+                "\n".join(f"- {rule}" for rule in curator_rules),
             )
         )
 
@@ -124,12 +165,18 @@ def audit_block(
     if taint is not None:
         taint.register_model(f"auditor.{block.block_id}", private)
 
+    # A refutation only counts for a claim this block was actually shown. A model that
+    # refutes something it was never given is answering a question nobody asked, and
+    # recording it would let an unrelated block dismiss a valid report.
+    shown = {claim.index for claim in applicable}
     return AuditResult(
         block_id=block.block_id,
         findings=tuple(
             _to_finding(item, block) for item in response.findings
         ),
-        refuted=tuple(response.refuted_claims),
+        refuted=tuple(
+            claim for claim in response.refuted_claims if claim.claim_index in shown
+        ),
         private=private,
     )
 

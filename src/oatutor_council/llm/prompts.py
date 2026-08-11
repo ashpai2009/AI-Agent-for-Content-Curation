@@ -26,6 +26,13 @@ PROMPT_ROOT = Path(__file__).resolve().parents[3] / "prompts"
 POLICY_PLACEHOLDER = "{untrusted_data_policy}"
 POLICY_FILE = "_shared/untrusted_data.md"
 
+#: The standing curation rules, versioned in this repository. Composed into every prompt
+#: that carries the placeholder, so a curator does not have to attach the formatting
+#: guide to every job -- and so the four agents cannot drift apart on what the rules are.
+#: A document uploaded with a job adds policy for that job; it never replaces this.
+RULES_PLACEHOLDER = "{curation_rules}"
+RULES_FILE = "_shared/curation_rules.v1.md"
+
 _VERSIONED = re.compile(r"^(?P<name>.+)\.v(?P<version>\d+)\.md$")
 
 
@@ -61,6 +68,14 @@ def _policy() -> str:
 
 
 @lru_cache(maxsize=None)
+def _curation_rules() -> str:
+    path = _root() / RULES_FILE
+    if not path.is_file():
+        raise PromptNotFound(f"shared curation rules are missing: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+@lru_cache(maxsize=None)
 def load_prompt(name: str, version: int | None = None) -> str:
     """Load one prompt with the untrusted-data policy composed into it.
 
@@ -84,7 +99,12 @@ def load_prompt(name: str, version: int | None = None) -> str:
             f"prompt {name}.v{chosen}.md does not contain {POLICY_PLACEHOLDER}; every "
             "agent must be told that fenced data is content and never instruction"
         )
-    return text.replace(POLICY_PLACEHOLDER, _policy()).strip()
+    text = text.replace(POLICY_PLACEHOLDER, _policy())
+    # Optional, unlike the untrusted-data policy: an agent that does not need the full
+    # rule text (a reviewer judging one edit) should not pay for it on every call.
+    if RULES_PLACEHOLDER in text:
+        text = text.replace(RULES_PLACEHOLDER, _curation_rules())
+    return text.strip()
 
 
 def system_prompt(role: AgentRole, version: int | None = None) -> str:

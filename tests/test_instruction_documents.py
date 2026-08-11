@@ -162,3 +162,85 @@ def test_latin_1_content_is_still_read(tmp_path):
     path.write_bytes("the angle is 45\xb0 not 90\xb0".encode("latin-1"))
     document = read_instruction_document(path)
     assert "45" in document.render()
+
+
+# --------------------------------------------------------------------------------------
+# Rules, errata, and notes
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Problem 3 has the wrong answer.", "errata"),
+        ("Row 14 shows a date instead of a fraction.", "errata"),
+        ("angles12 is missing its second hint.", "errata"),
+        ("Steps must not have dependencies.", "rules"),
+        ("All answers should use ** for exponents.", "rules"),
+        ("Never leave a scaffold without an answer.", "rules"),
+        ("The unit circle section was reviewed in March.", "notes"),
+    ],
+)
+def test_a_passage_is_classified_by_its_own_wording(text, expected):
+    """The distinction the whole routing turns on: a hypothesis about one block, versus
+    a rule that governs every block and that no block can refute."""
+    from oatutor_council.ingestion.instruction_documents import classify_segment
+
+    assert classify_segment(text).value == expected
+
+
+def test_a_reference_beats_an_obligation():
+    """"Problem 3 must have an answer" is checkable against problem 3. Reading it as
+    universal policy would apply it to twenty-nine blocks it was never about."""
+    from oatutor_council.ingestion.instruction_documents import classify_segment
+
+    assert classify_segment("Problem 3 must have an answer.").value == "errata"
+
+
+def test_a_declared_purpose_overrides_the_wording(tmp_path):
+    """Someone who uploads a formatting guide and says so knows something the phrasing
+    does not always reveal."""
+    from oatutor_council.ingestion.instruction_documents import (
+        SegmentPurpose,
+        read_instruction_document,
+    )
+
+    path = tmp_path / "guide.md"
+    path.write_text("Problem 3 has the wrong answer.\n", encoding="utf-8")
+    document = read_instruction_document(
+        path, declared_purpose=SegmentPurpose.RULES
+    )
+    assert all(s.purpose is SegmentPurpose.RULES for s in document.segments)
+
+
+@pytest.mark.parametrize(
+    "text,names,rows",
+    [
+        ("Problem 3 has the wrong answer.", set(), {3}),
+        ("angles12 is missing a hint.", {"angles12"}, set()),
+        ("Something is wrong somewhere.", set(), set()),
+    ],
+)
+def test_referenced_locations(text, names, rows):
+    from oatutor_council.ingestion.instruction_documents import referenced_locations
+
+    found_names, found_rows = referenced_locations(text)
+    assert set(found_names) == names
+    assert set(found_rows) == rows
+
+
+def test_a_defect_report_that_names_no_location_is_still_errata():
+    """A curator writing "something is wrong with one of the answers" has reported a real
+    problem in words naming neither a place nor an obligation. Filing that as background
+    notes means nobody ever checks it."""
+    from oatutor_council.ingestion.instruction_documents import classify_segment
+
+    assert classify_segment("Something is wrong with one of the answers.").value == (
+        "errata"
+    )
+
+
+def test_prose_with_no_defect_and_no_obligation_is_notes():
+    from oatutor_council.ingestion.instruction_documents import classify_segment
+
+    assert classify_segment("This section was reviewed in March.").value == "notes"

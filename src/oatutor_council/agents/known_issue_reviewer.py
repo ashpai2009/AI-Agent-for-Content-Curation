@@ -62,6 +62,7 @@ def build_context(
     current_block: ProblemBlock,
     conventions,
     deterministic_findings: Sequence[ValidationFinding] = (),
+    curator_rules: Sequence[str] = (),
 ) -> ReviewerContext:
     """Assemble exactly what a reviewer may see.
 
@@ -75,6 +76,7 @@ def build_context(
         block_diff=render_block_diff(original_block, current_block),
         conventions=render_conventions(conventions),
         deterministic_findings=render_findings(deterministic_findings),
+        curator_rules="\n".join(f"- {rule}" for rule in curator_rules),
     )
 
 

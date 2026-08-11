@@ -59,23 +59,29 @@ def sweep_block(
     block: ProblemBlock,
     conventions: WorkbookConventions,
     deterministic_findings: Sequence[ValidationFinding] = (),
+    curator_rules: Sequence[str] = (),
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
 ) -> SweepResult:
-    bundle = ContextBundle.build(
-        INSTRUCTIONS,
-        [
-            DataSection("The problem block", render_block(block)),
+    sections = [
+        DataSection("The problem block", render_block(block)),
+        DataSection(
+            "Conventions this workbook follows", render_conventions(conventions)
+        ),
+        DataSection(
+            "Deterministic findings for this block",
+            render_findings(deterministic_findings),
+        ),
+    ]
+    if curator_rules:
+        sections.append(
             DataSection(
-                "Conventions this workbook follows", render_conventions(conventions)
-            ),
-            DataSection(
-                "Deterministic findings for this block",
-                render_findings(deterministic_findings),
-            ),
-        ],
-    )
+                "Curation rules the curator supplied",
+                "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
+    bundle = ContextBundle.build(INSTRUCTIONS, sections)
     payload = bundle.render()
     if taint is not None:
         taint.assert_clean(payload, context="independent_reviewer")

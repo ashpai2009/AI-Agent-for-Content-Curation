@@ -32,6 +32,7 @@ from uuid import uuid4
 from .agents import independent_reviewer, initial_auditor, known_issue_reviewer, writer
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
+from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
 from .llm.base import LLMClient, ProviderConfigurationError, ProviderError
 from .models import (
     ArtifactKind,
@@ -115,6 +116,11 @@ _NEEDS_APPLY = frozenset({IssueState.PATCH_PROPOSED, IssueState.APPLYING})
 _NEEDS_REVIEW = frozenset({IssueState.PATCH_APPLIED, IssueState.AWAITING_REVIEW})
 LIVE_ISSUE_STATES = _NEEDS_WRITER | _NEEDS_APPLY | _NEEDS_REVIEW
 
+#: How much curator-supplied policy may ride along in every repair and review call. These
+#: travel on every one of them for the whole job, so an uncapped section turns a long
+#: document into a cost paid hundreds of times for text that mostly repeats.
+MAX_CURATOR_RULE_CHARACTERS = 4_000
+
 
 class BudgetExhausted(Exception):
     """A global fuse blew. Always terminal, never retried."""
@@ -191,14 +197,47 @@ class CurationCouncil:
         a job whose claims were all refuted. A curator who reported a defect would be
         told it was checked and was not there.
         """
-        return tuple(
-            initial_auditor.SeedClaim(
-                index=row["segment_index"],
-                text=row["text"],
-                provenance=row["provenance"],
+        claims = []
+        for row in load_instruction_segments(self.db, self.job_id):
+            if row.get("purpose") != SegmentPurpose.ERRATA:
+                continue
+            names, rows = referenced_locations(row["text"])
+            claims.append(
+                initial_auditor.SeedClaim(
+                    index=row["segment_index"],
+                    text=row["text"],
+                    provenance=row["provenance"],
+                    problem_names=names,
+                    rows=rows,
+                )
             )
+        return tuple(claims)
+
+    @property
+    def curator_rules(self) -> tuple[str, ...]:
+        """Governing instructions from the curator's document.
+
+        Policy, not hypotheses: these reach the Writer and both reviewers, who have to
+        *apply* them, and never the claim machinery, which would ask thirty blocks to
+        confirm or refute a statement that is true of all of them.
+
+        Capped, because these travel in every repair and review call for the whole job.
+        An uncapped policy section turns a long document into a per-call cost paid
+        hundreds of times.
+        """
+        rules = [
+            row["text"].strip()
             for row in load_instruction_segments(self.db, self.job_id)
-        )
+            if row.get("purpose") == SegmentPurpose.RULES and row["text"].strip()
+        ]
+        kept: list[str] = []
+        budget = MAX_CURATOR_RULE_CHARACTERS
+        for rule in rules:
+            if len(rule) > budget:
+                break
+            kept.append(rule)
+            budget -= len(rule)
+        return tuple(kept)
 
     def source_workbook(self) -> ParsedWorkbook:
         """The workbook as submitted. Parsed once: the source cannot change."""
@@ -343,6 +382,7 @@ class CurationCouncil:
             conventions=parsed.conventions,
             deterministic_findings=self._findings_for_block(parsed, block),
             seed_claims=self.seed_claims,
+            curator_rules=self.curator_rules,
             job_id=self.job_id,
             taint=self.taint,
         )
@@ -378,6 +418,7 @@ class CurationCouncil:
                 block=block,
                 conventions=parsed.conventions,
                 deterministic_findings=self._findings_for_block(parsed, block),
+                curator_rules=self.curator_rules,
                 job_id=self.job_id,
                 taint=self.taint,
             )
@@ -616,6 +657,7 @@ class CurationCouncil:
                 attempt_no=attempt.attempt_no,
                 deterministic_findings=self._findings_for_block(parsed, block),
                 reviewer_feedback=_latest_feedback(self.db, issue.issue_id),
+                curator_rules=self.curator_rules,
                 job_id=self.job_id,
                 taint=self.taint,
             )
@@ -730,6 +772,7 @@ class CurationCouncil:
             current_block=current_block,
             conventions=current.conventions,
             deterministic_findings=self._findings_for_block(current, current_block),
+            curator_rules=self.curator_rules,
         )
         self._spend(llm_calls=1)
         verdict = known_issue_reviewer.review(
