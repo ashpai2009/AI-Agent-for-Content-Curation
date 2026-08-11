@@ -90,10 +90,10 @@ def client(tmp_path):
         yield test_client
 
 
-def submit(client, data: bytes, name: str = "workbook.xlsx", **extra):
+def submit(client, data: bytes, name: str = "workbook.xlsx", *, headers=None, **extra):
     files = {"workbook": (name, data, "application/octet-stream")}
     files.update(extra)
-    return client.post("/jobs", files=files)
+    return client.post("/jobs", files=files, headers=headers)
 
 
 # --------------------------------------------------------------------------------------
@@ -694,3 +694,110 @@ def test_the_status_and_report_agree_about_what_the_job_cost(client, workbook_by
     report = client.get(f"/jobs/{job_id}/report").json()
     assert status["usage"]["calls"] == report["model_usage"]["calls"] > 0
     assert status["usage"]["calls"] == status["llm_calls_used"]
+
+
+# --------------------------------------------------------------------------------------
+# Production concerns
+# --------------------------------------------------------------------------------------
+
+
+def test_an_upload_larger_than_the_limit_is_refused_without_being_buffered(tmp_path):
+    """The cap is applied as the bytes arrive. Reading the whole body first and *then*
+    comparing its length means a client wanting to exhaust memory simply sends more than
+    the limit -- the check runs after the damage."""
+    settings = settings_for(tmp_path, max_upload_bytes=64 * 1024)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "council.db"),
+        client_factory=mock_client,
+        autostart=False,
+    )
+    oversized = b"PK\x03\x04" + b"x" * (512 * 1024)
+    with TestClient(app) as client:
+        response = submit(client, oversized)
+        assert response.status_code == 400
+        assert "limit" in response.json()["error"]
+
+    # And nothing is left behind: a stranger must not be able to fill the disk with the
+    # leading megabytes of files the service refused.
+    stored = list(settings.data_root.rglob("workbook.xlsx"))
+    assert stored == []
+
+
+def test_a_rejected_upload_never_reveals_where_it_would_have_been_stored(client):
+    response = submit(client, b"not a spreadsheet at all", name="evil.xlsx")
+    assert response.status_code == 400
+    assert "/" not in response.json()["error"]
+
+
+def test_every_route_but_health_needs_the_token_when_one_is_set(tmp_path, workbook_bytes):
+    """Opt-in, because this normally sits behind something that already authenticates --
+    but the open case must not be invisible, so `/readyz` reports it."""
+    settings = settings_for(tmp_path, api_token="s3cret-token")
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "council.db"),
+        client_factory=mock_client,
+        autostart=False,
+    )
+    with TestClient(app) as client:
+        # Liveness stays open: a probe that needs a secret is a probe that reports the
+        # process as dead when the secret is wrong.
+        assert client.get("/health").status_code == 200
+
+        assert client.get("/readyz").status_code == 401
+        assert submit(client, workbook_bytes).status_code == 401
+        assert client.get("/jobs/anything").status_code == 401
+
+        auth = {"Authorization": "Bearer s3cret-token"}
+        assert client.get("/readyz", headers=auth).status_code == 200
+        assert client.get("/readyz", headers=auth).json()["authentication_required"] is True
+        assert submit(client, workbook_bytes, headers=auth).status_code == 202
+
+        assert client.get(
+            "/readyz", headers={"Authorization": "Bearer s3cret-tokes"}
+        ).status_code == 401
+        assert client.get(
+            "/readyz", headers={"Authorization": "s3cret-token"}
+        ).status_code == 401
+
+
+def test_an_open_service_says_so(client):
+    assert client.get("/readyz").json()["authentication_required"] is False
+
+
+def test_artifacts_are_found_again_after_the_data_root_moves(tmp_path, workbook_bytes):
+    """The column has been called `relative_path` since the first schema and was being
+    handed absolute paths, which tied every job to the filesystem of the machine that made
+    it. Move `DATA_ROOT` -- a mounted volume, a restored backup, another container -- and
+    every artefact lookup failed on rows that looked perfectly healthy."""
+    import shutil
+
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    app = create_app(
+        settings=settings,
+        db=Database(settings.data_root / "council.db"),
+        client_factory=mock_client,
+        autostart=True,
+    )
+    with TestClient(app) as client:
+        job_id = submit(client, workbook_bytes).json()["job_id"]
+        _wait_for_terminal(client, job_id)
+        assert client.get(f"/jobs/{job_id}/download").status_code == 200
+
+    # The storage moves wholesale, as a restore or a remount would move it.
+    moved = tmp_path / "somewhere-else"
+    shutil.move(str(settings.data_root), str(moved))
+
+    relocated = settings_for(tmp_path, data_root=moved)
+    app = create_app(
+        settings=relocated,
+        db=Database(moved / "council.db"),
+        client_factory=mock_client,
+        autostart=False,
+    )
+    with TestClient(app) as client:
+        assert client.get(f"/jobs/{job_id}/download").status_code == 200

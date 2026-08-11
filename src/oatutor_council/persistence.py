@@ -1109,9 +1109,35 @@ def token_usage(db: Database, job_id: str) -> dict[str, int]:
     return totals
 
 
+def relative_to_data_root(path: str | Path, data_root: Path) -> str:
+    """Store where a file is *within the data root*, never where it is on this machine.
+
+    The column has been called `relative_path` since the first schema; it was being handed
+    absolute paths anyway, which quietly tied every job to the filesystem layout of the
+    machine that created it. Move `DATA_ROOT` -- to a mounted volume, a restored backup, a
+    different container -- and every artefact lookup fails, on rows that look perfectly
+    healthy.
+
+    A path outside the data root is stored as it is. That should not happen, and storing a
+    misleading relative path would make it harder to see when it does.
+    """
+    try:
+        return str(Path(path).resolve().relative_to(Path(data_root).resolve()))
+    except ValueError:
+        return str(path)
+
+
 def record_artifact(
-    db: Database, job_id: str, kind: ArtifactKind, relative_path: str, sha256: str = ""
+    db: Database,
+    job_id: str,
+    kind: ArtifactKind,
+    relative_path: str,
+    sha256: str = "",
+    *,
+    data_root: Path | None = None,
 ) -> None:
+    if data_root is not None:
+        relative_path = relative_to_data_root(relative_path, data_root)
     with db.write() as connection:
         connection.execute(
             """INSERT INTO job_artifacts (job_id, kind, relative_path, sha256, created_at)
@@ -1124,11 +1150,26 @@ def record_artifact(
         )
 
 
-def list_artifacts(db: Database, job_id: str) -> dict[ArtifactKind, str]:
+def list_artifacts(
+    db: Database, job_id: str, *, data_root: Path | None = None
+) -> dict[ArtifactKind, str]:
+    """Artefact paths, resolved against the data root the caller is using now.
+
+    Passing `data_root` is what makes a job survive its storage moving. Omitting it
+    returns the stored value unchanged, which is what a caller wants when it is asking
+    what the row says rather than where the file is.
+    """
     rows = db.connection.execute(
         "SELECT kind, relative_path FROM job_artifacts WHERE job_id = ?", (job_id,)
     ).fetchall()
-    return {ArtifactKind(row["kind"]): row["relative_path"] for row in rows}
+    return {
+        ArtifactKind(row["kind"]): (
+            str(Path(data_root) / row["relative_path"])
+            if data_root is not None and not Path(row["relative_path"]).is_absolute()
+            else row["relative_path"]
+        )
+        for row in rows
+    }
 
 
 def mark_block_done(db: Database, job_id: str, block_id: str, phase: str) -> None:
@@ -1361,6 +1402,37 @@ def load_prompt_versions(db: Database, job_id: str) -> dict[str, int]:
         "SELECT role, version FROM job_prompts WHERE job_id = ?", (job_id,)
     ).fetchall()
     return {row["role"]: row["version"] for row in rows}
+
+
+def expired_jobs(db: Database, *, retention_days: float, limit: int = 50) -> tuple[str, ...]:
+    """Finished jobs old enough to delete.
+
+    Only terminal ones, and only by `updated_at`. A job still in flight is not old, however
+    long ago it was submitted -- and a retention sweep that deleted a running job's working
+    copy would be a data-loss bug wearing a compliance hat.
+    """
+    if retention_days <= 0:
+        return ()
+    cutoff = _iso(_now() - timedelta(days=retention_days))
+    rows = db.connection.execute(
+        """SELECT job_id FROM jobs
+           WHERE state IN ('succeeded','needs_human_attention','failed','cancelled')
+             AND updated_at < ?
+           ORDER BY updated_at LIMIT ?""",
+        (cutoff, limit),
+    ).fetchall()
+    return tuple(row["job_id"] for row in rows)
+
+
+def delete_job(db: Database, job_id: str) -> None:
+    """Remove a job and everything hanging off it.
+
+    The child tables all cascade, so this is one statement -- which is the reason
+    `foreign_keys=ON` is a pragma rather than a preference. Deleting a job by hand across
+    fourteen tables is how orphaned private reasoning outlives the job it belonged to.
+    """
+    with db.write() as connection:
+        connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 
 
 def describe_artifacts(db: Database, job_id: str) -> list[dict[str, Any]]:

@@ -13,16 +13,21 @@ dependencies = [
   "pydantic>=2.9",
   "openpyxl>=3.1",
   "sympy>=1.13",
-  "google-genai>=2.17",
+  # Pinned to the minor line whose surface `docs/gemini-sdk-notes.md` was verified
+  # against. `interactions.create` is young enough that a major bump is a rewrite of
+  # `llm/provider.py`, not an upgrade, and the failure would surface as a runtime
+  # TypeError inside a paid call rather than at install time.
+  "google-genai>=2.17,<3",
   "python-dotenv>=1.0",
   "python-docx>=1.1",
   "pypdf>=5.1",                # embedded-text extraction only - deliberately not a renderer
 
   # Build constraint, not an import. google-genai -> google-auth -> cryptography.
-  # cryptography 50.x publishes no x86_64 macOS wheel for cp312, so an unpinned
-  # resolve tries to compile Rust from source and fails without a toolchain.
-  # 48.x has wheels for every platform we target.
-  "cryptography<50",
+  # Neither 49.x nor 50.x publishes an x86_64 macOS wheel for cp312, so an unpinned
+  # resolve tries to compile Rust from source and fails without a toolchain. `<50` was
+  # not enough once 49.0.0 shipped with the same gap -- caught by actually installing
+  # the wheel into a clean environment, which is why CI does that on every run.
+  "cryptography<49",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +43,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The prompts are content the package cannot run without: every agent's system prompt is
+# a file, and a wheel that omits them installs a service whose first model call raises.
+[tool.setuptools.package-data]
+oatutor_council = ["prompts/*.md", "prompts/_shared/*.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -30,6 +30,7 @@ DEFAULT_PROVIDER_MAX_ATTEMPTS = 4
 DEFAULT_PROVIDER_BACKOFF_CEILING_SECONDS = 60.0
 DEFAULT_PROVIDER_FAILURE_BUDGET = 12
 DEFAULT_RUN_DEADLINE_SECONDS = 21_600.0
+DEFAULT_RETENTION_DAYS = 30.0
 
 
 class ConfigurationError(RuntimeError):
@@ -103,9 +104,21 @@ class Settings:
     #: Wall-clock ceiling for one worker's run of a job. Zero disables it.
     run_deadline_seconds: float = DEFAULT_RUN_DEADLINE_SECONDS
 
+    #: Shared secret for every route except `/health`. Empty means the service is open,
+    #: which is a legitimate configuration behind an authenticating proxy and a serious
+    #: mistake anywhere else -- so it is reported by `/readyz` rather than assumed.
+    api_token: str = ""
+    #: How long a finished job's files and rows are kept. Zero keeps them forever, which
+    #: is the wrong default for a service holding other people's course material.
+    retention_days: float = DEFAULT_RETENTION_DAYS
+
     #: Decision 1: reviewers judge the artefact, not the Writer's argument for it. Kept
     #: as a flag so the opposite reading stays testable rather than unimaginable.
     reviewer_sees_writer_rationale: bool = False
+
+    @property
+    def requires_authentication(self) -> bool:
+        return bool(self.api_token.strip())
 
     @property
     def heartbeat_seconds(self) -> float:
@@ -189,5 +202,7 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
             "PROVIDER_FAILURE_BUDGET", DEFAULT_PROVIDER_FAILURE_BUDGET
         ),
         run_deadline_seconds=_float("RUN_DEADLINE_SECONDS", DEFAULT_RUN_DEADLINE_SECONDS),
+        api_token=os.environ.get("API_TOKEN", "").strip(),
+        retention_days=_float("RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
         reviewer_sees_writer_rationale=_bool("REVIEWER_SEES_WRITER_RATIONALE", False),
     )

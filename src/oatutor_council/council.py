@@ -770,6 +770,7 @@ class CurationCouncil:
             self.job_id,
             ArtifactKind.CORRECTED_WORKBOOK,
             str(corrected),
+            data_root=self.settings.data_root,
             # Hashed so a curator can tell the file they downloaded is the file this
             # report is about. An artefact with no hash is a claim about a file nobody
             # can check they are holding.
@@ -822,6 +823,7 @@ class CurationCouncil:
             self.job_id,
             ArtifactKind.VALIDATION_REPORT,
             str(report_path),
+            data_root=self.settings.data_root,
             sha256=sha256_of(report_path),
         )
 
@@ -1138,9 +1140,9 @@ class CurationCouncil:
         if not segments:
             return
         expected = segments[0].get("document_sha256") or ""
-        path = list_artifacts(self.db, self.job_id).get(
-            ArtifactKind.INSTRUCTION_DOCUMENT
-        )
+        path = list_artifacts(
+            self.db, self.job_id, data_root=self.settings.data_root
+        ).get(ArtifactKind.INSTRUCTION_DOCUMENT)
         if not expected or path is None or not Path(path).is_file():
             return
         actual = sha256_of(Path(path))

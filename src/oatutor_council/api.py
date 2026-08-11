@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from hmac import compare_digest
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from .config import Settings, load_settings
@@ -60,7 +61,9 @@ from .uploads import (
     UploadRejected,
     assert_contained,
     check_archive,
-    validate_upload,
+    check_extension,
+    safe_display_name,
+    stream_upload,
 )
 from .workbook.writer import create_working_copy, sha256_of
 from .workers import (
@@ -86,6 +89,52 @@ def _declared_purpose(value: str) -> SegmentPurpose | None:
             f"instructions_purpose must be one of auto, rules, errata, notes "
             f"(got {cleaned!r})"
         ) from None
+
+
+#: The only routes that answer without a token. Liveness has to: a probe that needs a
+#: secret reports the process as dead whenever the secret is wrong, which is the opposite
+#: of what it is for. Everything else -- including readiness, which names the model --
+#: requires one. Listed here rather than marked per route, so what is public is one short
+#: list somebody can read.
+PUBLIC_PATHS = frozenset({"/health"})
+
+
+def _authenticator(settings: Settings):
+    """A dependency that checks the bearer token, or waves everything through.
+
+    Opt-in, and that is a real decision rather than laziness: this service is normally
+    deployed behind something that already authenticates, and a mandatory token would mean
+    a second secret to rotate for no gain. What must not happen is the open case being
+    *invisible* -- so `/readyz` reports whether a token is configured, and an unauthenticated
+    process says so in the log at startup.
+
+    Compared with `compare_digest`, because a token compared with `==` leaks its prefix to
+    anyone willing to time a few thousand requests.
+    """
+
+    async def require_token(request: Request) -> None:
+        if not settings.requires_authentication or request.url.path in PUBLIC_PATHS:
+            return
+        header = request.headers.get("authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not compare_digest(
+            presented.strip(), settings.api_token
+        ):
+            # No detail about which part was wrong. "Unknown token" and "malformed header"
+            # are two facts an attacker would rather have than not.
+            raise HTTPException(status_code=401, detail="authentication required")
+
+    return require_token
+
+
+def _extension_of(filename: str, allowed: frozenset[str], kind: str) -> str:
+    """The validated extension, decided before a byte is written.
+
+    Streaming needs a destination up front, and the destination's suffix has to come from
+    a checked extension rather than from the client's name -- otherwise the one thing the
+    client controls would be choosing what kind of file this is.
+    """
+    return check_extension(safe_display_name(filename), allowed, kind=kind)
 
 
 def _database_reachable(db: Database) -> bool:
@@ -147,7 +196,23 @@ def create_app(
         poller.stop()
         runner.shutdown()
 
-    app = FastAPI(title="OATutor Curation Council", lifespan=lifespan)
+    if not resolved.requires_authentication:
+        # Said out loud, once, at startup. An open service is a legitimate configuration
+        # behind an authenticating proxy and a serious mistake anywhere else, and the
+        # difference is not visible from inside the process.
+        log.warning(
+            "API_TOKEN is not set: every endpoint is open. This is only safe behind a "
+            "proxy that authenticates on this service's behalf."
+        )
+
+    app = FastAPI(
+        title="OATutor Curation Council",
+        lifespan=lifespan,
+        # Applied to every route through the router rather than repeated per endpoint: a
+        # per-route dependency is one somebody forgets on the route they add next, and the
+        # route they add next is the one that serves a curator's workbook.
+        dependencies=[Depends(_authenticator(resolved))],
+    )
     app.state.db = database
     app.state.settings = resolved
     app.state.autostart = autostart
@@ -194,12 +259,17 @@ def create_app(
             # service, and a probe that called it ready would hide the half that is not.
             "poller": getattr(app.state, "poller", None) is not None,
         }
+        # Reported, not required. Whether an open service is acceptable depends on what is
+        # in front of it, which this process cannot see -- but an operator looking at a
+        # readiness page should not have to guess.
+        authenticated = resolved.requires_authentication
         ready = all(checks.values())
         return JSONResponse(
             status_code=200 if ready else 503,
             content={
                 "ready": ready,
                 "checks": checks,
+                "authentication_required": authenticated,
                 "offline_client": offline,
                 **resolved.describe_provider(),
             },
@@ -220,40 +290,42 @@ def create_app(
         for the whole document -- someone who uploads a formatting guide and says so
         knows something the phrasing does not always reveal.
         """
-        workbook_bytes = await workbook.read()
-        checked = validate_upload(
-            filename=workbook.filename or "",
-            data=workbook_bytes,
-            allowed=WORKBOOK_EXTENSIONS,
-            kind="workbook",
-            max_bytes=resolved.max_upload_bytes,
-        )
-
         job_id = uuid4().hex
         job_dir = job_dir_for(resolved, job_id)
         source_dir = job_dir / "source"
         source_dir.mkdir(parents=True, exist_ok=True)
 
-        # The client's filename never reaches the filesystem. The directory is a UUID and
-        # the file inside it has a fixed name.
-        source_path = source_dir / f"workbook{checked.extension}"
-        source_path.write_bytes(workbook_bytes)
+        # Streamed to disk in chunks with the cap applied as the bytes arrive. The client
+        # filename never reaches the filesystem: the directory is a UUID and the file
+        # inside it has a fixed name, decided from the *validated* extension.
+        extension = _extension_of(workbook.filename or "", WORKBOOK_EXTENSIONS, "workbook")
+        source_path = source_dir / f"workbook{extension}"
+        checked = await stream_upload(
+            workbook,
+            source_path,
+            filename=workbook.filename or "",
+            allowed=WORKBOOK_EXTENSIONS,
+            kind="workbook",
+            max_bytes=resolved.max_upload_bytes,
+        )
         check_archive(source_path, checked.extension)
 
         parsed_document = None
         document_path: Path | None = None
         instruction_name: str | None = None
         if instructions is not None and instructions.filename:
-            document_bytes = await instructions.read()
-            document = validate_upload(
+            document_extension = _extension_of(
+                instructions.filename, INSTRUCTION_EXTENSIONS, "instruction document"
+            )
+            document_path = source_dir / f"instructions{document_extension}"
+            document = await stream_upload(
+                instructions,
+                document_path,
                 filename=instructions.filename,
-                data=document_bytes,
                 allowed=INSTRUCTION_EXTENSIONS,
                 kind="instruction document",
                 max_bytes=resolved.max_upload_bytes,
             )
-            document_path = source_dir / f"instructions{document.extension}"
-            document_path.write_bytes(document_bytes)
             check_archive(document_path, document.extension)
 
             parsed_document = read_instruction_document(
@@ -274,7 +346,11 @@ def create_app(
             ),
         )
         record_artifact(
-            database, job_id, ArtifactKind.SOURCE_WORKBOOK, str(source_path)
+            database,
+            job_id,
+            ArtifactKind.SOURCE_WORKBOOK,
+            str(source_path),
+            data_root=resolved.data_root,
         )
 
         # The document is decomposed and stored **before the job is queued**, so the
@@ -299,6 +375,7 @@ def create_app(
                 ArtifactKind.INSTRUCTION_DOCUMENT,
                 str(document_path),
                 sha256=document_hash,
+                data_root=resolved.data_root,
             )
 
         if app.state.autostart:
@@ -399,7 +476,7 @@ def create_app(
     async def download(job_id: str) -> FileResponse:
         """Serve the corrected workbook by `(job_id, kind)`, never by client path."""
         _job_or_404(job_id)
-        artifacts = list_artifacts(database, job_id)
+        artifacts = list_artifacts(database, job_id, data_root=resolved.data_root)
         path = artifacts.get(ArtifactKind.CORRECTED_WORKBOOK)
         if path is None:
             raise HTTPException(

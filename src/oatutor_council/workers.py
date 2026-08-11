@@ -25,7 +25,9 @@ that is a different design rather than a flag.
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
+from contextlib import suppress
 from concurrent import futures
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -41,6 +43,8 @@ from .persistence import (
     Database,
     acquire_lease,
     claimable_jobs,
+    delete_job,
+    expired_jobs,
     get_job,
     heartbeat,
     record_event,
@@ -268,6 +272,39 @@ class JobRunner:
             futures.wait(pending, timeout=wait)
 
 
+def purge_expired_jobs(db: Database, settings: Settings) -> int:
+    """Delete finished jobs past the retention window, files and rows together.
+
+    Files **first**, then rows. The other order can leave a directory nobody has a record
+    of, which is the worst outcome available here: a curator's workbook sitting on a disk
+    with nothing left to say whose it was or that it should have been deleted.
+
+    Retention is a real setting rather than a cleanup script somebody runs quarterly,
+    because this service holds other people's course material and "we keep everything" is
+    a decision that should have to be made deliberately (`RETENTION_DAYS=0`).
+    """
+    purged = 0
+    for job_id in expired_jobs(db, retention_days=settings.retention_days):
+        directory = job_dir_for(settings, job_id)
+        try:
+            if directory.is_dir():
+                # The source workbook is chmod 0444 by design, so write permission has to
+                # be restored before the tree will go. Directories need the execute bit
+                # back too, or the walk cannot descend into what it just made unreadable.
+                for path in directory.rglob("*"):
+                    with suppress(OSError):
+                        path.chmod(0o755 if path.is_dir() else 0o644)
+                shutil.rmtree(directory)
+        except OSError:
+            log.exception("could not remove the directory for expired job %s", job_id)
+            continue
+        delete_job(db, job_id)
+        purged += 1
+    if purged:
+        log.info("purged %d job(s) past the retention window", purged)
+    return purged
+
+
 class JobPoller:
     """Sweeps for orphaned jobs on an interval, in its own daemon thread.
 
@@ -278,9 +315,13 @@ class JobPoller:
     thread.
     """
 
-    def __init__(self, runner: JobRunner, *, interval: float) -> None:
+    def __init__(self, runner: JobRunner, *, interval: float, purge: bool = True) -> None:
         self.runner = runner
         self.interval = max(0.05, interval)
+        # Retention runs on the same tick as the sweep. It needs *some* recurring thread,
+        # and inventing a second one would double the machinery for a job that takes
+        # milliseconds and almost always finds nothing to do.
+        self.purge = purge
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.sweeps = 0
@@ -301,6 +342,8 @@ class JobPoller:
         while not self._stop.wait(self.interval):
             try:
                 self.runner.sweep()
+                if self.purge:
+                    purge_expired_jobs(self.runner.db, self.runner.settings)
                 self.sweeps += 1
             except Exception:  # pragma: no cover - a poller must not die of one bad tick
                 log.exception("job sweep failed")

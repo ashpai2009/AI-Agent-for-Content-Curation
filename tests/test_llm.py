@@ -136,9 +136,19 @@ def test_an_unknown_prompt_is_fatal():
         load_prompt("nonexistent_agent")
 
 
-def test_prompts_live_outside_the_package():
+def test_prompts_ship_with_the_package():
+    """They used to sit beside `src/`, on the reasoning that they are content rather than
+    code. That does not survive a wheel install: the directory two levels above the
+    installed module is site-packages, so every agent raised `PromptNotFound` on its first
+    call. Content the package cannot run without lives where the package lives."""
+    import oatutor_council
+
+    package_root = Path(oatutor_council.__file__).resolve().parent
     assert PROMPT_ROOT.is_dir()
-    assert "src" not in PROMPT_ROOT.parts[-2:]
+    assert PROMPT_ROOT.parent == package_root
+    assert {p.name for p in PROMPT_ROOT.glob("*.v*.md")} == {
+        f"{role.value}.v1.md" for role in AgentRole
+    }
 
 
 # --------------------------------------------------------------------------------------

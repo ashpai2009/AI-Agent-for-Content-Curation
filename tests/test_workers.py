@@ -83,7 +83,9 @@ def source(make_workbook) -> Path:
 
 @pytest.fixture
 def job_dir(tmp_path) -> Path:
-    return tmp_path / "job"
+    # Named for the job, as `job_dir_for` names it in production: `data_root/<job_id>`.
+    # A fixture that put it anywhere else would pass tests that production layout fails.
+    return tmp_path / "job-1"
 
 
 @pytest.fixture
@@ -430,3 +432,89 @@ def test_a_run_that_overruns_its_deadline_fails_and_stays_resumable(setup):
     # with no outgoing edge, reported "nothing to do", and the job never moved.
     assert resume_from_failure(db, "job-1", run_epoch=get_job(db, "job-1").run_epoch)
     assert council(setup, quiet_client()).run().state is JobState.SUCCEEDED
+
+
+# --------------------------------------------------------------------------------------
+# Retention
+# --------------------------------------------------------------------------------------
+
+
+def test_a_finished_job_is_deleted_once_it_is_past_the_retention_window(setup, job_dir):
+    """Files first, then rows. The other order can leave a directory nobody has a record
+    of, which is the worst outcome available: a curator's workbook on a disk with nothing
+    left to say whose it was or that it should have been deleted."""
+    from oatutor_council.persistence import get_job
+    from oatutor_council.workers import purge_expired_jobs
+
+    db, _ = setup
+    council(setup, quiet_client()).run()
+    assert job_dir.is_dir()
+
+    _age_job(db, "job-1", days=90)
+    purged = purge_expired_jobs(
+        db, settings(data_root=job_dir.parent, retention_days=30)
+    )
+
+    assert purged == 1
+    assert get_job(db, "job-1") is None
+    assert not job_dir.exists()
+
+
+def test_a_running_job_is_never_purged_however_old_the_submission(setup, job_dir):
+    """A job still in flight is not old, however long ago it was submitted. A retention
+    sweep that deleted a running job's working copy would be a data-loss bug wearing a
+    compliance hat."""
+    from oatutor_council.persistence import get_job
+    from oatutor_council.workers import purge_expired_jobs
+
+    db, _ = setup
+    council(setup, quiet_client()).run(max_steps=3)
+    assert not get_job(db, "job-1").is_terminal
+
+    _age_job(db, "job-1", days=900)
+    assert purge_expired_jobs(db, settings(data_root=job_dir.parent, retention_days=1)) == 0
+    assert get_job(db, "job-1") is not None
+    assert job_dir.is_dir()
+
+
+def test_retention_can_be_switched_off_but_only_deliberately(setup, job_dir):
+    """`RETENTION_DAYS=0` keeps everything. It is a decision somebody has to make, not
+    the default, because this service holds other people's course material."""
+    from oatutor_council.persistence import get_job
+    from oatutor_council.workers import purge_expired_jobs
+
+    db, _ = setup
+    council(setup, quiet_client()).run()
+    _age_job(db, "job-1", days=9999)
+
+    assert purge_expired_jobs(db, settings(data_root=job_dir.parent, retention_days=0)) == 0
+    assert get_job(db, "job-1") is not None
+
+
+def test_deleting_a_job_takes_its_private_reasoning_with_it(setup, job_dir):
+    """The child tables cascade, which is why `foreign_keys=ON` is a pragma rather than a
+    preference: deleting a job by hand across fourteen tables is how orphaned agent
+    reasoning outlives the job it belonged to."""
+    from oatutor_council.persistence import (
+        delete_job,
+        list_llm_calls,
+        load_private_blobs,
+    )
+
+    db, _ = setup
+    council(setup, quiet_client()).run()
+    assert load_private_blobs(db, "job-1")
+
+    delete_job(db, "job-1")
+    assert load_private_blobs(db, "job-1") == ()
+    assert list_llm_calls(db, "job-1") == ()
+
+
+def _age_job(db, job_id: str, *, days: float) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with db.write() as connection:
+        connection.execute(
+            "UPDATE jobs SET updated_at = ? WHERE job_id = ?", (stale, job_id)
+        )

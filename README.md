@@ -72,6 +72,17 @@ Without credentials the service **refuses to start**, rather than accepting uplo
 can never process. `GET /health` is liveness; `GET /readyz` answers the different and more
 useful question of whether a job submitted right now could actually run.
 
+Set `API_TOKEN` and every endpoint except `/health` requires `Authorization: Bearer …`.
+Leaving it unset leaves the service open, which is a reasonable configuration behind a
+proxy that authenticates on its behalf and a serious mistake anywhere else — so the
+process says which it is at startup and `/readyz` reports it. Liveness stays open on
+purpose: a probe that needs a secret reports the process as dead whenever the secret is
+wrong.
+
+Finished jobs are deleted after `RETENTION_DAYS` (30 by default), files first and then
+rows. `RETENTION_DAYS=0` keeps everything, which should be a decision somebody makes
+rather than a default they inherit.
+
 **One worker process.** The lease protocol itself is safe across processes — epoch fencing
 and `BEGIN IMMEDIATE` are not in-process locks — but SQLite in WAL mode over a single file
 wants one writer, and the working copies live on a local filesystem. Concurrency within the
@@ -127,9 +138,16 @@ src/oatutor_council/
   llm/             base · provider (Gemini) · mock · context · prompts · audit
   ingestion/       instruction_documents
   reporting/       ledger · reports
-prompts/           versioned agent prompts, plus the shared untrusted-data policy
-scripts/           demo.py · evaluate_workbooks.py · smoke_provider.py · recon_workbooks.py
+  workers.py       leases, heartbeats, the worker pool, the poller, retention
+  prompts/         versioned agent prompts, plus the shared policies (package data)
+scripts/           demo.py · evaluate_workbooks.py · shadow_run.py ·
+                   smoke_provider.py · recon_workbooks.py
 ```
+
+The prompts ship **inside** the package. They started outside it, on the reasoning that
+they are content rather than code — which does not survive a wheel install, where the
+directory beside the source tree is site-packages and every agent raises on its first
+call. `OATUTOR_PROMPT_ROOT` overrides the location for anyone iterating on wording.
 
 ### The guarantees, and how each is enforced
 
@@ -277,6 +295,28 @@ That last point is a requirement rather than a limitation: an unreadable documen
 never be reported as a document containing no instructions. Those two outcomes are
 indistinguishable downstream, and confusing them tells a curator who uploaded a scan that
 their workbook is fine.
+
+---
+
+## Evaluation
+
+Three layers, answering three different questions.
+
+**The golden collection** (`tests/golden.py`) states, for each workbook, the verdict a
+curator would give it — in a sentence — and asserts the engine reaches it. Half the cases
+are *correct* material that must come back quiet, because a rule that flags good
+mathematics is worse than a missing rule: it buries every true finding beside it. Several
+of them encode measurements that changed the rules, such as `5*pi/6` being ordinary
+notation rather than a missing parenthesis.
+
+**`scripts/evaluate_workbooks.py`** runs the deterministic core over the real corpus,
+read-only, hashing every file before and after.
+
+**`scripts/shadow_run.py`** runs the *whole council* over a **copy** of one real workbook
+and prints what a real job would report. Offline by default — the scripted agents examine
+and never edit — with `--live` as an explicit opt-in that says what it is about to send
+before it sends it. `scripts/smoke_provider.py` makes one live call with invented
+arithmetic and no workbook content at all.
 
 ---
 

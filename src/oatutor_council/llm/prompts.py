@@ -1,9 +1,12 @@
-"""Loading versioned prompts from `prompts/`.
+"""Loading versioned prompts from the packaged `prompts/` directory.
 
 Prompts are files, not string literals in application code. Two reasons that matter: a
 prompt in a file can be read and reviewed by someone who does not read Python, and a
 prompt with a version in its name can be changed without silently altering what every
 previously-recorded call was made with.
+
+They live **inside the package** and ship as package data. See `PROMPT_ROOT` below for why
+that is a correction rather than the original design.
 
 The untrusted-data policy is **composed in, not copied**. Each prompt file carries a
 `{untrusted_data_policy}` placeholder, and the loader substitutes one shared clause. A
@@ -14,6 +17,7 @@ at load time rather than a security hole nobody noticed.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -21,9 +25,20 @@ from pathlib import Path
 
 from .base import AgentRole
 
-#: `prompts/` sits beside `src/`, not inside the package: it is content, not code, and
-#: keeping it out of the package makes it obvious that editing it changes behaviour.
-PROMPT_ROOT = Path(__file__).resolve().parents[3] / "prompts"
+#: **Inside the package, and this is a correction.** The prompts used to sit beside `src/`
+#: on the reasoning that they are content rather than code. That argument does not survive
+#: a wheel install: `pip install oatutor-council` produced a package whose every agent
+#: raised `PromptNotFound` on its first call, because the directory two levels above the
+#: installed module is site-packages. Content that has to ship with the code lives where
+#: the code ships.
+#:
+#: `OATUTOR_PROMPT_ROOT` overrides it, for an operator who wants to iterate on wording
+#: without reinstalling. Deliberately an *override* rather than the primary mechanism --
+#: a deployment that depends on an environment variable pointing at a directory is a
+#: deployment that breaks when somebody forgets it.
+PROMPT_ROOT = Path(
+    os.environ.get("OATUTOR_PROMPT_ROOT") or Path(__file__).resolve().parent.parent / "prompts"
+)
 
 POLICY_PLACEHOLDER = "{untrusted_data_policy}"
 POLICY_FILE = "_shared/untrusted_data.md"

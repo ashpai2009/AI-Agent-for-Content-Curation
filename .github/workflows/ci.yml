@@ -1,0 +1,65 @@
+name: ci
+
+# Two things are checked, and the second is the one that keeps being forgotten: that the
+# thing we ship actually works. A suite that passes against the source tree says nothing
+# about a package whose data files were left out of the wheel.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install from the lockfile
+        # The lockfile, not a fresh resolve. A test run that quietly picked up a new
+        # `google-genai` would fail somewhere confusing, or worse, pass while the pinned
+        # deployment does not.
+        run: |
+          uv venv --python 3.12
+          uv pip install -r requirements.lock
+          uv pip install --no-deps -e .
+
+      - name: Tests
+        # No credentials in the environment. Every test builds its own synthetic workbook
+        # and drives the council with the scripted client; a test that needed a key would
+        # fail here rather than silently costing money.
+        run: uv run --no-project python -m pytest tests/ -q
+
+      - name: The offline demo runs the whole council
+        run: uv run --no-project python scripts/demo.py
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build and install the wheel into a clean environment
+        run: |
+          uv build --wheel --out-dir dist
+          uv venv --python 3.12 /tmp/wheel-env
+          uv pip install --python /tmp/wheel-env dist/*.whl
+
+      - name: The installed package can load its own prompts
+        # The regression this exists for: the prompts lived beside `src/` and were not
+        # package data, so a wheel install produced a service whose every agent raised
+        # `PromptNotFound` on its first call. Nothing in the source-tree suite could see
+        # it, because in the source tree the directory is right where the code looks.
+        run: |
+          /tmp/wheel-env/bin/python -c "
+          from oatutor_council.api import create_app
+          from oatutor_council.llm.base import AgentRole
+          from oatutor_council.llm.prompts import system_prompt, current_prompt_versions
+          assert current_prompt_versions()
+          for role in AgentRole:
+              assert len(system_prompt(role)) > 500, role
+          print('wheel install is usable')
+          "

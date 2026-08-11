@@ -14,6 +14,10 @@ controlled and the first four bytes are what every reader will actually act on.
 **Both the compressed and decompressed sizes are capped.** An `.xlsx` is a zip archive, so
 a small upload can expand to fill a disk. Checking only the upload size defends against
 the wrong thing.
+
+**The size cap is enforced while the bytes arrive, not after.** `stream_upload` writes in
+chunks and stops at the limit. Reading the whole body first and then comparing its length
+means a client who wants to exhaust memory just sends more than the limit.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 #: Extensions accepted for each role. The instruction-document set matches what
 #: `ingestion.instruction_documents` can actually read.
@@ -174,6 +179,63 @@ def validate_upload(
     extension = check_extension(display, allowed, kind=kind)
     check_magic_bytes(data, extension)
     return UploadedFile(display_name=display, extension=extension, size=len(data))
+
+
+#: How much of an upload is read at a time. Large enough that the syscall overhead is
+#: irrelevant, small enough that a hundred concurrent uploads cannot be a memory problem.
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def stream_upload(
+    upload: Any,
+    destination: Path,
+    *,
+    filename: str,
+    allowed: frozenset[str],
+    kind: str,
+    max_bytes: int,
+) -> UploadedFile:
+    """Write an upload to disk in chunks, enforcing the cap **as it arrives**.
+
+    The previous version read the whole body into memory and *then* compared its length to
+    the limit -- which means a client wanting to exhaust the service's memory simply sends
+    more than the limit, and the check that was supposed to stop them runs after the damage
+    is done. Concurrency makes it worse: the cap was per upload, and nothing bounded the
+    sum.
+
+    Reading in chunks also lets the format check happen on the first chunk, before the rest
+    of a file that was never going to be accepted is written to disk at all.
+    """
+    display = safe_display_name(filename)
+    extension = check_extension(display, allowed, kind=kind)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    first = True
+    try:
+        with destination.open("wb") as handle:
+            while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
+                if first:
+                    check_magic_bytes(chunk, extension)
+                    first = False
+                total += len(chunk)
+                if total > max_bytes:
+                    raise UploadRejected(
+                        f"the {kind} file is larger than the "
+                        f"{max_bytes // (1024 * 1024)} MB limit"
+                    )
+                handle.write(chunk)
+    except UploadRejected:
+        # A rejected upload leaves nothing behind. Otherwise a stranger can fill the disk
+        # with the leading megabytes of files the service refused.
+        destination.unlink(missing_ok=True)
+        raise
+
+    if total == 0:
+        destination.unlink(missing_ok=True)
+        raise UploadRejected(f"the {kind} file is empty")
+
+    return UploadedFile(display_name=display, extension=extension, size=total)
 
 
 def assert_contained(path: Path, root: Path) -> Path:
