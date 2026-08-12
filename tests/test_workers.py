@@ -55,8 +55,9 @@ from oatutor_council.workers import (
 
 def settings(**overrides) -> Settings:
     defaults = dict(
-        gemini_api_key="test",
-        gemini_model="mock",
+        claude_cli_path="fake-claude",
+        claude_model="mock",
+        claude_effort="medium",
         data_root=Path("."),
         max_repair_attempts=3,
         max_validation_rounds=2,
@@ -66,6 +67,11 @@ def settings(**overrides) -> Settings:
         max_concurrent_jobs=2,
         max_upload_bytes=1024,
         lease_seconds=60,
+        # One physical call per logical call. A scripted mock is not a provider, and
+        # retrying one tests nothing -- while an absorbed failure would silently change
+        # what the failure-handling tests below are asserting about. The retry layer has
+        # its own tests, against a client that actually fails.
+        provider_max_attempts=1,
     )
     return Settings(**{**defaults, **overrides})
 

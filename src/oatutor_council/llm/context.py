@@ -52,6 +52,15 @@ def _fences(token: str) -> tuple[str, str]:
     )
 
 
+#: A label occupies one line inside the fenced region, so a newline in one forges a second
+#: header. Collapsed to spaces and bounded, on top of the fence neutralisation.
+MAX_LABEL_CHARACTERS = 200
+
+
+def _label(text: str) -> str:
+    return " ".join(neutralise(text).split())[:MAX_LABEL_CHARACTERS]
+
+
 def neutralise(text: str) -> str:
     """Remove anything that could pass for a fence.
 
@@ -92,8 +101,15 @@ class ContextBundle:
             )
 
         for section in self.sections:
+            # **The label is neutralised too, and that is a fix rather than a flourish.**
+            # It used to be interpolated raw while only the content was cleaned, which made
+            # the label an unfenced hole in the very boundary this class exists to hold.
+            # Labels are supposed to be generated text, but "supposed to be" is what the
+            # caller believes; a caller that puts a problem name in one -- and problem names
+            # come from the workbook -- would hand a payload the ability to close its own
+            # section. A newline alone would forge a second SECTION header.
             parts.append(
-                f"{begin}\nSECTION: {section.label}\n"
+                f"{begin}\nSECTION: {_label(section.label)}\n"
                 f"{neutralise(section.content)}\n{end}"
             )
         return "\n\n".join(parts)

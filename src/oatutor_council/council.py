@@ -23,7 +23,7 @@ human attention, which is the honest outcome after three failed repairs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -41,6 +41,7 @@ from .llm.base import (
     ProviderConfigurationError,
     ProviderError,
     ProviderRefused,
+    RetryingClient,
     sanitize_provider_message,
 )
 from .llm.prompts import current_prompt_versions
@@ -83,8 +84,10 @@ from .persistence import (
     list_issues,
     load_instruction_segments,
     load_ledger,
+    load_job_settings,
     load_private_blobs,
     load_prompt_versions,
+    pin_job_settings,
     pin_prompt_versions,
     save_private_blob,
     mark_block_done,
@@ -150,9 +153,37 @@ PROVIDER_FAILURE_EVENT = "provider_failure"
 #: only answer to "is this file finished" that is still true afterwards.
 FINAL_GATE_ROUND = 1_000
 
+#: Bumped when the CLI adapter's invocation changes in a way that could alter results --
+#: a flag added or removed, the envelope read differently.
+#:
+#: Pinned per job and **compared on every resume**. A pinned version nothing checks is a
+#: note in a drawer: the job would carry on under a different adapter from the one its
+#: first half ran under, and the record would say otherwise. Unlike the batch size or the
+#: model, this one cannot be re-applied -- the running code is the running code -- so the
+#: only safe answer to a mismatch is to stop.
+#:
+#: There is deliberately no output-limit formula version beside it. One was pinned and
+#: recorded for a while with no output limit anywhere in the adapter to govern; metadata
+#: describing a mechanism that does not exist is worse than no metadata, because it is
+#: read as evidence that the mechanism does. The CLI at 2.1.219 offers no output-token
+#: ceiling (`--max-thinking-tokens` and `--task-budget` are different things), so the
+#: honest record is silence.
+CLI_ADAPTER_VERSION = 1
+
 
 class BudgetExhausted(Exception):
     """A global fuse blew. Always terminal, never retried."""
+
+
+class JobSettingsMigrationRequired(Exception):
+    """This job was pinned to an adapter version the running code is not.
+
+    Deployments happen mid-job, and the pinned settings exist precisely so a resumed job
+    keeps the behaviour it started under. Batch size and model can simply be re-applied.
+    An adapter version cannot: the code that would honour it has been replaced. Carrying
+    on regardless would mean a job whose first half ran under one set of flags and whose
+    second half ran under another, with its own record insisting they were the same.
+    """
 
 
 class JobDeadlineExceeded(Exception):
@@ -162,6 +193,25 @@ class JobDeadlineExceeded(Exception):
     is the only brake that catches a job whose worker is alive, within budget, and simply
     not getting anywhere -- a provider degraded to one call a minute, say.
     """
+
+
+def _adapter_mismatch(pinned: dict[str, object]) -> str | None:
+    """The message to fail with, or `None` when the pin matches the running code.
+
+    A job pinned before this key existed is not a mismatch -- there is nothing to
+    disagree with, and treating absence as disagreement would fail every job that was
+    in flight across this very deployment.
+    """
+    recorded = pinned.get("cli_adapter_version")
+    if recorded is None or int(recorded) == CLI_ADAPTER_VERSION:
+        return None
+    return (
+        f"this job was pinned to CLI adapter version {int(recorded)} and this process "
+        f"is running version {CLI_ADAPTER_VERSION}. The adapter decides what flags each "
+        "model call carries, so continuing would finish the job under different "
+        "instructions from the ones it started under. Resume it on a process running "
+        f"adapter {int(recorded)}, or submit the workbook again."
+    )
 
 
 @dataclass(frozen=True)
@@ -227,6 +277,11 @@ class CurationCouncil:
         # under another with nothing in the record to say so.
         self.prompt_versions = load_prompt_versions(db, job_id)
 
+        # A resumed job must run under the settings it *started* with, from its very first
+        # step -- not from the step where pinning happens to re-run. Loaded here so a
+        # second worker picks up the same batch size and effort the first one used.
+        self.settings = self._settings_from_pins()
+
         # One registry per job. Two jobs share no reasoning, and a global one would make
         # a different job's rationale a false positive here.
         #
@@ -243,8 +298,25 @@ class CurationCouncil:
         # Wrapped last, so every agent gets the audit trail without any of them knowing
         # about it. An audit trail each new agent has to remember to write to is one with
         # invisible holes: a missing row looks exactly like a call never made.
-        self.client = RecordingClient(
-            client, db, job_id, prompt_versions=self.prompt_versions
+        #
+        # The order of the two wrappers is the whole fix to a real hole: retry **outside**
+        # recording, recording outside the provider. With the retry inside the provider,
+        # one logical call could start four `claude` processes while producing one audit
+        # row and one budget charge -- so the trail understated the spend and the budget
+        # bounded a quarter of what it named. Every physical invocation now passes through
+        # the recorder, and `_charge_call` commits its budget before it starts.
+        self.recorder = RecordingClient(
+            client,
+            db,
+            job_id,
+            prompt_versions=self.prompt_versions,
+            behaviour=load_job_settings(db, job_id),
+            before_call=self._charge_call,
+        )
+        self.client = RetryingClient(
+            self.recorder,
+            attempts=self.settings.provider_max_attempts,
+            backoff_ceiling=self.settings.provider_backoff_ceiling_seconds,
         )
         self._source_parse: ParsedWorkbook | None = None
 
@@ -321,22 +393,32 @@ class CurationCouncil:
         """
         return read_workbook(self.copy.path)
 
-    def _spend(self, *, steps: int = 1, llm_calls: int = 0) -> None:
+    def _spend(self, *, steps: int = 1) -> None:
         job = self.job
         if job.steps_used + steps > self.settings.step_budget:
             raise BudgetExhausted(
                 f"job exceeded its step budget of {self.settings.step_budget}"
             )
-        if job.llm_calls_used + llm_calls > self.settings.llm_call_budget:
+        increment_counters(
+            self.db, self.job_id, run_epoch=self.run_epoch, steps=steps
+        )
+
+    def _charge_call(self) -> None:
+        """One unit of the model-call budget, committed before the process starts.
+
+        Hung on the recorder rather than called from each phase, for the reason the
+        recorder itself is a wrapper: a budget each caller has to remember to charge is a
+        budget with holes, and the holes are invisible. It also means the thing counted is
+        the thing that costs -- a physical `claude` invocation -- rather than a phase's
+        intention to make one. A retried outage and a schema retry each cost a real call,
+        and both used to be free.
+        """
+        if self.job.llm_calls_used + 1 > self.settings.llm_call_budget:
             raise BudgetExhausted(
                 f"job exceeded its model-call budget of {self.settings.llm_call_budget}"
             )
         increment_counters(
-            self.db,
-            self.job_id,
-            run_epoch=self.run_epoch,
-            steps=steps,
-            llm_calls=llm_calls,
+            self.db, self.job_id, run_epoch=self.run_epoch, llm_calls=1
         )
 
     def _advance(self, target: JobState, reason: FailureReason | None = None) -> None:
@@ -381,16 +463,118 @@ class CurationCouncil:
                 kind=kind,
             )
 
-    def _pin_prompts(self) -> None:
-        """Fix this job's prompt versions, once, at the first step that runs.
+    def _take_batch(
+        self, parsed: ParsedWorkbook, pending: Sequence[ProblemBlock]
+    ) -> list[ProblemBlock]:
+        """The next blocks to scan in one call, bounded by count *and* by size.
 
-        `INSERT OR IGNORE`, so a resumed job keeps what it started with rather than
-        adopting whatever is on disk now. The in-memory copy is refreshed from the write
-        so the recording client labels calls with the pinned version, not the current one.
+        Two limits because they bound different things. `scan_batch_size` bounds how many
+        verdicts one response has to carry; `scan_batch_max_characters` bounds how much
+        context one call has to hold, which a count cannot -- a five-row block and a
+        hundred-row block are not the same allowance.
+
+        **At least one block always goes**, even one that exceeds the size cap by itself.
+        Otherwise an oversized first block is never dispatched, never marked done, and the
+        phase requeues it forever: a livelock created by a safety limit, which is worse
+        than the limit not existing.
+        """
+        limit = max(1, self.settings.scan_batch_size)
+        budget = self.settings.scan_batch_max_characters
+
+        batch: list[ProblemBlock] = []
+        used = 0
+        for block in pending[:limit]:
+            cost = self._batch_cost(parsed, block)
+            if batch and used + cost > budget:
+                break
+            batch.append(block)
+            used += cost
+        return batch
+
+    def _batch_cost(self, parsed: ParsedWorkbook, block: ProblemBlock) -> int:
+        """A block's full contribution to a batched payload.
+
+        The rendered block *plus* its applicable claims and its deterministic findings --
+        not `render_block` alone, or a block with forty findings slips under a cap it
+        dominates.
+        """
+        from .agents.rendering import render_block, render_findings
+
+        cost = len(render_block(block))
+        cost += len(render_findings(self._findings_for_block(parsed, block)))
+        cost += sum(
+            len(claim.text) for claim in self.seed_claims if claim.applies_to(block)
+        )
+        # Labels, headers and fencing per section. Small, fixed, and counted so the cap
+        # means what it says.
+        return cost + 200
+
+    def _pin_prompts(self) -> None:
+        """Fix this job's prompt versions *and* its behaviour settings, once.
+
+        `INSERT OR IGNORE` for both, so a resumed job keeps what it started with rather
+        than adopting whatever is on disk or in the environment now. Recording them per
+        call would be auditing; pinning them is what stops a worker restarted after an
+        `.env` edit from giving one job half its blocks at batch 1 and the other half at
+        batch 10 -- a run the report would then describe as a single coherent thing.
         """
         pin_prompt_versions(self.db, self.job_id, current_prompt_versions())
         self.prompt_versions = load_prompt_versions(self.db, self.job_id)
         self.client.prompt_versions = self.prompt_versions
+
+        pin_job_settings(self.db, self.job_id, self._behaviour_settings())
+        self.settings = self._settings_from_pins()
+        self.client.behaviour = load_job_settings(self.db, self.job_id)
+
+    def _behaviour_settings(self) -> dict[str, object]:
+        """What must not change under a running job.
+
+        Two kinds of entry, and they are enforced differently. The first four are
+        *re-applied* on resume, which is enforcement enough: whatever the environment says
+        now, the job runs at the batch size and model it started with. `cli_adapter_version`
+        cannot be re-applied -- it names the code, and the code is whatever was deployed --
+        so it is **compared** instead, and a mismatch stops the job.
+        """
+        return {
+            "scan_batch_size": self.settings.scan_batch_size,
+            "scan_batch_max_characters": self.settings.scan_batch_max_characters,
+            "role_effort": {
+                role.value: self.settings.effort_for(role.value) for role in AgentRole
+            },
+            "model": self.settings.claude_model,
+            "cli_adapter_version": CLI_ADAPTER_VERSION,
+        }
+
+    def _settings_from_pins(self) -> Settings:
+        """Re-read the settings this job is pinned to, overriding the live ones.
+
+        The version check is recorded rather than raised, because this runs in the
+        constructor and a worker that cannot build a council cannot mark the job failed --
+        it would raise a traceback into the pool and leave the job sitting at a state
+        nobody moves. `step()` asks, and fails the job properly.
+        """
+        pinned = load_job_settings(self.db, self.job_id)
+        self._settings_migration = _adapter_mismatch(pinned)
+        if not pinned:
+            return self.settings
+        return replace(
+            self.settings,
+            scan_batch_size=int(
+                pinned.get("scan_batch_size", self.settings.scan_batch_size)
+            ),
+            scan_batch_max_characters=int(
+                pinned.get(
+                    "scan_batch_max_characters", self.settings.scan_batch_max_characters
+                )
+            ),
+            role_effort=pinned.get("role_effort") or self.settings.role_effort,
+            claude_model=str(pinned.get("model", self.settings.claude_model)),
+        )
+
+    def _check_pinned_adapter(self) -> None:
+        """Refuse to continue a job under an adapter it was not pinned to."""
+        if self._settings_migration:
+            raise JobSettingsMigrationRequired(self._settings_migration)
 
     def _prompt_version(self, role: AgentRole) -> int | None:
         return self.prompt_versions.get(role.value)
@@ -466,8 +650,16 @@ class CurationCouncil:
         """One unit of progress. See the module docstring for the contract."""
         job = self.job
         try:
+            self._check_pinned_adapter()
             self._check_deadline()
             return self._dispatch(job)
+        except JobSettingsMigrationRequired as error:
+            # `CONFIG`, and therefore non-resumable: resuming runs the same code against
+            # the same pin and stops in the same place. A person decides what to do --
+            # roll the deployment back, or start the workbook again under the new adapter.
+            record_event(self.db, self.job_id, "settings_migration_required", str(error))
+            self._advance(JobState.FAILED, FailureReason.CONFIG)
+            return StepOutcome(False, str(error), self.job.state)
         except JobDeadlineExceeded as error:
             record_event(self.db, self.job_id, "deadline_exceeded", str(error))
             self._advance(JobState.FAILED, FailureReason.TIMEOUT)
@@ -522,6 +714,17 @@ class CurationCouncil:
         message = sanitize_provider_message(str(error))
         record_event(self.db, self.job_id, PROVIDER_FAILURE_EVENT, message)
         spent = count_events(self.db, self.job_id, PROVIDER_FAILURE_EVENT)
+
+        # A failure that says it will not succeed is taken at its word. Spending the whole
+        # budget on it means twelve calls, each retried four times, to reach a conclusion
+        # the first one already stated -- which is what the live pilot did against an
+        # exhausted quota: four and a half minutes and forty-eight requests to learn that
+        # the account had run out twenty calls ago. The budget is for failures that might
+        # not repeat.
+        if isinstance(error, ProviderError) and not error.retryable:
+            self._advance(JobState.FAILED, FailureReason.PROVIDER)
+            return StepOutcome(False, f"the provider refused to continue: {message}", self.job.state)
+
         if spent >= self.settings.provider_failure_budget:
             self._advance(JobState.FAILED, FailureReason.PROVIDER)
             return StepOutcome(
@@ -594,29 +797,46 @@ class CurationCouncil:
             self._advance(JobState.REPAIRING_KNOWN)
             return StepOutcome(True, "audit complete", JobState.REPAIRING_KNOWN)
 
-        block = pending[0]
-        self._spend(llm_calls=1)
-        result = initial_auditor.audit_block(
+        batch = self._take_batch(parsed, pending)
+        self._spend()
+        results, requeued = initial_auditor.audit_blocks(
             self.client,
-            block=block,
+            blocks=batch,
             conventions=parsed.conventions,
-            deterministic_findings=self._findings_for_block(parsed, block),
+            findings_for=lambda block: self._findings_for_block(parsed, block),
             seed_claims=self.seed_claims,
             curator_rules=self.curator_rules,
             job_id=self.job_id,
             taint=self.taint,
             prompt_version=self._prompt_version(AgentRole.INITIAL_AUDITOR),
         )
-        self._keep_private(
-            AgentRole.INITIAL_AUDITOR, f"auditor.{block.block_id}", result.private
-        )
-        opened = self._open_issues(result.findings, source=IssueSource.INITIAL_AUDITOR)
-        self._record_claim_verdicts(block.block_id, result)
-        mark_block_done(self.db, self.job_id, block.block_id, "audited")
+
+        by_id = {block.block_id: block for block in batch}
+        opened = 0
+        for result in results:
+            block = by_id[result.block_id]
+            # **One block persisted completely, then marked done, then the next.** A crash
+            # between two blocks of a batch must leave the finished ones finished and the
+            # rest queued -- so the mark is the last write for each block, never a single
+            # sweep at the end of the batch.
+            self._keep_private(
+                AgentRole.INITIAL_AUDITOR, f"auditor.{block.block_id}", result.private
+            )
+            opened += self._open_issues(
+                result.findings, source=IssueSource.INITIAL_AUDITOR
+            )
+            self._record_claim_verdicts(block.block_id, result)
+            mark_block_done(self.db, self.job_id, block.block_id, "audited")
+
+        if requeued:
+            record_event(
+                self.db, self.job_id, "blocks_requeued",
+                f"{len(requeued)} block(s) came back unattributable from an audit batch",
+            )
         return StepOutcome(
             True,
-            f"audited {block.problem_name}: {opened} issue(s), "
-            f"{len(result.refuted)} claim(s) refuted",
+            f"audited {len(results)} block(s): {opened} issue(s) opened"
+            + (f", {len(requeued)} requeued" if requeued else ""),
             JobState.AUDITING,
         )
 
@@ -635,26 +855,35 @@ class CurationCouncil:
         ]
 
         if pending:
-            block = pending[0]
-            self._spend(llm_calls=1)
-            result = independent_reviewer.sweep_block(
+            batch = self._take_batch(parsed, pending)
+            self._spend()
+            results, requeued = independent_reviewer.sweep_blocks(
                 self.client,
-                block=block,
+                blocks=batch,
                 conventions=parsed.conventions,
-                deterministic_findings=self._findings_for_block(parsed, block),
+                findings_for=lambda block: self._findings_for_block(parsed, block),
                 curator_rules=self.curator_rules,
                 job_id=self.job_id,
                 taint=self.taint,
                 prompt_version=self._prompt_version(AgentRole.INDEPENDENT_REVIEWER),
             )
-            opened = self._open_issues(
-                result.findings,
-                source=IssueSource.INDEPENDENT_REVIEWER,
-                reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
-            )
-            mark_block_done(self.db, self.job_id, block.block_id, "swept")
+            opened = 0
+            for result in results:
+                opened += self._open_issues(
+                    result.findings,
+                    source=IssueSource.INDEPENDENT_REVIEWER,
+                    reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
+                )
+                mark_block_done(self.db, self.job_id, result.block_id, "swept")
+            if requeued:
+                record_event(
+                    self.db, self.job_id, "blocks_requeued",
+                    f"{len(requeued)} block(s) came back unattributable from a sweep batch",
+                )
             return StepOutcome(
-                True, f"swept {block.problem_name}: {opened} issue(s)",
+                True,
+                f"swept {len(results)} block(s): {opened} issue(s)"
+                + (f", {len(requeued)} requeued" if requeued else ""),
                 JobState.INDEPENDENT_REVIEW,
             )
 
@@ -893,7 +1122,7 @@ class CurationCouncil:
             attempt_no=next_attempt_number(self.db, issue.issue_id),
         )
         insert_attempt(self.db, attempt)
-        self._spend(llm_calls=1)
+        self._spend()
 
         try:
             result = writer.propose_patch(
@@ -1080,7 +1309,7 @@ class CurationCouncil:
             deterministic_findings=self._findings_for_block(current, current_block),
             curator_rules=self.curator_rules,
         )
-        self._spend(llm_calls=1)
+        self._spend()
         verdict = known_issue_reviewer.review(
             self.client,
             issue=issue,

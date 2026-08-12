@@ -229,8 +229,9 @@ def main() -> int:
             ),
         )
         settings = Settings(
-            gemini_api_key="not-needed-for-the-mock",
-            gemini_model="mock",
+            claude_cli_path="not-needed-for-the-mock",
+            claude_model="mock",
+            claude_effort="medium",
             data_root=workspace,
             max_repair_attempts=3,
             max_validation_rounds=2,

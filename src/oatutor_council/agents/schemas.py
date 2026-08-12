@@ -70,10 +70,44 @@ class RefutedClaim(BaseModel):
 
 
 class AuditorResponse(BaseModel):
+    """The single-block audit response. **Unchanged, and deliberately so.**
+
+    `SCAN_BATCH_SIZE=1` uses this schema and the single-block prompt, byte for byte, which
+    is what makes the default a genuine no-op rather than a lookalike that happens to
+    produce similar results through a different wire contract.
+    """
+
     #: Private. Split off before anything else sees this response.
     reasoning: str = ""
     findings: list[AuditorFinding] = Field(default_factory=list)
     refuted_claims: list[RefutedClaim] = Field(default_factory=list)
+
+
+class AuditorBlockResult(BaseModel):
+    """One block's verdict inside a batched audit.
+
+    `batch_item_id` is the whole safety mechanism. Attribution by row containment alone
+    cannot tell a block the model *omitted* from a block it examined and found clean --
+    both produce nothing mentioning that block -- and marking the omitted one done is a
+    workbook reported as reviewed when nothing looked at it.
+    """
+
+    batch_item_id: str = Field(
+        description="Copy the batch_item id from the block's section label exactly"
+    )
+    reasoning: str = ""
+    findings: list[AuditorFinding] = Field(default_factory=list)
+    refuted_claims: list[RefutedClaim] = Field(default_factory=list)
+
+
+class BatchedAuditorResponse(BaseModel):
+    """Used only when a batch holds more than one block.
+
+    Every dispatched block must appear exactly once. A block with nothing wrong still
+    needs its own entry, carrying an empty `findings` list -- silence is not an answer.
+    """
+
+    results: list[AuditorBlockResult] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------------------
@@ -138,10 +172,33 @@ class IndependentFinding(BaseModel):
 
 
 class IndependentReviewResponse(BaseModel):
-    """The sweep over blocks nobody flagged. Public: these become issues."""
+    """The sweep over blocks nobody flagged. Public: these become issues.
+
+    Unchanged for the same reason as `AuditorResponse`: batch size 1 is the old path.
+    """
 
     findings: list[IndependentFinding] = Field(default_factory=list)
     block_is_sound: bool = True
+
+
+class IndependentBlockResult(BaseModel):
+    """One block's sweep verdict inside a batch."""
+
+    batch_item_id: str = Field(
+        description="Copy the batch_item id from the block's section label exactly"
+    )
+    findings: list[IndependentFinding] = Field(default_factory=list)
+    block_is_sound: bool = True
+
+
+class BatchedIndependentReviewResponse(BaseModel):
+    """Used only when a batch holds more than one block.
+
+    A block absent from `results` is **not** sound; it is unswept, and it goes back on the
+    queue. Treating an omission as a pass is how a sweep reports coverage it never had.
+    """
+
+    results: list[IndependentBlockResult] = Field(default_factory=list)
 
 
 def column_key(name: str) -> ColumnKey:

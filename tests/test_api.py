@@ -31,8 +31,9 @@ from oatutor_council.persistence import Database
 
 def settings_for(tmp_path: Path, **kwargs) -> Settings:
     defaults = dict(
-        gemini_api_key="test",
-        gemini_model="mock",
+        claude_cli_path="fake-claude",
+        claude_model="mock",
+        claude_effort="medium",
         data_root=tmp_path / "jobs",
         max_repair_attempts=3,
         max_validation_rounds=2,
@@ -42,6 +43,8 @@ def settings_for(tmp_path: Path, **kwargs) -> Settings:
         max_concurrent_jobs=1,
         max_upload_bytes=5 * 1024 * 1024,
         lease_seconds=60,
+        # A scripted mock is not a provider; retrying one tests nothing.
+        provider_max_attempts=1,
     )
     return Settings(**{**defaults, **kwargs})
 
@@ -101,7 +104,7 @@ def submit(client, data: bytes, name: str = "workbook.xlsx", *, headers=None, **
 # --------------------------------------------------------------------------------------
 
 
-def test_the_service_refuses_to_start_without_credentials(tmp_path):
+def test_the_service_refuses_to_start_without_a_usable_cli(tmp_path):
     """Before the first upload, not at the first model call. A service that starts
     unconfigured accepts work it can never do, and the curator pays the upload and the
     wait to learn something that was knowable at boot."""
@@ -109,16 +112,19 @@ def test_the_service_refuses_to_start_without_credentials(tmp_path):
 
     with pytest.raises(ConfigurationError) as error:
         create_app(
-            settings=settings_for(tmp_path, gemini_api_key=""),
+            settings=settings_for(tmp_path, claude_cli_path="/nonexistent/claude"),
             db=Database(tmp_path / "c.db"),
         )
-    assert "GEMINI_API_KEY" in str(error.value)
+    message = str(error.value)
+    assert "claude" in message
+    # The message tells the operator what to do and names no secret.
+    assert "COUNCIL_CLAUDE_CLI_PATH" in message or "auth login" in message
 
 
 def test_an_explicit_offline_client_is_the_only_way_past_that(tmp_path):
     """The escape hatch is a parameter rather than an environment flag, because an
     environment variable that disables a credential check ends up set in production."""
-    settings = settings_for(tmp_path, gemini_api_key="")
+    settings = settings_for(tmp_path, claude_cli_path="/nonexistent/claude")
     settings.data_root.mkdir(parents=True, exist_ok=True)
     app = create_app(
         settings=settings,
@@ -130,13 +136,20 @@ def test_an_explicit_offline_client_is_the_only_way_past_that(tmp_path):
         assert test_client.get("/readyz").status_code == 200
 
 
-def test_readiness_reports_the_provider_without_exposing_the_key(client):
+def test_readiness_reports_the_provider_without_exposing_the_account(client):
+    """There is no API key to leak now, but there is an account: the CLI knows the user's
+    email, organisation and org id, and none of them are anybody's business here."""
     body = client.get("/readyz").json()
     assert body["ready"] is True
-    assert body["credentials_present"] is True
+    assert body["provider"] == "claude-code-cli"
     assert body["model"] == "mock"
-    assert "test" not in str(body)  # the key itself, in any form
-    assert "api_key" not in body and "gemini_api_key" not in body
+    assert body["checks"]["authenticated"] is True
+
+    serialised = str(body)
+    assert "@" not in serialised          # no email
+    assert "orgId" not in serialised and "orgName" not in serialised
+    assert "api_key" not in serialised and "token" not in serialised
+    assert "/" not in str(body.get("model"))  # and never a filesystem path
 
 
 def test_a_process_with_no_worker_pool_is_alive_but_not_ready(tmp_path):

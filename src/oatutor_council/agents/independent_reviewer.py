@@ -29,10 +29,15 @@ from ..models import (
     ValidationFinding,
     WorkbookConventions,
 )
+from .batching import attribute, make_items, rows_for_block
 from .isolation import TaintRegistry
 from .known_issue_reviewer import review as review_correction  # noqa: F401 - re-exported
 from .rendering import render_block, render_conventions, render_findings
-from .schemas import IndependentReviewResponse, column_key
+from .schemas import (
+    BatchedIndependentReviewResponse,
+    IndependentReviewResponse,
+    column_key,
+)
 
 INSTRUCTIONS = """\
 This problem block was not reported as defective. Examine it yourself.
@@ -142,3 +147,144 @@ def blocks_to_sweep(all_blocks: Sequence[ProblemBlock], reviewed: frozenset[str]
     it belongs in this sweep.
     """
     return tuple(block for block in all_blocks if block.block_id not in reviewed)
+
+
+# --------------------------------------------------------------------------------------
+# Batched sweeping
+# --------------------------------------------------------------------------------------
+
+BATCH_INSTRUCTIONS = """\
+Review each problem block below as a fresh reader who has been told nothing about it.
+
+Each block is in its own section whose label carries a `batch_item` id. Return one result
+per block, copying that id into `batch_item_id` exactly. A block you consider sound still
+needs its own result, with `block_is_sound` true and an empty `findings` list -- omitting a
+block does not mean it is sound, it means it was not reviewed, and it will be sent again.
+
+Report a finding only under the block it belongs to, and only with rows from that block.
+
+Solve each problem as a student would and check that the stated answer is what you get.
+Check that each step follows from the last, that hints point toward the answer, and that a
+multiple-choice list has exactly one correct option.
+
+Most blocks are correct. Report a finding only when you can state concretely what is wrong
+and where.
+"""
+
+
+def sweep_blocks(
+    client: LLMClient,
+    *,
+    blocks: Sequence[ProblemBlock],
+    conventions: WorkbookConventions,
+    findings_for=None,
+    curator_rules: Sequence[str] = (),
+    job_id: str = "",
+    seed: int | None = None,
+    taint: TaintRegistry | None = None,
+    prompt_version: int | None = None,
+) -> tuple[tuple[SweepResult, ...], tuple[ProblemBlock, ...]]:
+    """Sweep several blocks in one call. Returns `(results, blocks_to_requeue)`.
+
+    **One block delegates to `sweep_block`**, so batch size 1 is the pre-batching code
+    path rather than something that resembles it.
+    """
+    blocks = list(blocks)
+    if not blocks:
+        return (), ()
+    if len(blocks) == 1:
+        result = sweep_block(
+            client,
+            block=blocks[0],
+            conventions=conventions,
+            deterministic_findings=findings_for(blocks[0]) if findings_for else (),
+            curator_rules=curator_rules,
+            job_id=job_id,
+            seed=seed,
+            taint=taint,
+            prompt_version=prompt_version,
+        )
+        return (result,), ()
+
+    items = make_items(blocks)
+    sections = [
+        DataSection("Conventions this workbook follows", render_conventions(conventions))
+    ]
+    for item in items:
+        sections.append(
+            DataSection(
+                item.label,
+                "\n".join(
+                    [
+                        f"problem name: {item.block.problem_name}",
+                        render_block(item.block),
+                        "",
+                        "Deterministic findings for this block:",
+                        render_findings(
+                            findings_for(item.block) if findings_for else ()
+                        ),
+                    ]
+                ),
+            )
+        )
+    if curator_rules:
+        sections.append(
+            DataSection(
+                "Curation rules the curator supplied",
+                "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
+
+    bundle = ContextBundle.build(BATCH_INSTRUCTIONS, sections)
+    payload = bundle.render()
+    if taint is not None:
+        taint.assert_clean(payload, context="independent_reviewer")
+
+    response = call_structured(
+        client,
+        LLMRequest(
+            role=AgentRole.INDEPENDENT_REVIEWER,
+            system_prompt=system_prompt(AgentRole.INDEPENDENT_REVIEWER, prompt_version),
+            user_payload=payload,
+            schema=BatchedIndependentReviewResponse.model_json_schema(),
+            seed=seed,
+            job_id=job_id,
+        ),
+        BatchedIndependentReviewResponse,
+    )
+
+    attribution = attribute(items, response.results)
+    results: list[SweepResult] = []
+    requeue = [item.block for item in attribution.requeue]
+
+    for item in items:
+        result = attribution.resolved.get(item.item_id)
+        if result is None:
+            continue
+
+        findings: list[ValidationFinding] = []
+        relocated = False
+        for finding in result.findings:
+            rows = rows_for_block(finding.rows, item.block)
+            if rows is None:
+                relocated = True
+                continue
+            findings.append(
+                _to_finding(finding.model_copy(update={"rows": rows}), item.block)
+            )
+
+        if relocated:
+            requeue.append(item.block)
+            continue
+
+        results.append(
+            SweepResult(
+                block_id=item.block.block_id,
+                findings=tuple(findings),
+                # Same contradiction rule as the single-block path: concrete findings beat
+                # a soundness claim made alongside them.
+                block_is_sound=result.block_is_sound and not findings,
+            )
+        )
+
+    return tuple(results), tuple(requeue)

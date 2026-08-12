@@ -19,18 +19,20 @@ jobs:
           enable-cache: true
 
       - name: Install from the lockfile
-        # The lockfile, not a fresh resolve. A test run that quietly picked up a new
-        # `google-genai` would fail somewhere confusing, or worse, pass while the pinned
-        # deployment does not.
+        # The lockfile, not a fresh resolve. A test run that quietly picked up a
+        # different dependency set would fail somewhere confusing, or worse, pass while
+        # the pinned deployment does not.
         run: |
           uv venv --python 3.12
           uv pip install -r requirements.lock
           uv pip install --no-deps -e .
 
       - name: Tests
-        # No credentials in the environment. Every test builds its own synthetic workbook
-        # and drives the council with the scripted client; a test that needed a key would
-        # fail here rather than silently costing money.
+        # No credentials and no `claude` binary in the environment. Every test builds its
+        # own synthetic workbook and drives the council with the scripted client, and the
+        # CLI subprocess tests use a fake executable written into tmp_path -- so a test
+        # that reached the real provider would fail here rather than quietly consuming
+        # somebody's subscription.
         run: uv run --no-project python -m pytest tests/ -q
 
       - name: The offline demo runs the whole council

@@ -60,17 +60,25 @@ and prints every artefact.
 ### Running the service
 
 ```bash
-export GEMINI_API_KEY=...            # see .env.example for every setting
+claude auth login                    # once; this app never sees your password or token
 .venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src \
   --port 8000 --workers 1
 
 # Verify the provider with one live call carrying no workbook content
-.venv/bin/python scripts/smoke_provider.py
+.venv/bin/python scripts/smoke_claude_cli.py
 ```
 
-Without credentials the service **refuses to start**, rather than accepting uploads it
-can never process. `GET /health` is liveness; `GET /readyz` answers the different and more
-useful question of whether a job submitted right now could actually run.
+**There is no API key.** The provider is the Claude Code CLI running on your Claude
+subscription, invoked as a subprocess. The service checks at startup that the executable
+exists, that the CLI is logged in, and that the login is a *subscription* rather than an
+API credential — and refuses to start otherwise, rather than accepting uploads it can
+never process. An inherited `ANTHROPIC_API_KEY` cannot silently switch it to metered
+billing: the child environment is an allowlist and drops that variable on the way in.
+
+`GET /health` is liveness; `GET /readyz` answers the different and more useful question of
+whether a job submitted right now could actually run — provider configured, executable
+present, CLI authenticated, database reachable, worker pool and poller up. It never reports
+the account's email, organisation or any filesystem path.
 
 Set `API_TOKEN` and every endpoint except `/health` requires `Authorization: Bearer …`.
 Leaving it unset leaves the service open, which is a reasonable configuration behind a
@@ -134,14 +142,14 @@ src/oatutor_council/
   workbook/        reader · writer · diff · styles
   validation/      rules/ (60 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
-                   independent_reviewer · isolation · rendering · schemas
-  llm/             base · provider (Gemini) · mock · context · prompts · audit
+                   independent_reviewer · isolation · rendering · schemas · batching
+  llm/             base · claude_cli · mock · context · prompts · audit
   ingestion/       instruction_documents
   reporting/       ledger · reports
   workers.py       leases, heartbeats, the worker pool, the poller, retention
   prompts/         versioned agent prompts, plus the shared policies (package data)
 scripts/           demo.py · evaluate_workbooks.py · shadow_run.py ·
-                   smoke_provider.py · recon_workbooks.py
+                   smoke_claude_cli.py · recon_workbooks.py
 ```
 
 The prompts ship **inside** the package. They started outside it, on the reasoning that
@@ -254,34 +262,67 @@ corpus read-only, hashing every file before and after, and reports what it finds
 
 ## Provider
 
-Google Gemini through `google-genai`, default model `gemini-3.6-flash`, overridable with
-`GEMINI_MODEL`. Structured outputs with Pydantic schemas for every agent response, and a
-scripted mock client that drives the entire council offline.
+The **Claude Code CLI** on your subscription, one `claude --print` process per call, model
+`sonnet` by default. Structured outputs with Pydantic schemas for every agent response, and
+a scripted mock client that drives the entire council offline.
+
+`docs/claude-cli-notes.md` records the exact flags, verified against the installed binary.
+The properties that matter:
+
+- **The payload goes on stdin**, never as an argument (arguments are visible in `ps` to
+  every user on the machine) and never through the environment or a temporary file.
+- **`--tools ""`** disables every built-in tool. The empty string is a real argument;
+  omitting it enables the lot, and an agent that can read the filesystem is not an agent
+  that reads the block it was given.
+- **A fresh process in a fresh empty directory per call**, with no session persistence — so
+  context isolation between agents is structural rather than disciplinary.
+- **A restricted child environment** built by allowlist, dropping every credential variable.
+- **A timeout kills the whole process group**, because the CLI spawns helpers that would
+  otherwise outlive it.
+
+Settings are prefixed `COUNCIL_` because `CLAUDE_EFFORT` is a variable the CLI itself sets:
+unprefixed, the service would inherit an effort level from whatever session launched it.
 
 Failures are classified rather than lumped together, because they need opposite handling:
 
 | Failure | Handling |
 | --- | --- |
 | 429, 5xx, timeout, transport | Retried with exponential backoff, honouring `Retry-After` where the server sends one and capping it where it exceeds our patience |
-| Rejected key, unknown model, malformed request | Never retried — it fails identically until the settings change. `FAILED(CONFIG)`, non-resumable |
+| Not logged in, unknown model, malformed request | Never retried — it fails identically until something changes. `FAILED(CONFIG)`, non-resumable, and the message says to run `claude auth login` |
+| Subscription usage limit | Never retried: an allowance is not a burst. Fails the job **immediately** rather than walking the failure budget down, and stays resumable. A reset time is kept only if the provider states one, never guessed |
 | Safety block, recitation | Never retried either: the same cell trips the same filter every time. That one issue goes to a person and the job carries on |
 | Anything unrecognised | Treated as transient — the conservative reading, since a bounded few retries costs less than failing a job that would have worked |
 
 Every call carries a timeout. Lost calls are counted against a per-job budget stored in the
 database rather than in the worker, because a provider outage routinely takes the worker
 with it and an in-memory counter would reset exactly when it mattered. Persisted error
-messages are truncated and stripped of anything key-shaped: a provider can quote your
-workbook back at you in an error, and errors end up in logs.
+messages are bounded at both ends and stripped of anything credential-shaped: a provider
+can quote your workbook back at you in an error, and errors end up in logs.
+
+### Scan batching
+
+`SCAN_BATCH_SIZE` (default **1**) controls how many problem blocks one Initial Auditor or
+Independent Reviewer call examines. At 1 the code delegates to the unchanged single-block
+path — same prompt, same schema, same payload, same recorded prompt hash — so the default
+is a genuine no-op rather than something that resembles one.
+
+Above 1 the response is per block, keyed by an opaque id generated for that call. That is
+not decoration: **a block the model omitted is indistinguishable from a block it examined
+and found clean**, and marking the first done would report a workbook as reviewed when
+nothing looked at it. So a block is marked done only when its own result is present and
+valid; missing, duplicated and unknown ids all send the block back to the queue, and a
+finding whose rows lie entirely outside the block it was filed under is discarded rather
+than relocated.
 
 **There is no `Conversation` object anywhere in the codebase**, and a test greps the whole
 package to keep it that way. Context isolation is not a discipline anyone has to remember;
 there is simply no message list that could carry reasoning forward.
 
-See `docs/gemini-sdk-notes.md` before touching `llm/provider.py`. The API differs from
-every plausible guess — it is `client.interactions.create`, not `models.generate_content`;
-the parameter is `input=`, not `contents=`; and `status` must be checked before
-`output_text` is read, because an `incomplete` interaction returns truncated JSON that
-fails schema validation with a confusing error rather than the real cause.
+See `docs/claude-cli-notes.md` before touching `llm/claude_cli.py`. It records which flags
+were verified against the installed binary and — just as importantly — which were *not*:
+the response envelope has not been observed, so the parser checks each plausible location
+for structured output and fails loudly rather than guessing. `scripts/smoke_claude_cli.py`
+is what closes that gap.
 
 ---
 

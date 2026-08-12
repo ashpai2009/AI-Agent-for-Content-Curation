@@ -26,6 +26,7 @@ from oatutor_council.llm.base import (
     ProviderConfigurationError,
     ProviderError,
     ProviderRefused,
+    ProviderUnavailable,
 )
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
@@ -50,8 +51,9 @@ from oatutor_council.workbook.writer import create_working_copy
 
 def settings(**kwargs) -> Settings:
     defaults = dict(
-        gemini_api_key="test",
-        gemini_model="mock",
+        claude_cli_path="fake-claude",
+        claude_model="mock",
+        claude_effort="medium",
         data_root=Path("."),
         max_repair_attempts=3,
         max_validation_rounds=2,
@@ -61,6 +63,11 @@ def settings(**kwargs) -> Settings:
         max_concurrent_jobs=1,
         max_upload_bytes=1024,
         lease_seconds=60,
+        # One physical call per logical call. A scripted mock is not a provider, and
+        # retrying one tests nothing -- while an absorbed failure would silently change
+        # what the failure-handling tests below are asserting about. The retry layer has
+        # its own tests, against a client that actually fails.
+        provider_max_attempts=1,
     )
     return Settings(**{**defaults, **kwargs})
 
@@ -845,7 +852,13 @@ def test_a_recorded_provider_failure_is_bounded_rather_than_a_copy_of_the_workbo
     ][0]
     assert len(detail) < len(leaked) / 10
     assert detail.startswith("400 rejected input:")
-    assert detail.endswith("[truncated]")
+    # Head *and* tail survive, with the marker between them. A live pilot's quota error was
+    # cut at "limit: 20, model:…" and the dropped tail was exactly the part naming the
+    # quota period -- the one thing needed to decide whether to resume in a minute or a day.
+    assert "[truncated]" in detail
+    # Compared against the whitespace-collapsed original, since collapsing is part of
+    # making a provider message safe to store.
+    assert detail.endswith(" ".join(leaked.split())[-40:])
 
 
 # --------------------------------------------------------------------------------------
@@ -869,6 +882,67 @@ def test_every_model_call_leaves_a_row(setup):
     assert {c["role"] for c in calls} >= {"initial_auditor", "writer"}
     assert all(c["prompt_sha256"] for c in calls)
     assert all(c["payload"]["user_payload"] for c in calls)
+
+
+def test_every_physical_invocation_is_recorded_and_charged_not_just_the_last(setup):
+    """The accounting hole retrying used to hide.
+
+    With the retry inside the provider, one logical call could start four processes while
+    leaving one row and spending one unit of budget. Four physical calls now leave four
+    rows and cost four units, which is what makes the model-call budget bound the thing
+    that actually costs money."""
+    from oatutor_council.persistence import list_llm_calls
+
+    db, _ = setup
+    # Two transient failures on the first audit call, then a healthy run.
+    client = failing_client(ProviderUnavailable("503 Service Unavailable"), times=2)
+    result = council(
+        setup, client, provider_max_attempts=4, provider_backoff_ceiling_seconds=0
+    ).run()
+
+    assert result.state is JobState.SUCCEEDED
+    calls = list_llm_calls(db, "job-1")
+    failed = [c for c in calls if c["status"] != "completed"]
+    assert len(failed) == 2, "each retried attempt gets its own row"
+    assert result.llm_calls_used == len(calls)
+    # The retry absorbed the outage, so the council never saw a lost call at all.
+    assert not any(e["kind"] == "provider_failure" for e in list_events(db, "job-1"))
+
+
+def test_the_model_call_budget_counts_retries(setup):
+    """A budget that counted logical calls bounded a quarter of what it named, since a
+    call that failed four times spent four."""
+    client = failing_client(ProviderUnavailable("503 Service Unavailable"), times=10**6)
+    result = council(
+        setup,
+        client,
+        provider_max_attempts=4,
+        provider_backoff_ceiling_seconds=0,
+        llm_call_budget=3,
+    ).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.BUDGET_EXHAUSTED
+    assert result.llm_calls_used == 3
+
+
+def test_a_call_is_charged_before_the_process_starts(setup):
+    """Reserved and committed before, exactly like a repair attempt. Charging afterwards
+    lets a crash loop start calls against a counter that never moves."""
+    from oatutor_council.persistence import get_job
+
+    db, _ = setup
+    seen: list[int] = []
+
+    def reply(request):
+        seen.append(get_job(db, "job-1").llm_calls_used)
+        raise ProviderUnavailable("503 Service Unavailable")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    council(setup, client, provider_failure_budget=1).run(max_steps=4)
+
+    assert seen and seen[0] >= 1, "the budget was committed before the call was made"
 
 
 def test_a_failed_call_is_recorded_with_how_it_failed(setup):
@@ -948,17 +1022,18 @@ def test_a_job_keeps_the_prompt_version_it_started_with(setup, monkeypatch):
     }
 
 
-def test_the_audit_trail_never_contains_the_api_key(setup):
-    """The key reaches the SDK client directly from settings. Nothing in the recording
-    path has access to it, and this is the assertion that keeps it that way."""
+def test_the_audit_trail_never_contains_a_credential(setup):
+    """There is no API key in this application at all now -- the CLI authenticates against
+    the user's subscription through its own keychain. The assertion stays because the
+    recording path is where a credential *would* surface if one were ever introduced."""
     from oatutor_council.persistence import list_llm_calls
 
     db, _ = setup
-    council(setup, quiet_client(), gemini_api_key="AIzaSyD-a-real-looking-secret").run()
+    council(setup, quiet_client()).run()
 
     recorded = str(list_llm_calls(db, "job-1"))
-    assert "AIzaSyD" not in recorded
-    assert "a-real-looking-secret" not in recorded
+    for shape in ("sk-ant-", "AIza", "ANTHROPIC_API_KEY", "Bearer "):
+        assert shape not in recorded, shape
 
 
 def test_no_persisted_reviewer_prompt_contains_the_writers_rationale(setup):
@@ -986,3 +1061,33 @@ def test_no_persisted_reviewer_prompt_contains_the_writers_rationale(setup):
     for text in private:
         for prompt in reviewer_prompts:
             assert text not in prompt
+
+
+def test_a_failure_that_says_it_will_not_succeed_is_taken_at_its_word(setup):
+    """From the live pilot. Spending the whole budget on an exhausted quota meant twelve
+    calls, each retried four times, to reach a conclusion the first one already stated --
+    four and a half minutes and forty-eight requests. The budget is for failures that
+    might not repeat."""
+    from oatutor_council.llm.base import ProviderUsageLimited
+    from oatutor_council.persistence import count_events
+
+    db, _ = setup
+    client = failing_client(ProviderUsageLimited("you exceeded your current quota"))
+    result = council(setup, client, provider_failure_budget=12).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.PROVIDER
+    # One failure recorded, not twelve.
+    assert count_events(db, "job-1", "provider_failure") == 1
+
+
+def test_a_quota_failure_stays_resumable(setup):
+    """Nothing about the settings is wrong and the work is intact -- the account simply
+    has nothing left right now. Tomorrow it will, and the job should still be there."""
+    from oatutor_council.llm.base import ProviderUsageLimited
+    from oatutor_council.state_machine import is_resumable
+
+    result = council(
+        setup, failing_client(ProviderUsageLimited("quota exceeded"))
+    ).run()
+    assert is_resumable(result.state, result.failure_reason)

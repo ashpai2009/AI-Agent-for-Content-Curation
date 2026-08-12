@@ -1,8 +1,12 @@
 """Settings, read from the environment in exactly one place.
 
-The model name and the API key are read here and nowhere else. A provider module that
-reaches for `os.environ` itself is a module that cannot be tested without credentials and
-cannot be pointed at a different model without an edit.
+**There is no API key in this application.** The provider is the Claude Code CLI running on
+the user's Claude subscription, which authenticates through its own keychain-backed login.
+What lives here is where the executable is, which model to ask for, and how hard to think
+-- never a credential.
+
+A provider module that reaches for `os.environ` itself is a module that cannot be tested
+without credentials and cannot be pointed at a different model without an edit.
 
 Every budget is a setting rather than a constant because they are the system's fuses:
 they exist to be tightened in an incident, and a fuse you have to redeploy to change is
@@ -31,6 +35,28 @@ DEFAULT_PROVIDER_BACKOFF_CEILING_SECONDS = 60.0
 DEFAULT_PROVIDER_FAILURE_BUDGET = 12
 DEFAULT_RUN_DEADLINE_SECONDS = 21_600.0
 DEFAULT_RETENTION_DAYS = 30.0
+
+#: Provider defaults. `sonnet` is an alias that tracks the latest model in that family.
+#:
+#: **The environment names are prefixed, and that is not decoration.** `CLAUDE_EFFORT` is a
+#: variable the Claude Code CLI itself sets -- it was present and set to `high` in the shell
+#: this migration was written in. An unprefixed setting would therefore be silently
+#: overridden by whatever session happened to launch the service, from a source the operator
+#: never configured and would not think to look at. The unprefixed names are **not** read as
+#: fallbacks, because a fallback would reopen exactly that hole.
+DEFAULT_CLAUDE_CLI_PATH = "claude"
+DEFAULT_CLAUDE_MODEL = "sonnet"
+DEFAULT_CLAUDE_EFFORT = "medium"
+VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+#: Scan batching. **1 is today's behaviour exactly** -- `audit_blocks` delegates to the
+#: unchanged single-block path at this value, so the default changes nothing until somebody
+#: raises it deliberately and measures the result.
+DEFAULT_SCAN_BATCH_SIZE = 1
+MAX_SCAN_BATCH_SIZE = 16
+#: A five-row block and a hundred-row block must not consume the same allowance, so the
+#: batch is bounded by rendered size as well as by count.
+DEFAULT_SCAN_BATCH_MAX_CHARACTERS = 24_000
 
 
 class ConfigurationError(RuntimeError):
@@ -71,8 +97,15 @@ def _bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    gemini_api_key: str
-    gemini_model: str
+    #: Path to the `claude` executable. A name is resolved on `PATH`; an absolute path is
+    #: used as given, which is what a deployment with a pinned install wants.
+    claude_cli_path: str
+    #: An alias (`sonnet`, `opus`) or a full model name. An alias tracks the latest model
+    #: in that family, which is the right default for a service that is not pinned to a
+    #: specific snapshot.
+    claude_model: str
+    #: Default reasoning effort. Overridable per role -- see `effort_for`.
+    claude_effort: str
     data_root: Path
 
     max_repair_attempts: int
@@ -112,9 +145,36 @@ class Settings:
     #: is the wrong default for a service holding other people's course material.
     retention_days: float = DEFAULT_RETENTION_DAYS
 
+    #: Per-role reasoning effort overrides, empty by default. Behind a setting because
+    #: changing it changes detection quality, not just cost.
+    role_effort: dict[str, str] | None = None
+
+    #: How many problem blocks one Initial Auditor or Independent Reviewer call examines.
+    #: 1 delegates to the unchanged single-block path.
+    scan_batch_size: int = DEFAULT_SCAN_BATCH_SIZE
+    #: Ceiling on a batch's total rendered contribution -- blocks, applicable claims,
+    #: deterministic findings and labels together, not `render_block` alone.
+    scan_batch_max_characters: int = DEFAULT_SCAN_BATCH_MAX_CHARACTERS
+
     #: Decision 1: reviewers judge the artefact, not the Writer's argument for it. Kept
     #: as a flag so the opposite reading stays testable rather than unimaginable.
     reviewer_sees_writer_rationale: bool = False
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.scan_batch_size <= MAX_SCAN_BATCH_SIZE:
+            raise ConfigurationError(
+                f"SCAN_BATCH_SIZE must be between 1 and {MAX_SCAN_BATCH_SIZE}, "
+                f"got {self.scan_batch_size}"
+            )
+        if self.scan_batch_max_characters < 1:
+            raise ConfigurationError(
+                "SCAN_BATCH_MAX_CHARACTERS must be positive; it bounds one call's context"
+            )
+        if self.claude_effort not in VALID_EFFORT_LEVELS:
+            raise ConfigurationError(
+                f"COUNCIL_CLAUDE_EFFORT must be one of {', '.join(VALID_EFFORT_LEVELS)}, "
+                f"got {self.claude_effort!r}"
+            )
 
     @property
     def requires_authentication(self) -> bool:
@@ -135,37 +195,57 @@ class Settings:
 
     @property
     def provider_configured(self) -> bool:
-        return bool(self.gemini_api_key.strip() and self.gemini_model.strip())
+        """Whether the *settings* name a provider. Says nothing about authentication.
+
+        Deliberately separate: a well-configured service whose CLI is logged out is a
+        different problem from one that was never configured, and the readiness endpoint
+        reports them apart.
+        """
+        return bool(self.claude_cli_path.strip() and self.claude_model.strip())
+
+    def effort_for(self, role: str) -> str:
+        """Reasoning effort for one agent role.
+
+        Per role because the four agents do different work -- but **defaulted the same for
+        all of them**, because lowering it is a quality change and not a cost trim. The
+        auditor and the reviewers judge mathematics; a cheaper setting that misses defects
+        also *increases* calls by producing more repair rounds. Any per-role value should
+        be set only after comparing runs on labelled material.
+        """
+        return (self.role_effort or {}).get(role, self.claude_effort)
 
     def require_credentials(self) -> None:
         """Fail loudly and early rather than at the first model call.
 
-        A missing key discovered halfway through a job has already cost the curator the
-        upload and the wait -- and worse, the job sits in `created` looking like work in
-        progress rather than work that was never possible.
+        Delegates to the CLI adapter, which checks that the executable exists, that the CLI
+        is logged in, and that the login is a *subscription* rather than an API credential.
+        A service that boots unauthenticated accepts a workbook it can never process.
         """
-        if not self.gemini_api_key.strip():
+        if not self.claude_cli_path.strip():
             raise ConfigurationError(
-                "GEMINI_API_KEY is not set. The curation council cannot run without "
-                "credentials for the Gemini API. Set it in the environment or in .env, "
-                "or start the service with an explicit offline client."
+                "COUNCIL_CLAUDE_CLI_PATH is empty. Unset it to use `claude` from PATH, or give "
+                "the path to the executable."
             )
-        if not self.gemini_model.strip():
+        if not self.claude_model.strip():
             raise ConfigurationError(
-                "GEMINI_MODEL is empty. Unset it to use the default, or name a model."
+                "COUNCIL_CLAUDE_MODEL is empty. Unset it to use the default, or name a model."
             )
+
+        from .llm.claude_cli import require_authentication
+
+        require_authentication(self)
 
     def describe_provider(self) -> dict[str, object]:
         """What is configured, in a form that is safe to serve over HTTP.
 
-        The key itself never appears -- not truncated, not fingerprinted, not its length.
-        The only question an operator needs answered here is *is one present*, and every
-        further detail is material for someone who should not have any.
+        No credential detail and no filesystem path. The executable is reported as
+        *present or not*, never as a location: an operator needs the former and an attacker
+        probing for the layout should learn nothing from the latter.
         """
         return {
-            "provider": "google-gemini",
-            "model": self.gemini_model,
-            "credentials_present": bool(self.gemini_api_key.strip()),
+            "provider": "claude-code-cli",
+            "model": self.claude_model,
+            "effort": self.claude_effort,
         }
 
 
@@ -174,15 +254,22 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         load_dotenv(env_file, override=False)
 
     return Settings(
-        gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip(),
+        claude_cli_path=os.environ.get("COUNCIL_CLAUDE_CLI_PATH", DEFAULT_CLAUDE_CLI_PATH).strip()
+        or DEFAULT_CLAUDE_CLI_PATH,
+        claude_model=os.environ.get("COUNCIL_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL).strip()
+        or DEFAULT_CLAUDE_MODEL,
+        claude_effort=os.environ.get("COUNCIL_CLAUDE_EFFORT", DEFAULT_CLAUDE_EFFORT).strip()
+        or DEFAULT_CLAUDE_EFFORT,
         data_root=Path(os.environ.get("DATA_ROOT", "./jobs")).expanduser(),
         max_repair_attempts=_int("MAX_REPAIR_ATTEMPTS", DEFAULT_MAX_REPAIR_ATTEMPTS),
         max_validation_rounds=_int("MAX_VALIDATION_ROUNDS", 2),
         step_budget=_int("STEP_BUDGET", 2000),
         llm_call_budget=_int("LLM_CALL_BUDGET", 1500),
         interrupted_retry_budget=_int("INTERRUPTED_RETRY_BUDGET", 2),
-        max_concurrent_jobs=_int("MAX_CONCURRENT_JOBS", 2),
+        # One at a time by default. The CLI backend runs a subprocess per call against a
+        # single interactive subscription; two jobs in parallel double the rate at which a
+        # session allowance is consumed and make a usage limit twice as likely mid-run.
+        max_concurrent_jobs=_int("MAX_CONCURRENT_JOBS", 1),
         max_upload_bytes=_int("MAX_UPLOAD_BYTES", 52_428_800),
         lease_seconds=_int("LEASE_SECONDS", 120),
         heartbeat_divisor=_int("HEARTBEAT_DIVISOR", DEFAULT_HEARTBEAT_DIVISOR),
@@ -204,5 +291,9 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         run_deadline_seconds=_float("RUN_DEADLINE_SECONDS", DEFAULT_RUN_DEADLINE_SECONDS),
         api_token=os.environ.get("API_TOKEN", "").strip(),
         retention_days=_float("RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
+        scan_batch_size=_int("SCAN_BATCH_SIZE", DEFAULT_SCAN_BATCH_SIZE),
+        scan_batch_max_characters=_int(
+            "SCAN_BATCH_MAX_CHARACTERS", DEFAULT_SCAN_BATCH_MAX_CHARACTERS
+        ),
         reviewer_sees_writer_rationale=_bool("REVIEWER_SEES_WRITER_RATIONALE", False),
     )

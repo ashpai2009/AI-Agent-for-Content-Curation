@@ -137,6 +137,34 @@ def _extension_of(filename: str, allowed: frozenset[str], kind: str) -> str:
     return check_extension(safe_display_name(filename), allowed, kind=kind)
 
 
+def _authentication_state(settings: Settings, offline: bool) -> dict[str, Any]:
+    """Whether the CLI could actually run a call, without running one.
+
+    Never includes the account's email, organisation or identifiers -- a readiness probe
+    answers "can this process do work", and everything past that is material for somebody
+    who should not have any. Never includes a filesystem path either.
+    """
+    if offline:
+        return {
+            "executable_present": True,
+            "authenticated": True,
+            "subscription_login": True,
+            "subscription_type": "offline-client",
+        }
+
+    from .llm.claude_cli import auth_status, describe_authentication, executable_present
+
+    if not executable_present(settings):
+        return {
+            "executable_present": False,
+            "authenticated": False,
+            "subscription_login": False,
+            "subscription_type": None,
+        }
+    described = describe_authentication(auth_status(settings))
+    return {"executable_present": True, **described}
+
+
 def _database_reachable(db: Database) -> bool:
     try:
         db.connection.execute("SELECT 1").fetchone()
@@ -245,13 +273,20 @@ def create_app(
         gone away, accepts uploads and does nothing with them -- and a load balancer that
         cannot tell that apart from working routes every upload into it.
 
-        The provider is *described*, never contacted. A readiness probe that made a paid
-        model call would be a bill that scales with how often it is polled. Credentials
-        are checked at startup instead, which is why this reports rather than enforces.
+        The provider is *described*, never asked to do work. A readiness probe that made a
+        model call would consume the subscription allowance in proportion to how often it
+        is polled. The authentication check is local -- `claude auth status` reads stored
+        credentials and starts no session -- so it is safe to run on every probe.
         """
         offline = client_factory is not None
+        authentication = _authentication_state(resolved, offline)
         checks = {
             "provider_configured": offline or resolved.provider_configured,
+            "executable_present": authentication["executable_present"],
+            # Reported separately from configuration because they fail for different
+            # reasons and need different fixes: one is a settings problem, the other is
+            # `claude auth login`.
+            "authenticated": authentication["authenticated"],
             "database": _database_reachable(database),
             "worker_pool": getattr(app.state, "runner", None) is not None,
             # A process with a pool but no poller accepts work and runs it, then never
@@ -271,6 +306,8 @@ def create_app(
                 "checks": checks,
                 "authentication_required": authenticated,
                 "offline_client": offline,
+                "subscription_login": authentication["subscription_login"],
+                "subscription_type": authentication["subscription_type"],
                 **resolved.describe_provider(),
             },
         )

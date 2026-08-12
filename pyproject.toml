@@ -13,21 +13,15 @@ dependencies = [
   "pydantic>=2.9",
   "openpyxl>=3.1",
   "sympy>=1.13",
-  # Pinned to the minor line whose surface `docs/gemini-sdk-notes.md` was verified
-  # against. `interactions.create` is young enough that a major bump is a rewrite of
-  # `llm/provider.py`, not an upgrade, and the failure would surface as a runtime
-  # TypeError inside a paid call rather than at install time.
-  "google-genai>=2.17,<3",
   "python-dotenv>=1.0",
   "python-docx>=1.1",
   "pypdf>=5.1",                # embedded-text extraction only - deliberately not a renderer
 
-  # Build constraint, not an import. google-genai -> google-auth -> cryptography.
-  # Neither 49.x nor 50.x publishes an x86_64 macOS wheel for cp312, so an unpinned
-  # resolve tries to compile Rust from source and fails without a toolchain. `<50` was
-  # not enough once 49.0.0 shipped with the same gap -- caught by actually installing
-  # the wheel into a clean environment, which is why CI does that on every run.
-  "cryptography<49",
+  # The provider is the Claude Code CLI, invoked as a subprocess. It is a *runtime*
+  # dependency of the deployment rather than a Python package, which is why nothing here
+  # names it: `pip install` cannot supply it and pretending otherwise would turn a clear
+  # startup error into a confusing resolve failure. `require_credentials()` checks for the
+  # executable and for a subscription login at boot.
 ]
 
 [project.optional-dependencies]

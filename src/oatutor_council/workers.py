@@ -59,9 +59,9 @@ ClientFactory = Callable[[Settings], LLMClient]
 
 
 def default_client_factory(settings: Settings) -> LLMClient:
-    from .llm.provider import GeminiClient
+    from .llm.claude_cli import ClaudeCLIClient
 
-    return GeminiClient(settings)
+    return ClaudeCLIClient(settings)
 
 
 class LeaseKeeper:

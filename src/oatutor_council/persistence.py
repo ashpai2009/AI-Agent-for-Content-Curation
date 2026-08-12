@@ -222,6 +222,18 @@ CREATE TABLE IF NOT EXISTS private_blobs (
 );
 CREATE INDEX IF NOT EXISTS private_blobs_job ON private_blobs(job_id);
 
+-- Behaviour settings pinned **for this job**, the same way prompt versions are. Without
+-- this, a worker restarted after an `.env` edit gives one job half its blocks at batch 1
+-- and the other half at batch 10, and the report describes a run that never happened as a
+-- whole.
+CREATE TABLE IF NOT EXISTS job_settings (
+    job_id     TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, name)
+);
+
 -- Which prompt version each role is pinned to **for this job**. Without this, adding
 -- `writer.v2.md` mid-flight would mean a job's first repair was made under v1 and its
 -- second under v2, and the audit trail would say v2 for both.
@@ -1090,22 +1102,35 @@ def token_usage(db: Database, job_id: str) -> dict[str, int]:
     of truth that a crash between the call and the increment could put permanently out of
     step with the rows it is meant to summarise.
     """
-    totals = {"calls": 0, "failed_calls": 0, "input_tokens": 0, "output_tokens": 0,
-              "thought_tokens": 0, "total_tokens": 0}
+    totals = {
+        "calls": 0,
+        "failed_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        # Carried through to the report rather than left in the per-call blob: part of any
+        # apparent saving comes from the provider's own prompt caching rather than from
+        # batching, and a number nobody aggregates cannot answer which.
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "duration_ms": 0,
+    }
     for call in list_llm_calls(db, job_id):
         totals["calls"] += 1
         if call["status"] != "completed":
             totals["failed_calls"] += 1
         usage = call["payload"].get("usage") or {}
-        for source, target in (
-            ("total_input_tokens", "input_tokens"),
-            ("total_output_tokens", "output_tokens"),
-            ("total_thought_tokens", "thought_tokens"),
-            ("total_tokens", "total_tokens"),
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_tokens",
+            "cache_read_tokens",
+            "total_tokens",
+            "duration_ms",
         ):
-            value = usage.get(source)
-            if isinstance(value, int):
-                totals[target] += value
+            value = usage.get(name)
+            if isinstance(value, (int, float)):
+                totals[name] += int(value)
     return totals
 
 
@@ -1360,6 +1385,21 @@ def save_private_blob(
     if not text.strip():
         return
     with db.write() as connection:
+        # **Idempotent by `(job_id, label)`.** A crash between two blocks of a batch sends
+        # the unmarked ones round again, and an append-only write would accumulate a second
+        # copy of the same reasoning on every retry -- growing the table with duplicates
+        # that say nothing new and making "what did the Writer argue on attempt 2" a
+        # question with several identical answers.
+        existing = connection.execute(
+            "SELECT blob_id FROM private_blobs WHERE job_id = ? AND label = ?",
+            (job_id, label),
+        ).fetchone()
+        if existing is not None:
+            connection.execute(
+                "UPDATE private_blobs SET text = ?, created_at = ? WHERE blob_id = ?",
+                (text, _iso(_now()), existing["blob_id"]),
+            )
+            return
         connection.execute(
             """INSERT INTO private_blobs
                (blob_id, job_id, issue_id, role, label, created_at, text)
@@ -1395,6 +1435,32 @@ def pin_prompt_versions(
                 for role, (version, digest) in versions.items()
             ],
         )
+
+
+def pin_job_settings(db: Database, job_id: str, values: dict[str, Any]) -> None:
+    """Fix this job's behaviour settings on first use, and never move them again.
+
+    `INSERT OR IGNORE`, exactly like the prompt versions: a resumed job keeps what it
+    started with rather than adopting whatever the environment says now. Recording these
+    per call would be auditing; pinning them is what stops a job changing behaviour
+    halfway through.
+    """
+    with db.write() as connection:
+        connection.executemany(
+            """INSERT OR IGNORE INTO job_settings (job_id, name, value, created_at)
+               VALUES (?,?,?,?)""",
+            [
+                (job_id, name, json.dumps(value), _iso(_now()))
+                for name, value in values.items()
+            ],
+        )
+
+
+def load_job_settings(db: Database, job_id: str) -> dict[str, Any]:
+    rows = db.connection.execute(
+        "SELECT name, value FROM job_settings WHERE job_id = ?", (job_id,)
+    ).fetchall()
+    return {row["name"]: json.loads(row["value"]) for row in rows}
 
 
 def load_prompt_versions(db: Database, job_id: str) -> dict[str, int]:

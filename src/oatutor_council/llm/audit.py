@@ -10,6 +10,12 @@ that was never made.
 calls on an outage and one on a repair is indistinguishable from a job that made one call,
 unless the four are written down.
 
+**One row per physical invocation**, which is why retrying sits *outside* this wrapper.
+While the provider retried internally, four `claude` processes produced one row and one
+budget charge: the trail understated what the job spent, and the budget bounded a quarter
+of what it claimed to. `RetryingClient` now wraps this, so each attempt passes through
+here on its own.
+
 What is stored: the role, the model, the status, the pinned prompt version, the token
 usage, the prompt hash, and the exact text of both halves of the prompt. The text is what
 makes the isolation guarantee auditable after the fact -- a test asserting that a reviewer
@@ -21,7 +27,7 @@ in settings and reaches the SDK client directly, and nothing here has access to 
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 from ..persistence import Database, record_llm_call
 from .base import (
@@ -55,16 +61,30 @@ class RecordingClient:
         job_id: str,
         *,
         prompt_versions: dict[str, int] | None = None,
+        behaviour: dict[str, Any] | None = None,
+        before_call: Callable[[], None] | None = None,
     ) -> None:
         self._inner = inner
         self._db = db
         self._job_id = job_id
+        # Charged **before** the call, and per physical invocation. The council supplies
+        # this; it commits one unit of the model-call budget and raises if the job has
+        # none left. Charging afterwards would let a crash loop start calls against a
+        # counter that never moves -- the same argument that puts attempt reservation
+        # before the Writer call rather than after it.
+        self._before_call = before_call
+        # The job's pinned behaviour settings -- batch size, effort, model, adapter
+        # version. Recorded on every call so a run's settings are recoverable from the
+        # audit trail rather than inferred from whatever the environment said at the time.
+        self.behaviour = behaviour or {}
         # Public and mutable: the council pins the versions on its first step, which is
         # after this client is built. A private copy taken at construction would label
         # every call `None` and quietly make the version column useless.
         self.prompt_versions = prompt_versions or {}
 
     def complete(self, request: LLMRequest) -> LLMResponse:
+        if self._before_call is not None:
+            self._before_call()
         started = time.monotonic()
         try:
             response = self._inner.complete(request)
@@ -90,6 +110,7 @@ class RecordingClient:
             "user_payload": payload,
             "truncated": system_clipped or payload_clipped,
             "prompt_version": self.prompt_versions.get(request.role.value),
+            "behaviour": self.behaviour,
             "seed": request.seed,
             "latency_ms": round((time.monotonic() - started) * 1000),
             "usage": response.usage if response else {},

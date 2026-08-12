@@ -19,7 +19,7 @@ Three guarantees, in the order they matter:
 
 Usage:
     .venv/bin/python scripts/shadow_run.py ~/Documents/OATutor/7.3.xlsx
-    .venv/bin/python scripts/shadow_run.py <workbook> --live      # real Gemini calls
+    .venv/bin/python scripts/shadow_run.py <workbook> --live      # real Claude calls
     .venv/bin/python scripts/shadow_run.py <workbook> --keep      # keep the job directory
 """
 
@@ -88,7 +88,7 @@ def main() -> int:
     parser.add_argument(
         "--live",
         action="store_true",
-        help="make real Gemini calls with this workbook's content (costs money)",
+        help="send this workbook's content to Claude through the CLI (uses your subscription)",
     )
     parser.add_argument("--keep", action="store_true", help="keep the job directory")
     parser.add_argument("--max-steps", type=int, default=None)
@@ -115,7 +115,8 @@ def main() -> int:
             settings.require_credentials()
             print(
                 f"LIVE RUN: this will send the contents of {source.name} to "
-                f"{settings.gemini_model}. Ctrl-C now if that is not what you want.\n"
+                f"{settings.claude_model} through the Claude Code CLI, on your "
+                f"subscription. Ctrl-C now if that is not what you want.\n"
             )
 
         db = Database(workspace / "council.db")
@@ -130,9 +131,9 @@ def main() -> int:
         )
 
         if args.live:
-            from oatutor_council.llm.provider import GeminiClient
+            from oatutor_council.llm.claude_cli import ClaudeCLIClient
 
-            client = GeminiClient(settings)
+            client = ClaudeCLIClient(settings)
         else:
             client = observer_client()
 
@@ -166,6 +167,12 @@ def main() -> int:
         print(f"  model calls: {usage['calls']} ({usage['failed_calls']} failed)")
         if usage["total_tokens"]:
             print(f"  tokens: {usage['total_tokens']}")
+        if usage.get("cache_read_tokens"):
+            print(
+                f"  cache: {usage['cache_read_tokens']} read, "
+                f"{usage['cache_creation_tokens']} written"
+            )
+        print(f"  scan batch size: {settings.scan_batch_size}")
 
         by_severity: dict[str, int] = {}
         for finding in findings:
