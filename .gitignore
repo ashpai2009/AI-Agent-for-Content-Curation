@@ -29,3 +29,12 @@ outputs/
 *.db
 *.db-wal
 *.db-shm
+
+# --- Web interface ----------------------------------------------------------
+node_modules/
+.next/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+.env.local
+.env*.local

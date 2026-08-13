@@ -127,6 +127,33 @@ curl -s -X POST localhost:8000/jobs/9f2c.../resume
 
 ---
 
+## Web interface
+
+`web/` is a Next.js page for curators who would rather not use `curl`: choose a workbook,
+add anything specific about *this* one, watch the phases, download the result.
+
+```bash
+.venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src --port 8000
+cd web && npm install && cp .env.example .env.local && npm run dev
+```
+
+It is designed to deploy to Vercel, and **only the page deploys there.** The council
+shells out to the Claude Code CLI under a subscription login, keeps SQLite in WAL mode on
+a writable filesystem, and runs one job for minutes under a renewed lease; a serverless
+function has none of those. Putting the council in the cloud would mean an API key and
+metered billing, which is what the CLI migration removed. So the page calls back to the
+machine the login lives on, through a tunnel.
+
+The browser never talks to the service directly — every call goes through a route handler,
+so `COUNCIL_API_TOKEN` stays server-side and there is no CORS to configure. Typed
+instructions are uploaded as an **instruction document**, so they go through the same
+`RULES | ERRATA | NOTES` classification and the same untrusted-data fencing as an attached
+file. The agents' own prompts stay in the service and are never served to the page.
+
+`web/README.md` has the deployment steps and the limits that come with them.
+
+---
+
 ## Architecture
 
 ```
