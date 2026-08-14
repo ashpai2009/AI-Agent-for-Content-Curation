@@ -33,6 +33,7 @@ from oatutor_council.llm.base import (  # noqa: E402
     call_structured,
 )
 from oatutor_council.llm.claude_cli import (  # noqa: E402
+    _STRUCTURED_KEYS,
     ClaudeCLIClient,
     auth_status,
     build_command,
@@ -52,6 +53,48 @@ SYSTEM = (
     "JSON object."
 )
 PROMPT = "The two numbers are 17 and 25. What is their sum, and which is larger?"
+
+
+def _describe_envelope(stdout: str) -> None:
+    """Report the envelope's shape, so `docs/claude-cli-notes.md` can stop guessing.
+
+    Names and types only, never values. The point is to record where the structured output
+    lives and what usage the CLI reports -- and the payload came back from a model that was
+    asked about two invented numbers, so there is nothing here worth printing anyway.
+    """
+    if not stdout.strip():
+        print("\nenvelope: nothing was captured")
+        return
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        print(f"\nenvelope: not JSON ({stdout[:120]!r})")
+        return
+    if not isinstance(envelope, dict):
+        print(f"\nenvelope: a JSON {type(envelope).__name__}, not an object")
+        return
+
+    print("\nenvelope observed (record this in docs/claude-cli-notes.md):")
+    print(f"  top-level keys: {sorted(envelope)}")
+
+    source = next(
+        (key for key in (*_STRUCTURED_KEYS, "result") if envelope.get(key) not in (None, "")),
+        None,
+    )
+    kind = type(envelope.get(source)).__name__ if source else "—"
+    print(f"  structured output came from: {source!r} (a {kind})")
+
+    usage = envelope.get("usage")
+    if isinstance(usage, dict):
+        print(f"  usage fields: {sorted(usage)}")
+    else:
+        print(f"  usage: absent or not an object ({type(usage).__name__})")
+
+    for field in ("subtype", "is_error", "model", "duration_ms", "num_turns"):
+        if field in envelope:
+            value = envelope[field]
+            shown = value if isinstance(value, (int, float, bool)) else type(value).__name__
+            print(f"  {field}: {shown}")
 
 
 def main() -> int:
@@ -84,16 +127,34 @@ def main() -> int:
     print(f"\ncommand: {' '.join(repr(part) if ' ' in part else part for part in shown)}")
     print("sending one call with no workbook content ...")
 
+    # The envelope is captured on the way past, through the `runner` seam that already
+    # exists for the tests. The full client still does the work -- this observes it rather
+    # than reimplementing it -- so what is reported below is the shape the real parser
+    # actually read, not a second guess at it.
+    captured: dict[str, str] = {}
+
+    def capturing_runner(command, *, input, cwd, timeout):
+        completed = ClaudeCLIClient._run_process(
+            command, input=input, cwd=cwd, timeout=timeout
+        )
+        captured["stdout"] = completed.stdout
+        return completed
+
+    client = ClaudeCLIClient(settings, runner=capturing_runner)
+
     try:
-        answer = call_structured(ClaudeCLIClient(settings), request, Arithmetic)
+        answer = call_structured(client, request, Arithmetic)
     except MalformedResponse as error:
         print(f"\nthe CLI returned something the schema rejects: {error}", file=sys.stderr)
+        _describe_envelope(captured.get("stdout", ""))
         return 3
     except ProviderError as error:
         print(f"\nthe call failed [{error.status}]: {error}", file=sys.stderr)
+        _describe_envelope(captured.get("stdout", ""))
         return 3
 
     print(f"parsed: {answer.model_dump()}")
+    _describe_envelope(captured.get("stdout", ""))
     correct = answer.sum_of_the_numbers == 42 and answer.the_larger_one == 25
     print(f"arithmetic correct: {correct}")
     print("\nprovider OK" if correct else "\nprovider answered, but got the sum wrong")

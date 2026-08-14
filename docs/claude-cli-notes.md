@@ -1,8 +1,8 @@
 # Claude Code CLI — the verified provider surface
 
-Everything marked **verified** below was checked against the installed binary during the
-migration. Everything marked **unverified** has not been observed and is handled
-defensively in code; the smoke test is what closes that gap.
+Everything below was checked against the installed binary, and the call path itself has
+been exercised against the live provider once — see the envelope section. Where a detail
+has been reasoned about but not *observed*, it says so; nothing here is recalled.
 
 ```
 claude --version   →  2.1.219 (Claude Code)
@@ -138,11 +138,27 @@ from a source the operator never configured.
 
 ---
 
-## The response envelope — **unverified**
+## The response envelope — verified end to end, shape not yet recorded
 
-The outer shape of `--output-format json` has **not** been observed; no live call has been
-made. The parser therefore looks for structured output in each plausible location and
-**fails loudly rather than guessing**, in this order:
+**A live call has been made and it worked** (2026-08-13, `scripts/smoke_claude_cli.py`,
+invented arithmetic, no workbook content). That closed the three things a fake executable
+cannot establish:
+
+- structured output landed where the parser looks, and validated against the Pydantic
+  schema it was given;
+- **`--max-turns 1` is accepted** — an unknown option aborts the call, so this is proof
+  the flag exists at 2.1.219, not just that the binary contains the string;
+- the restricted child environment still reaches the keychain. The allowlist entries
+  `XPC_SERVICE_NAME` and `__CF_USER_TEXT_ENCODING` were a judgment call about macOS
+  keychain bootstrap, and they are enough.
+
+What is **not** recorded here yet is which key held the output and what usage fields came
+back — that first run reported only the parsed result. The smoke test now prints both
+(names and types only, never values); paste its `envelope observed` block into this section
+on the next run.
+
+Until then the parser stays defensive, which costs nothing: it looks for structured output
+in each plausible location and **fails loudly rather than guessing**, in this order:
 
 1. `structured_output` / `structuredOutput` / `structured_result` — dict, list or string
 2. `result` — dict, list or string
@@ -160,8 +176,9 @@ Usage is read from `usage` with both snake_case and camelCase spellings tried:
 `total_tokens`. **No dollar figure is derived** — the CLI reports a cost estimate for
 API-key users, and on a subscription that number is fiction.
 
-**Running `scripts/smoke_claude_cli.py` is what confirms this section.** Update it with the
-observed envelope afterwards, and delete the word "unverified".
+`scripts/smoke_claude_cli.py` is the only thing in the repository that exercises this. It
+observes the envelope through the client's `runner` seam rather than reimplementing the
+call, so what it reports is the shape the real parser actually read.
 
 ---
 

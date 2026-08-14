@@ -133,24 +133,26 @@ curl -s -X POST localhost:8000/jobs/9f2c.../resume
 add anything specific about *this* one, watch the phases, download the result.
 
 ```bash
-.venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src --port 8000
-cd web && npm install && cp .env.example .env.local && npm run dev
+./scripts/serve.sh          # council on :8000, page on :3000, browser opened
+./scripts/serve.sh --api-only   # just the service
 ```
 
-It is designed to deploy to Vercel, and **only the page deploys there.** The council
-shells out to the Claude Code CLI under a subscription login, keeps SQLite in WAL mode on
-a writable filesystem, and runs one job for minutes under a renewed lease; a serverless
-function has none of those. Putting the council in the cloud would mean an API key and
-metered billing, which is what the CLI migration removed. So the page calls back to the
-machine the login lives on, through a tunnel.
+**It runs on your machine, and that is the architecture rather than a limitation.** The
+council shells out to the Claude Code CLI under your subscription login, kept in this
+machine's keychain; there is no API key anywhere in this application, deliberately. Hosting
+the work elsewhere would mean introducing one and converting a subscription into metered
+billing. The service also wants a writable filesystem and runs one job for minutes under a
+renewed lease, so the compute has to be where the login is — and once it is, a remote host
+has nothing left to do.
 
-The browser never talks to the service directly — every call goes through a route handler,
-so `COUNCIL_API_TOKEN` stays server-side and there is no CORS to configure. Typed
-instructions are uploaded as an **instruction document**, so they go through the same
-`RULES | ERRATA | NOTES` classification and the same untrusted-data fencing as an attached
-file. The agents' own prompts stay in the service and are never served to the page.
+The browser still never talks to the service directly: every call goes through a Next.js
+route handler, so `COUNCIL_API_TOKEN` stays out of the JavaScript bundle and there is no
+CORS to configure. Typed instructions are uploaded as an **instruction document**, so they
+go through the same `RULES | ERRATA | NOTES` classification and the same untrusted-data
+fencing as an attached file. The agents' own prompts stay in the service and are never
+served to the page.
 
-`web/README.md` has the deployment steps and the limits that come with them.
+`web/README.md` has the rest.
 
 ---
 
