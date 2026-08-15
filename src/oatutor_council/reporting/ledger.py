@@ -67,16 +67,28 @@ def issue_from_finding(
     found and whether anything can be done about it.
     """
     rule = REGISTRY.get(finding.code)
+    if rule is not None:
+        category = rule.category
+    else:
+        # Model findings carry their declared category in `detail`. Treating every
+        # semantic finding as STRUCTURE loses the auditor's classification and can grant
+        # structural edit authority to an ordinary mathematics issue.
+        try:
+            category = IssueCategory(str(finding.detail.get("category", "")))
+        except ValueError:
+            category = IssueCategory.STRUCTURE
     return Issue(
         issue_id=uuid4().hex,
         job_id=job_id,
         block_id=finding.block_id,
         problem_name=finding.problem_name,
         source=source,
-        category=rule.category if rule else IssueCategory.STRUCTURE,
+        category=category,
         severity=finding.severity,
         title=f"{finding.code} at {_location(finding)}",
         description=finding.message,
+        expected=str(finding.detail.get("expected", "") or ""),
+        observed=str(finding.detail.get("observed", "") or ""),
         rule_codes=(finding.code,),
         cells=((finding.row, finding.column),)
         if finding.row is not None and finding.column is not None

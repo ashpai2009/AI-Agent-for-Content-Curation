@@ -61,8 +61,14 @@ If the issue is about how a value is *written* rather than what it is -- notatio
 formatting -- the corrected cell must still mean the same thing. That is checked
 symbolically.
 
+`derivation` is required in every response. If any edit targets `answer` or `mc_choices`,
+it must be non-empty and must verify the proposed value concretely: show the calculation,
+state which choice matches the answer exactly, or state why a notation-only rewrite is
+mathematically equivalent. A mathematical edit with an empty derivation is rejected and
+spends an attempt. For a response that edits no mathematical cell, use an empty string.
+
 If you cannot determine the correct content confidently, set `needs_human_review` and
-produce no edits.
+produce no edits; still include `derivation` as an empty string.
 """
 
 
@@ -109,10 +115,11 @@ def propose_patch(
             )
         )
     if reviewer_feedback:
-        # The reviewer's feedback is public by design -- it is the only thing that
-        # travels back to the Writer, and it has to be actionable.
+        # Reviewer feedback and deterministic gate rejections are both public by design.
+        # They are the only information that travels from a failed attempt back to the
+        # Writer, and have to be actionable rather than making it repeat the same patch.
         sections.append(
-            DataSection("Reviewer feedback on your previous attempt", reviewer_feedback)
+            DataSection("Feedback on your previous attempt", reviewer_feedback)
         )
 
     bundle = ContextBundle.build(INSTRUCTIONS, sections)

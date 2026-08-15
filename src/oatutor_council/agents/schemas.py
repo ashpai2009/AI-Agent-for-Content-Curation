@@ -127,7 +127,14 @@ class WriterEdit(BaseModel):
 class WriterResponse(BaseModel):
     #: Private. Reviewers never see these three.
     reasoning: str = ""
-    derivation: str = ""
+    derivation: str = Field(
+        description=(
+            "Required verification for the proposed edits. When editing answer or "
+            "mc_choices, state the calculation, exact-choice check, or symbolic "
+            "equivalence that proves the new value is correct. Use an empty string only "
+            "when no mathematical cell is edited."
+        )
+    )
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
     edits: list[WriterEdit] = Field(default_factory=list)

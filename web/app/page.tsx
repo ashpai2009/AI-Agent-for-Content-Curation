@@ -407,7 +407,7 @@ export default function Page() {
             {status && (
               <dl className="stats">
                 <div>
-                  <dt>Issues</dt>
+                  <dt>Findings tracked</dt>
                   <dd>{status.issues}</dd>
                 </div>
                 <div>

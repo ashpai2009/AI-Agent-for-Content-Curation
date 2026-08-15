@@ -1102,6 +1102,24 @@ class CurationCouncil:
             )
             return StepOutcome(True, f"{issue.issue_id} no longer applies", state)
 
+        # A semantic issue cannot be re-derived mechanically, but it may already have
+        # been resolved by an earlier accepted repair in the same block. Sending it
+        # straight to the Writer is what produced the pilot's false "needs a person"
+        # entry for a date-coercion defect whose cell already contained the repaired
+        # fraction. Ask the issue's assigned reviewer to judge the current artifact first.
+        # A revision still reaches the Writer on the next step, carrying the reviewer's
+        # feedback; an acceptance closes this issue as resolved by another repair.
+        if (
+            issue.state is IssueState.OPEN
+            and issue.attempts_used == 0
+            and remaining is None
+            and any(
+                change.block_id == issue.block_id and change.issue_id != issue.issue_id
+                for change in list_changes(self.db, self.job_id)
+            )
+        ):
+            return self._review_prior_repair(issue, state)
+
         # Reserved and committed BEFORE the call. Incrementing afterwards would let a
         # crash loop burn unbounded spend against a counter that never moves.
         try:
@@ -1293,13 +1311,68 @@ class CurationCouncil:
             save_issue(self.db, advance_issue(issue, IssueState.AWAITING_REVIEW))
             issue = advance_issue(issue, IssueState.AWAITING_REVIEW)
 
+        verdict = self._ask_reviewer(issue)
+        if verdict is None:
+            save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, "block vanished; escalating", state)
+        _settle_reviewed_attempt(self.db, issue.issue_id, verdict)
+
+        if verdict.decision is ReviewDecision.ACCEPT:
+            save_issue(self.db, advance_issue(issue, IssueState.ACCEPTED))
+            return StepOutcome(True, f"{issue.issue_id} accepted", state)
+        if verdict.decision is ReviewDecision.HUMAN_REVIEW:
+            save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
+
+        next_state = (
+            IssueState.REVISION_REQUESTED
+            if self.machine.can_attempt(issue)
+            else IssueState.NEEDS_HUMAN_REVIEW
+        )
+        save_issue(self.db, advance_issue(issue, next_state))
+        return StepOutcome(True, f"{issue.issue_id} revision requested", state)
+
+    def _review_prior_repair(self, issue: Issue, state: JobState) -> StepOutcome:
+        """Check whether another accepted edit already resolved a semantic duplicate.
+
+        This is deliberately a reviewer call, not a cell-overlap heuristic. Two genuine
+        semantic defects can concern the same answer, and silently superseding one merely
+        because that cell changed would lose it. The reviewer sees source versus current
+        and decides whether this particular issue survived the earlier repair.
+        """
+        verdict = self._ask_reviewer(issue)
+        if verdict is None:
+            save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, "block vanished; escalating", state)
+
+        if verdict.decision is ReviewDecision.ACCEPT:
+            save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
+            record_event(
+                self.db,
+                self.job_id,
+                "issue_superseded",
+                f"{issue.issue_id}: reviewer confirmed an earlier repair resolved "
+                f"the semantic finding in {issue.problem_name}",
+            )
+            return StepOutcome(True, f"{issue.issue_id} resolved by another repair", state)
+
+        if verdict.decision is ReviewDecision.HUMAN_REVIEW:
+            save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
+
+        # OPEN cannot transition directly to REVISION_REQUESTED. AWAITING_PATCH means
+        # exactly what is true now: the reviewer has supplied actionable feedback and
+        # the next phase step should ask the Writer for the first patch.
+        save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
+        return StepOutcome(True, f"{issue.issue_id} still needs a patch", state)
+
+    def _ask_reviewer(self, issue: Issue):
         source_parse = self.source_workbook()
         current = self.current_workbook()
         original_block = source_parse.block_by_id(issue.block_id)
         current_block = current.block_by_id(issue.block_id)
         if original_block is None or current_block is None:
-            save_issue(self.db, self.machine.exhausted(issue))
-            return StepOutcome(True, "block vanished; escalating", state)
+            return None
 
         context = known_issue_reviewer.build_context(
             issue=issue,
@@ -1325,21 +1398,7 @@ class CurationCouncil:
             ),
         )
         insert_verdict(self.db, verdict)
-
-        if verdict.decision is ReviewDecision.ACCEPT:
-            save_issue(self.db, advance_issue(issue, IssueState.ACCEPTED))
-            return StepOutcome(True, f"{issue.issue_id} accepted", state)
-        if verdict.decision is ReviewDecision.HUMAN_REVIEW:
-            save_issue(self.db, self.machine.exhausted(issue))
-            return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
-
-        next_state = (
-            IssueState.REVISION_REQUESTED
-            if self.machine.can_attempt(issue)
-            else IssueState.NEEDS_HUMAN_REVIEW
-        )
-        save_issue(self.db, advance_issue(issue, next_state))
-        return StepOutcome(True, f"{issue.issue_id} revision requested", state)
+        return verdict
 
     # -- queries -----------------------------------------------------------------------
 
@@ -1515,16 +1574,83 @@ def _latest_patch(db: Database, issue_id: str):
 
 
 def _latest_feedback(db: Database, issue_id: str) -> str:
+    """The newest actionable response to a failed repair, whatever produced it.
+
+    The old implementation read only reviewer verdicts. A deterministic gate rejection
+    therefore vanished before the next Writer call, which made the Writer repeat the
+    exact same invalid patch until its attempt budget was exhausted.
+    """
     from .models import ReviewVerdict
 
     row = db.connection.execute(
-        "SELECT payload_json FROM review_verdicts WHERE issue_id = ? "
-        "ORDER BY decided_at DESC LIMIT 1",
-        (issue_id,),
+        """SELECT kind, payload_json FROM (
+               SELECT 'review' AS kind, payload_json, decided_at AS happened_at
+                 FROM review_verdicts WHERE issue_id = ?
+               UNION ALL
+               SELECT 'rejection' AS kind, payload_json,
+                      COALESCE(finished_at, started_at) AS happened_at
+                 FROM repair_attempts
+                WHERE issue_id = ? AND outcome = 'patch_rejected'
+           ) ORDER BY happened_at DESC LIMIT 1""",
+        (issue_id, issue_id),
     ).fetchone()
     if row is None:
         return ""
-    return ReviewVerdict.model_validate_json(row["payload_json"]).feedback
+    if row["kind"] == "review":
+        return ReviewVerdict.model_validate_json(row["payload_json"]).feedback
+
+    attempt = RepairAttempt.model_validate_json(row["payload_json"])
+    rejection = attempt.rejection
+    if rejection is None:
+        return ""
+    feedback = (
+        f"The deterministic patch gate rejected the previous attempt with "
+        f"{rejection.code.value}: {rejection.message}."
+    )
+    if rejection.row is not None:
+        feedback += f" It concerns row {rejection.row}"
+        if rejection.column is not None:
+            feedback += f", column {rejection.column}"
+        feedback += "."
+    if rejection.code is RejectionCode.MISSING_MATH_VERIFICATION:
+        feedback += (
+            " In the next response, put a concrete calculation, exact-choice check, or "
+            "symbolic-equivalence check in `derivation`; do not leave it empty."
+        )
+    return feedback
+
+
+def _latest_attempt(db: Database, issue_id: str) -> RepairAttempt | None:
+    row = db.connection.execute(
+        "SELECT payload_json FROM repair_attempts WHERE issue_id = ? "
+        "ORDER BY attempt_no DESC LIMIT 1",
+        (issue_id,),
+    ).fetchone()
+    return RepairAttempt.model_validate_json(row["payload_json"]) if row else None
+
+
+def _settle_reviewed_attempt(db: Database, issue_id: str, verdict) -> None:
+    """Attach the review's real terminal outcome to the Writer attempt it judged."""
+    attempt = _latest_attempt(db, issue_id)
+    if attempt is None or attempt.patch_id is None or attempt.outcome is not None:
+        # A prior-repair review has no Writer attempt of its own. A recovered or already
+        # settled attempt must also remain exactly as recovery recorded it.
+        return
+    outcomes = {
+        ReviewDecision.ACCEPT: AttemptOutcome.PATCH_ACCEPTED,
+        ReviewDecision.REVISE: AttemptOutcome.REVISION_REQUESTED,
+        ReviewDecision.HUMAN_REVIEW: AttemptOutcome.ESCALATED,
+    }
+    settle_attempt(
+        db,
+        attempt.model_copy(
+            update={
+                "outcome": outcomes[verdict.decision],
+                "verdict_id": verdict.verdict_id,
+                "finished_at": verdict.decided_at,
+            }
+        ),
+    )
 
 
 def _verdicts(db: Database, job_id: str):

@@ -13,6 +13,7 @@ import pytest
 
 from conftest import problem, scaffold, step
 from oatutor_council.agents.schemas import (
+    AuditorFinding,
     AuditorResponse,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -42,6 +43,7 @@ from oatutor_council.persistence import (
     create_job,
     list_changes,
     list_events,
+    list_attempts,
     list_issues,
     load_ledger,
 )
@@ -279,6 +281,7 @@ def test_an_escalation_is_terminal_on_the_first_occurrence(setup):
     client = quiet_client(
         **{
             AgentRole.WRITER: WriterResponse(
+                derivation="",
                 needs_human_review=True, human_review_reason="the source is contradictory"
             )
         }
@@ -304,6 +307,86 @@ def test_a_rejected_patch_costs_an_attempt(setup):
     council(setup, client).run()
     issues = [i for i in list_issues(db, "job-1") if i.attempts_used]
     assert max(i.attempts_used for i in issues) == 3
+
+
+def test_a_gate_rejection_is_actionable_feedback_for_the_next_writer_attempt(setup):
+    """The live pilot repeated MISSING_MATH_VERIFICATION three times because gate
+    feedback never reached the Writer. The second call must see the rejection and be able
+    to correct the response contract instead of guessing again."""
+    client = ScriptedLLMClient()
+
+    def reply(request):
+        if request.role is AgentRole.WRITER:
+            corrected = "MISSING_MATH_VERIFICATION" in request.user_payload
+            return WriterResponse(
+                derivation=(
+                    "the scaffold asks for a graded numeric answer of 30"
+                    if corrected
+                    else ""
+                ),
+                edits=[
+                    {"row": 4, "column": "answer", "before": "", "after": "30"}
+                ],
+            )
+        if request.role is AgentRole.KNOWN_ISSUE_REVIEWER:
+            return ReviewerResponse(decision="accept")
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse()
+        return IndependentReviewResponse(block_is_sound=True)
+
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    assert client.call_count(AgentRole.WRITER) == 2
+    second = client.payloads_for(AgentRole.WRITER)[1]
+    assert "MISSING_MATH_VERIFICATION" in second
+    assert "do not leave it empty" in second
+
+
+def test_a_semantic_duplicate_is_reviewed_before_another_writer_call(setup):
+    """A deterministic repair and an auditor finding can describe the same defect.
+
+    Once the first issue changes the block, the semantic issue is checked against the
+    repaired artifact. An accepting reviewer supersedes it; the Writer is not asked to
+    invent a second change for a defect that is already gone.
+    """
+    db, _ = setup
+    duplicate = AuditorResponse(
+        findings=[
+            AuditorFinding(
+                rows=[4],
+                columns=["answer"],
+                problem="The graded scaffold is missing its answer.",
+                expected="30",
+                category="row_type",
+            )
+        ]
+    )
+    client = quiet_client(**{AgentRole.INITIAL_AUDITOR: duplicate})
+    result = council(setup, client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    issues = list_issues(db, "job-1")
+    semantic = next(i for i in issues if i.rule_codes == ("AUDITOR_FINDING",))
+    assert semantic.state is IssueState.SUPERSEDED
+    assert semantic.category.value == "row_type"
+    assert semantic.expected == "30"
+    assert len([i for i in issues if i.state is IssueState.NEEDS_HUMAN_REVIEW]) == 0
+    assert client.call_count(AgentRole.WRITER) == 1
+
+
+def test_an_accepted_patch_records_the_reviewed_attempt_outcome(setup):
+    db, _ = setup
+    result = council(setup, quiet_client()).run()
+
+    assert result.state is JobState.SUCCEEDED
+    attempts = list_attempts(db, "job-1")
+    accepted = [a for a in attempts if a.outcome is not None]
+    assert len(accepted) == 1
+    assert accepted[0].outcome.value == "patch_accepted"
+    assert accepted[0].verdict_id is not None
+    assert accepted[0].finished_at is not None
 
 
 # --------------------------------------------------------------------------------------

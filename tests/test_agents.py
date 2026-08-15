@@ -300,6 +300,10 @@ def test_the_auditor_payload_carries_the_seed_claims_as_fenced_data(parsed, bloc
 # --------------------------------------------------------------------------------------
 
 
+def test_writer_schema_requires_the_derivation_field():
+    assert "derivation" in WriterResponse.model_json_schema()["required"]
+
+
 def test_the_writer_produces_exact_cell_edits(parsed, block):
     client = ScriptedLLMClient(
         default=WriterResponse(
@@ -326,6 +330,7 @@ def test_escalation_produces_no_edits_and_is_terminal(parsed, block):
     is worse than an escalation because it gets reviewed as though someone checked it."""
     client = ScriptedLLMClient(
         default=WriterResponse(
+            derivation="",
             needs_human_review=True, human_review_reason="the source is contradictory"
         )
     )
@@ -338,7 +343,7 @@ def test_escalation_produces_no_edits_and_is_terminal(parsed, block):
 
 def test_neither_edits_nor_escalation_is_refused(parsed, block):
     """A patch with no edits and no escalation is not an answer to the question asked."""
-    client = ScriptedLLMClient(default=WriterResponse())
+    client = ScriptedLLMClient(default=WriterResponse(derivation=""))
     with pytest.raises(WriterProposedNothing):
         propose_patch(
             client, issue=make_issue(), block=block, conventions=parsed.conventions,
@@ -351,6 +356,7 @@ def test_reviewer_feedback_reaches_the_writer(parsed, block):
     be actionable."""
     client = ScriptedLLMClient(
         default=WriterResponse(
+            derivation="a stated verification for the mathematical edit",
             edits=[{"row": 3, "column": "answer", "before": "pi/6", "after": "pi/3"}]
         )
     )
@@ -369,6 +375,7 @@ def test_the_writer_rationale_is_registered_as_private(parsed, block):
     client = ScriptedLLMClient(
         default=WriterResponse(
             reasoning=RATIONALE,
+            derivation="a stated verification for the mathematical edit",
             edits=[{"row": 3, "column": "answer", "before": "pi/6", "after": "pi/3"}],
         )
     )

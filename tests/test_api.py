@@ -675,6 +675,7 @@ def _client_that_never_repairs(_settings) -> ScriptedLLMClient:
         AgentRole.INITIAL_AUDITOR: AuditorResponse(),
         AgentRole.INDEPENDENT_REVIEWER: IndependentReviewResponse(block_is_sound=True),
         AgentRole.WRITER: WriterResponse(
+            derivation="",
             needs_human_review=True, human_review_reason="I cannot determine the answer"
         ),
         AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(decision="accept"),
