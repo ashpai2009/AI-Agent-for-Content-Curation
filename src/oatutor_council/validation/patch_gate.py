@@ -327,11 +327,28 @@ def _conservation_failure(edits: Sequence[CellEdit]) -> str | None:
 
 
 def _block_invariants_broken(patched: ProblemBlock) -> str | None:
-    """Condition 5: the resulting block must still be a block.
+    """Condition 5: the resulting block must still be a **block**.
 
-    These are the invariants a shift repair is most likely to get subtly wrong, and each
-    is cheap to state exactly -- which is the whole reason they are checked here rather
-    than left to a reviewer's judgment.
+    Strictly the shape of the block: a problem row at the top, no second problem row
+    splitting it, one `Problem Name` throughout. These are reader-level facts that
+    `run_rules` cannot re-derive from a simulated block -- simulation edits cell values
+    and does not re-parse the sheet -- so they are stated here, absolutely, and each is
+    cheap to state exactly.
+
+    **Identifier uniqueness and dependency resolution are deliberately not here**, and
+    were, which cost a live run. They were checked block-wide, so every step after the
+    first in a `RESET_PER_STEP` workbook looked like a duplicate `h1` -- the exact
+    misreading `step_scopes()` exists to prevent, restated in a second place that never
+    got the fix. Worse, they were checked *absolutely*: the condition was almost always
+    pre-existing, so the gate refused patches for a defect the patch had not introduced
+    and could not remove. Nearly every repair inside a multi-step problem was rejected
+    three times over and the issue walked to `NEEDS_HUMAN_REVIEW` with its attempts spent.
+
+    Both belong to `regressions_introduced`, which already derives them from the
+    registered rules -- with the workbook's own convention, therefore with the right
+    scope -- and compares before against after, so a patch is answerable only for what it
+    breaks. A rule engine and a gate that both decide what a valid identifier is will
+    disagree eventually, and the gate is the one nobody re-measures against the corpus.
     """
     from ..models import RowType
 
@@ -354,24 +371,6 @@ def _block_invariants_broken(patched: ProblemBlock) -> str | None:
                 f"{name!r}"
             )
 
-    identifiers = [
-        row.get(ColumnKey.HINT_ID).strip()
-        for row in patched.rows
-        if row.get(ColumnKey.HINT_ID).strip()
-    ]
-    duplicates = [value for value, count in Counter(identifiers).items() if count > 1]
-    if duplicates:
-        return f"the patch would leave duplicate identifiers: {', '.join(duplicates)}"
-
-    available = set(identifiers)
-    for row in patched.rows:
-        dependency = row.get(ColumnKey.DEPENDENCY).strip()
-        for reference in (part.strip() for part in dependency.split(",")):
-            if reference and reference not in available:
-                return (
-                    f"row {row.row} would depend on {reference!r}, which does not exist "
-                    "in the resulting block"
-                )
     return None
 
 

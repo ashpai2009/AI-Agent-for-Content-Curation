@@ -1100,9 +1100,15 @@ def test_a_job_keeps_the_prompt_version_it_started_with(setup, monkeypatch):
     council(setup, quiet_client()).run()
 
     assert load_prompt_versions(db, "job-1") == pinned
-    assert {c["payload"]["prompt_version"] for c in list_llm_calls(db, "job-1")} == {
-        pinned["writer"]
-    }
+    # Per role, because roles are versioned independently -- the auditor is on v2 while the
+    # others are still on v1, so a single expected number would only ever have been true by
+    # accident. What must hold is that every call used the version this job pinned, and
+    # that the version deployed mid-job reached none of them.
+    calls = list_llm_calls(db, "job-1")
+    assert calls
+    for call in calls:
+        assert call["payload"]["prompt_version"] == pinned[call["role"]]
+    assert 99 not in {c["payload"]["prompt_version"] for c in calls}
 
 
 def test_the_audit_trail_never_contains_a_credential(setup):

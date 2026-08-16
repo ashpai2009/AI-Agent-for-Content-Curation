@@ -137,9 +137,15 @@ def test_prompts_ship_with_the_package():
     package_root = Path(oatutor_council.__file__).resolve().parent
     assert PROMPT_ROOT.is_dir()
     assert PROMPT_ROOT.parent == package_root
-    assert {p.name for p in PROMPT_ROOT.glob("*.v*.md")} == {
-        f"{role.value}.v1.md" for role in AgentRole
-    }
+
+    # Every role must ship at least one version. Not *exactly* v1: a role gains a version
+    # whenever its instructions change materially, which is the mechanism that keeps an
+    # in-flight job on the wording it started under.
+    shipped = {p.name for p in PROMPT_ROOT.glob("*.v*.md")}
+    for role in AgentRole:
+        assert any(
+            name.startswith(f"{role.value}.v") for name in shipped
+        ), f"no prompt shipped for {role.value}"
 
 
 # --------------------------------------------------------------------------------------

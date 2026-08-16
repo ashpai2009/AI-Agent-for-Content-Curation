@@ -107,11 +107,34 @@ def _location(finding: ValidationFinding) -> str:
     return finding.block_id or "the workbook"
 
 
+#: Categories that are a structural claim in themselves. A finding that classifies itself
+#: this way has identified a defect in the shape of the block, whichever cell it cited --
+#: and an issue that is not marked structural cannot authorise the repair, so reading the
+#: declaration is the difference between a fixable defect and one that burns three attempts
+#: against `STRUCTURAL_COLUMN_UNAUTHORIZED`.
+_STRUCTURAL_CATEGORIES = frozenset(
+    {IssueCategory.STRUCTURE, IssueCategory.ROW_TYPE, IssueCategory.DEPENDENCY}
+)
+
+
 def _is_structural(finding: ValidationFinding) -> bool:
     from ..models import STRUCTURAL_COLUMNS, StructuralCode
 
     if finding.column_key in STRUCTURAL_COLUMNS:
         return True
+
+    # The agent's own classification, when it made one. This does not rescue a finding
+    # that cited the wrong cell *and* called itself mathematics -- nothing mechanical can,
+    # since the target column is only knowable from the prose -- which is why the auditor
+    # prompt asks for the column that must change rather than the one where the defect
+    # showed up.
+    declared = str(finding.detail.get("category", ""))
+    try:
+        if IssueCategory(declared) in _STRUCTURAL_CATEGORIES:
+            return True
+    except ValueError:
+        pass
+
     return finding.code in {
         StructuralCode.COLUMN_SHIFT,
         StructuralCode.ROW_SHIFT_RIGHT,

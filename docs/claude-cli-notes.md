@@ -53,7 +53,7 @@ Every flag below exists in 2.1.219's `--help`:
 | `--safe-mode` | No CLAUDE.md, skills, plugins, hooks, MCP, custom agents or output styles. |
 | `--disable-slash-commands` | No skills reachable through `/name`. |
 | `--strict-mcp-config` + `--mcp-config '{"mcpServers":{}}'` | An explicitly empty MCP set, and every other MCP configuration ignored. |
-| `--max-turns 1` | One turn, enforced by the CLI rather than inferred from having no tools. |
+| `--max-turns 2` | A turn ceiling enforced by the CLI rather than inferred from having no tools. **2, not 1** — see below. `COUNCIL_CLAUDE_MAX_TURNS`. |
 | `--permission-mode dontAsk` | Never blocks waiting for a human. With no tools there is nothing to permit, so this is belt and braces. |
 | `--no-session-persistence` | Nothing written to disk, nothing resumable. |
 
@@ -78,6 +78,24 @@ against the binary and the reference, before "deliberately not used" is written 
 `--tools ""` still leaves nothing to iterate on, so the two limits are independent: one is
 an argument about what the model has no reason to do, the other is the CLI refusing to let
 it. Both, because what is being bounded is spend on somebody's subscription.
+
+### Why the ceiling is 2 — measured, 2026-08-16
+
+It was 1, and 1 was wrong. A live pilot lost **four independent-review calls** to
+`Reached maximum number of turns (1)`, raised before the model had emitted its structured
+output. Retry recovered all four, and that is the finding rather than a consolation: the
+ceiling that existed to bound spend was *causing* whole extra invocations, each of them a
+separately billed process. At 1 the flag was not a limit, it was a retry loop with a
+confusing error message.
+
+The reason to keep it low is untouched — this is somebody's subscription — so it moved to
+2 rather than to a comfortable number, and it is a setting (`COUNCIL_CLAUDE_MAX_TURNS`) so
+it can be tightened during an incident without a redeploy. Raise it again only with the
+same kind of evidence: an observed failure mode, not a hunch about headroom.
+
+Structured output arriving on turn 2 is not itself surprising — the CLI's own turn
+accounting is not documented at this version, and nothing here claims to know why the
+second turn is needed. What is recorded is what was observed.
 
 ### Not used, deliberately
 
@@ -146,8 +164,9 @@ cannot establish:
 
 - structured output landed where the parser looks, and validated against the Pydantic
   schema it was given;
-- **`--max-turns 1` is accepted** — an unknown option aborts the call, so this is proof
-  the flag exists at 2.1.219, not just that the binary contains the string;
+- **`--max-turns` is accepted** — an unknown option aborts the call, so this is proof the
+  flag exists at 2.1.219, not just that the binary contains the string. (That call passed
+  `1`; the ceiling is now 2 for the reason recorded above.)
 - the restricted child environment still reaches the keychain. The allowlist entries
   `XPC_SERVICE_NAME` and `__CF_USER_TEXT_ENCODING` were a judgment call about macOS
   keychain bootstrap, and they are enough.

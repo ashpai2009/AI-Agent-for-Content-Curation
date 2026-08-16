@@ -49,6 +49,17 @@ DEFAULT_CLAUDE_MODEL = "sonnet"
 DEFAULT_CLAUDE_EFFORT = "medium"
 VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
+#: Turns per call. **2, not 1, and measured rather than chosen.** At 1 the live pilot lost
+#: four independent-review calls to `Reached maximum number of turns (1)` before the model
+#: had emitted its structured output. Retry recovered all four, which is the point: the
+#: ceiling that was meant to bound spend was *causing* whole extra calls, so 1 was more
+#: expensive than 2 as well as less reliable.
+#:
+#: A setting because it is a fuse, and the reason to keep it low is unchanged -- what is
+#: bounded is spend on somebody's subscription, and `--tools ""` already leaves nothing to
+#: iterate on. Raise it further only with the same kind of evidence.
+DEFAULT_CLAUDE_MAX_TURNS = 2
+
 #: Scan batching. **1 is today's behaviour exactly** -- `audit_blocks` delegates to the
 #: unchanged single-block path at this value, so the default changes nothing until somebody
 #: raises it deliberately and measures the result.
@@ -118,6 +129,9 @@ class Settings:
     max_upload_bytes: int
     lease_seconds: int
 
+    #: Agentic turns the CLI will allow per call. See `DEFAULT_CLAUDE_MAX_TURNS`.
+    claude_max_turns: int = DEFAULT_CLAUDE_MAX_TURNS
+
     #: How often a running worker renews its lease. Must be comfortably shorter than
     #: `lease_seconds` or a worker loses a job it is actively working on -- see
     #: `heartbeat_seconds` below, which enforces exactly that rather than trusting it.
@@ -174,6 +188,11 @@ class Settings:
             raise ConfigurationError(
                 f"COUNCIL_CLAUDE_EFFORT must be one of {', '.join(VALID_EFFORT_LEVELS)}, "
                 f"got {self.claude_effort!r}"
+            )
+        if self.claude_max_turns < 1:
+            raise ConfigurationError(
+                "COUNCIL_CLAUDE_MAX_TURNS must be at least 1; a call that is allowed no "
+                f"turns cannot produce a response, got {self.claude_max_turns}"
             )
 
     @property
@@ -260,6 +279,7 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         or DEFAULT_CLAUDE_MODEL,
         claude_effort=os.environ.get("COUNCIL_CLAUDE_EFFORT", DEFAULT_CLAUDE_EFFORT).strip()
         or DEFAULT_CLAUDE_EFFORT,
+        claude_max_turns=_int("COUNCIL_CLAUDE_MAX_TURNS", DEFAULT_CLAUDE_MAX_TURNS),
         data_root=Path(os.environ.get("DATA_ROOT", "./jobs")).expanduser(),
         max_repair_attempts=_int("MAX_REPAIR_ATTEMPTS", DEFAULT_MAX_REPAIR_ATTEMPTS),
         max_validation_rounds=_int("MAX_VALIDATION_ROUNDS", 2),

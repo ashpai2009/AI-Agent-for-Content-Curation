@@ -168,7 +168,11 @@ FINAL_GATE_ROUND = 1_000
 #: read as evidence that the mechanism does. The CLI at 2.1.219 offers no output-token
 #: ceiling (`--max-thinking-tokens` and `--task-budget` are different things), so the
 #: honest record is silence.
-CLI_ADAPTER_VERSION = 1
+#: 2 (2026-08-16): `--max-turns` went from a hardcoded 1 to `COUNCIL_CLAUDE_MAX_TURNS`,
+#: defaulting to 2, after 1 was measured to abort correct calls before their structured
+#: output arrived. That changes what every call carries, which is exactly what this
+#: constant exists to record -- a job that started under 1 must not finish under 2.
+CLI_ADAPTER_VERSION = 2
 
 
 class BudgetExhausted(Exception):

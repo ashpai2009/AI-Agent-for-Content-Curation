@@ -12,6 +12,7 @@ import pytest
 
 from conftest import cells, hint, problem, scaffold, step
 from oatutor_council.models import (
+    DependencyConvention,
     CellEdit,
     ColumnKey,
     Issue,
@@ -641,10 +642,12 @@ def test_a_shift_repair_that_duplicates_content_is_refused(parsed, block):
         block,
         parsed,
     )
-    # Caught precisely by the uniqueness invariant rather than by counting values:
-    # `s1` would then exist on two rows.
-    assert result.rejection.code is RejectionCode.STRUCTURAL_BLOCK_INVARIANT_BROKEN
-    assert "duplicate identifiers" in result.rejection.message
+    # Caught by uniqueness rather than by counting values: `s1` would exist on two rows.
+    # The uniqueness question is asked by the rule engine, which knows the workbook's
+    # identifier convention -- so the refusal arrives as a regression rather than as a
+    # block invariant. What matters is that it arrives and names the right defect.
+    assert result.rejection.code is RejectionCode.RULE_VIOLATION
+    assert "DUPLICATE_IDENTIFIER" in result.rejection.detail["codes"]
 
 
 def test_a_patch_that_would_split_the_block_is_refused(parsed, block):
@@ -672,16 +675,17 @@ def test_a_patch_that_empties_the_problem_name_is_refused(parsed, block):
 
 
 def test_a_patch_leaving_a_dangling_dependency_is_refused(parsed, block):
-    """Condition 5: the complete resulting block is simulated and must satisfy the
-    dependency invariant before anything is written."""
+    """The complete resulting block is simulated and must satisfy the dependency
+    invariant before anything is written — asked of the rule engine, which resolves a
+    dependency within its own step rather than across the block."""
     result = check(
         make_patch(edit(4, ColumnKey.HINT_ID, "s1", "s9")),
         make_issue(is_structural=True, category=IssueCategory.STRUCTURE),
         block,
         parsed,
     )
-    assert result.rejection.code is RejectionCode.STRUCTURAL_BLOCK_INVARIANT_BROKEN
-    assert "would depend on" in result.rejection.message
+    assert result.rejection.code is RejectionCode.RULE_VIOLATION
+    assert "DEPENDENCY_UNRESOLVED" in result.rejection.detail["codes"]
 
 
 def test_a_patch_creating_duplicate_identifiers_is_refused(parsed, block):
@@ -694,8 +698,96 @@ def test_a_patch_creating_duplicate_identifiers_is_refused(parsed, block):
         block,
         parsed,
     )
-    assert result.rejection.code is RejectionCode.STRUCTURAL_BLOCK_INVARIANT_BROKEN
-    assert "duplicate identifiers" in result.rejection.message
+    assert result.rejection.code is RejectionCode.RULE_VIOLATION
+    assert "DUPLICATE_IDENTIFIER" in result.rejection.detail["codes"]
+
+
+# -- reset-per-step numbering ----------------------------------------------------------
+#
+# The live regression these exist for. A workbook that restarts identifiers at every step
+# is *correct* under `RESET_PER_STEP`, and the gate was reading each step's `h1` as a
+# duplicate of the last one's. The condition was pre-existing, so it was not something a
+# patch could clear: every repair inside a multi-step problem was refused three times and
+# the issue walked to `NEEDS_HUMAN_REVIEW` with its budget spent. Eight of nine misses on
+# a real workbook came from this one check.
+
+
+@pytest.fixture
+def multi_step_parsed(make_workbook):
+    """Two steps, each with its own `h1`/`h2`, each depending within its own step."""
+    return read_workbook(
+        make_workbook(
+            [
+                problem("angles2", title="Convert", oer_src="s", license="CC"),
+                step("angles2", answer="pi/6", answer_type="algebra"),
+                hint("angles2", "h1", body="Start from degrees."),
+                hint("angles2", "h2", body="Multiply by pi/180.", dependency="h1"),
+                step("angles2", answer="pi/3", answer_type="algebra"),
+                hint("angles2", "h1", body="Same conversion again."),
+                hint("angles2", "h2", body="Now for sixty.", dependency="h1"),
+            ]
+        )
+    )
+
+
+def test_reused_identifiers_across_steps_do_not_block_an_unrelated_repair(
+    multi_step_parsed,
+):
+    """The regression, stated as the curator would: a correct repair must not be refused
+    because a *different* step reuses `h1` exactly as the convention says it should."""
+    block = multi_step_parsed.blocks[0]
+    assert [row.get(ColumnKey.HINT_ID) for row in block.rows].count("h1") == 2
+    # Stated rather than assumed: if the reader ever stopped calling this reset-per-step,
+    # the test would still pass on the delta alone and quietly stop testing the scope.
+    assert (
+        multi_step_parsed.conventions.dependency_convention
+        is DependencyConvention.RESET_PER_STEP
+    )
+
+    result = check(
+        make_patch(edit(4, ColumnKey.BODY_TEXT, "Start from degrees.", "Begin in degrees.")),
+        make_issue(),
+        block,
+        multi_step_parsed,
+    )
+
+    assert result.rejection is None
+
+
+def test_a_duplicate_within_one_step_is_still_refused(multi_step_parsed):
+    """The exemption is per step, not per block. Two `h2` rows under the *same* step is
+    the defect the check exists for, and it must still fire."""
+    block = multi_step_parsed.blocks[0]
+    result = check(
+        make_patch(edit(4, ColumnKey.HINT_ID, "h1", "h2")),
+        make_issue(is_structural=True, category=IssueCategory.STRUCTURE),
+        block,
+        multi_step_parsed,
+    )
+
+    assert result.rejection is not None
+    assert "DUPLICATE_IDENTIFIER" in result.rejection.detail["codes"]
+
+
+def test_a_pre_existing_defect_does_not_make_every_patch_unapplyable(parsed, block):
+    """The second half of the same bug, independent of scoping.
+
+    The identifier checks ran *absolutely* over the patched block rather than as a delta,
+    so a block that arrived with a dangling dependency could never be repaired at all —
+    the gate refused every patch for a defect the patch had not introduced. A workbook
+    full of pre-existing defects is the only kind anyone uploads.
+    """
+    broken = simulate_block(block, (edit(5, ColumnKey.DEPENDENCY, "s1", "s404"),))
+    patched_parsed = parsed.model_copy(update={"blocks": (broken,)})
+
+    result = check(
+        make_patch(edit(4, ColumnKey.ANSWER, "30", "30 degrees")),
+        make_issue(),
+        broken,
+        patched_parsed,
+    )
+
+    assert result.rejection is None
 
 
 # --------------------------------------------------------------------------------------

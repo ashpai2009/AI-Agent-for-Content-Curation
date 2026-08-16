@@ -471,6 +471,19 @@ function Result({
   // Artefacts exist for the first two; a job that failed mid-pipeline may have none.
   const downloadable = status.state === "succeeded" || status.state === "needs_human_attention";
 
+  // Remaining findings are split by severity rather than counted together, because the two
+  // halves mean opposite things to a curator. `blocking`/`error` is work left undone.
+  // `warning`/`observation` is the council reporting something it deliberately never
+  // corrects -- the correct MC answer sitting first, or an optional header this workbook
+  // does not carry. Counting them as one number told a curator whose workbook was finished
+  // that it was not, which is the failure mode this whole system exists to avoid.
+  const openErrors = report.remaining_findings.filter(
+    (f) => f.severity === "blocking" || f.severity === "error",
+  );
+  const observations = report.remaining_findings.filter(
+    (f) => f.severity !== "blocking" && f.severity !== "error",
+  );
+
   return (
     <>
       <section className="card">
@@ -493,8 +506,12 @@ function Result({
             <dd>{report.changes_applied}</dd>
           </div>
           <div>
-            <dt>Still open</dt>
-            <dd>{report.remaining_findings.length}</dd>
+            <dt>Open errors</dt>
+            <dd>{openErrors.length}</dd>
+          </div>
+          <div>
+            <dt>Observations</dt>
+            <dd>{observations.length}</dd>
           </div>
         </dl>
 
@@ -542,11 +559,19 @@ function Result({
         </section>
       )}
 
-      {report.remaining_findings.length > 0 && (
+      {openErrors.length > 0 && (
         <Findings
-          title="Still flagged"
-          hint="Present in the workbook as handed back. Most are observations that are reported and never auto-corrected."
-          findings={report.remaining_findings}
+          title="Open errors"
+          hint="Still present in the workbook as handed back, and still work to do."
+          findings={openErrors}
+        />
+      )}
+
+      {observations.length > 0 && (
+        <Findings
+          title="Observations"
+          hint="Reported, never auto-corrected, and not a reason to hold the workbook back — a correct answer sitting first among the choices, or an optional column this workbook does not use."
+          findings={observations}
         />
       )}
 

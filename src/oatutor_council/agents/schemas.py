@@ -47,11 +47,31 @@ ColumnName = Literal[
 
 class AuditorFinding(BaseModel):
     rows: list[int] = Field(description="Spreadsheet rows the defect concerns")
-    columns: list[ColumnName] = Field(default_factory=list)
+    #: The repair is authorised against these cells, so naming the column where the defect
+    #: was *noticed* rather than the column that must *change* produces a correction the
+    #: gate refuses and a defect that survives the job. An `answerType` of `numeric` over
+    #: an algebraic answer is a defect in `answerType`, not in `Answer`.
+    columns: list[ColumnName] = Field(
+        default_factory=list,
+        description=(
+            "The column(s) that must change to fix this. Not where the problem was "
+            "noticed -- if a correct answer is labelled with the wrong answerType, the "
+            "column is answerType"
+        ),
+    )
     problem: str = Field(description="What is wrong, in one sentence")
     expected: str = Field(default="", description="What the content should be, if known")
     severity: Severity = Severity.ERROR
-    category: IssueCategory = IssueCategory.MATHEMATICS
+    #: Structural columns are repairable only under a finding that classifies itself as
+    #: structural, so this field decides whether the defect can be fixed at all.
+    category: IssueCategory = Field(
+        default=IssueCategory.MATHEMATICS,
+        description=(
+            "Use structure, row_type or dependency for a defect in Problem Name, Row "
+            "Type, answerType, HintID/Scaffold ID or Dependency -- those corrections are "
+            "refused under a mathematics finding"
+        ),
+    )
     #: Index into the seed claims supplied with the request, when this finding confirms
     #: one. `None` means the auditor found it independently.
     confirms_claim: int | None = None

@@ -151,11 +151,17 @@ def build_command(settings: Settings, request: LLMRequest) -> list[str]:
         "--system-prompt", request.system_prompt,
         # The empty string is load-bearing. Omit it and every built-in tool is enabled.
         "--tools", "",
-        # One turn, stated rather than inferred. `--tools ""` already leaves nothing to
-        # iterate on, but that is an argument about what the model *should* have no reason
-        # to do; this is the CLI refusing to let it. Two independent limits, because the
-        # thing being bounded is spend on somebody's subscription.
-        "--max-turns", "1",
+        # Stated rather than inferred. `--tools ""` already leaves nothing to iterate on,
+        # but that is an argument about what the model *should* have no reason to do; this
+        # is the CLI refusing to let it. Two independent limits, because the thing being
+        # bounded is spend on somebody's subscription.
+        #
+        # **The value is 2, and 1 was measured to be worse on both counts.** At 1 the live
+        # pilot lost four independent-review calls to `Reached maximum number of turns (1)`
+        # before the structured output was emitted; retry recovered every one, so the
+        # ceiling meant to save calls was spending whole extra ones. A limit that fires on
+        # correct work is not a limit, it is a retry loop with a confusing error message.
+        "--max-turns", str(settings.claude_max_turns),
         "--safe-mode",
         "--disable-slash-commands",
         "--strict-mcp-config",

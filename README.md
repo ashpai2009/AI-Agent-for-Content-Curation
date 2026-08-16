@@ -152,6 +152,14 @@ go through the same `RULES | ERRATA | NOTES` classification and the same untrust
 fencing as an attached file. The agents' own prompts stay in the service and are never
 served to the page.
 
+What is left over is reported in two figures, never one: **open errors** (`blocking` and
+`error` — work still to do) and **observations** (`warning` and `observation` — things the
+council reports and deliberately never corrects, like a correct answer that happens to be
+listed first, or an optional column this workbook does not use). They are counted apart
+because a single total makes a finished workbook look unfinished, and a curator who cannot
+trust the summary has to re-check the file by hand, which is the whole job they came here to
+avoid.
+
 `web/README.md` has the rest.
 
 ---
@@ -316,9 +324,21 @@ The properties that matter:
 - **A restricted child environment** built by allowlist, dropping every credential variable.
 - **A timeout kills the whole process group**, because the CLI spawns helpers that would
   otherwise outlive it.
+- **`--max-turns 2`** (`COUNCIL_CLAUDE_MAX_TURNS`), a ceiling the CLI enforces rather than one
+  inferred from having no tools. It was 1 until a live run lost four calls to `Reached maximum
+  number of turns (1)` before their structured output arrived — retry recovered every one, so
+  a limit meant to bound spend was buying extra billed processes instead. Raise it further only
+  on the same kind of evidence.
 
 Settings are prefixed `COUNCIL_` because `CLAUDE_EFFORT` is a variable the CLI itself sets:
 unprefixed, the service would inherit an effort level from whatever session launched it.
+
+**The adapter is versioned, and the version is pinned per job.** `CLI_ADAPTER_VERSION` decides
+what flags every call carries, so a job that started under one set and finished under another
+finished under instructions its first half never saw — and its own record would say otherwise.
+A job whose pin disagrees with the running process fails as `FAILED(CONFIG)` on resume rather
+than continuing. Two practical consequences: changing anything in `build_command` means bumping
+the constant, and bumping it means in-flight jobs must be resubmitted rather than resumed.
 
 Failures are classified rather than lumped together, because they need opposite handling:
 
@@ -439,21 +459,34 @@ are judgments about *what makes a good repair*, which is Writer-prompt territory
 the open work, and they are recorded here rather than smoothed over because a pilot that only
 reports its score stops being evidence.
 
-**A later run on a different 15-problem workbook (2026-08-16) failed on the isolation
-false positive described above**, before any reviewer ran, so it says nothing about repair
-quality. It did surface two detection misses worth naming, because both are the same species
-as the editorial gaps: a trigonometry problem answered with the smaller solution where the
-question asks for the larger, and a multiple-choice problem answered with a real solution
-where the question asks for the non-solution. Valid mathematics answering a different question
-from the one on the page — invisible to every rule, and the reason the golden collection gets
-the next of these rather than a live run.
+**A later run on a harder 15-problem workbook (2026-08-16) first failed on the isolation
+false positive described above**, before any reviewer ran. After that fix the rerun passed at
+100% correctness and precision.
 
-One UI wording gap surfaced alongside them: the page reports **`STILL OPEN 1`** for a job with
-zero unresolved errors. The remaining item is the low-severity observation that the correct
-multiple-choice answer appears first — reported everywhere and deliberately never
-auto-corrected, since the rules require exact matching and never shuffling. Counting it beside
-errors tells a curator their finished workbook still needs work. It should read `OPEN ERRORS: 0`
-and `OBSERVATIONS: 1`.
+It surfaced two detection misses worth naming, because both are the same species as the
+editorial gaps: a trigonometry problem answered with the smaller solution where the question
+asks for the larger, and a multiple-choice problem answered with a real solution where the
+question asks for the non-solution. Valid mathematics answering a different question from the
+one on the page — invisible to every rule, and the reason the golden collection gets the next
+of these rather than a live run.
+
+It also produced two software fixes. `--max-turns` was 1, and four independent-review calls
+died on `Reached maximum number of turns (1)` before emitting their structured output; retry
+recovered every one, which made the ceiling a source of extra billed processes rather than a
+brake on them. It is now `COUNCIL_CLAUDE_MAX_TURNS`, default 2. And the page counted warnings
+and observations together under "still open", which told a curator that a finished workbook
+was unfinished; open errors and observations are now separate figures.
+
+That second fix is worth stating as a rule rather than an incident. The backend was already
+right — `ledger.unresolved` deliberately excludes observations and non-repairable warnings,
+which is why the job reported `succeeded` — and only the page disagreed with it. A count that
+adds "the correct answer is listed first" and "this workbook omits an optional header" to the
+errors is a page telling a curator their finished work is unfinished, which is the exact
+failure this system exists to prevent, arriving through the one component nobody was auditing
+for it.
+
+The pilot has nothing left to teach. The next live test is a real workbook, on a copy, through
+`scripts/shadow_run.py`.
 
 ---
 

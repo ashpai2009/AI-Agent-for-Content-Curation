@@ -159,17 +159,40 @@ def test_the_argument_list_is_the_one_that_was_verified(tmp_path, recorder):
         assert flag in sent, flag
 
 
-def test_the_call_is_capped_at_one_turn(tmp_path, recorder):
+def test_the_call_carries_the_configured_turn_ceiling(tmp_path, recorder):
     """`--max-turns` was left out of this list once, on the evidence that the CLI's
     abbreviated `--help` does not mention it -- when the binary carries both the flag and
     its description and the published reference documents it. `--tools ""` already leaves
     nothing to iterate on, but a limit the CLI enforces is worth more than a limit that
-    follows from an argument about what the model should have no reason to do."""
+    follows from an argument about what the model should have no reason to do.
+
+    The value is **2**. At 1 the live pilot lost four independent-review calls to
+    `Reached maximum number of turns (1)` before the structured output arrived, and retry
+    recovered every one -- so the ceiling meant to bound spend was buying extra calls."""
     executable, args, _, _ = recorder
-    ClaudeCLIClient(settings(tmp_path, executable)).complete(request())
+    configured = settings(tmp_path, executable)
+    assert configured.claude_max_turns == 2
+
+    ClaudeCLIClient(configured).complete(request())
+    sent = args.read_text().splitlines()
+
+    assert sent[sent.index("--max-turns") + 1] == str(configured.claude_max_turns)
+
+
+def test_the_turn_ceiling_is_a_setting_rather_than_a_literal(tmp_path, recorder):
+    """It is a fuse: tightenable in an incident without a redeploy."""
+    executable, args, _, _ = recorder
+    ClaudeCLIClient(settings(tmp_path, executable, claude_max_turns=1)).complete(request())
     sent = args.read_text().splitlines()
 
     assert sent[sent.index("--max-turns") + 1] == "1"
+
+
+def test_a_turn_ceiling_below_one_is_refused(tmp_path):
+    """Zero turns cannot produce a response, so it is a configuration error rather than a
+    very tight budget."""
+    with pytest.raises(ConfigurationError, match="at least 1"):
+        settings(tmp_path, "claude", claude_max_turns=0)
 
 
 def test_tools_are_disabled_with_an_explicit_empty_argument(tmp_path, recorder):

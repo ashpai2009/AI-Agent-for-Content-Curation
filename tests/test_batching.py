@@ -31,7 +31,7 @@ from oatutor_council.agents.schemas import (
     WriterResponse,
 )
 from oatutor_council.config import Settings
-from oatutor_council.council import CurationCouncil
+from oatutor_council.council import CLI_ADAPTER_VERSION, CurationCouncil
 from oatutor_council.llm.base import AgentRole
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import CurationJob, FailureReason, JobState, SourcePath
@@ -617,11 +617,15 @@ def test_a_job_resumed_under_a_different_adapter_stops_rather_than_carrying_on(s
     ran under different flags, with its own record insisting they did not."""
     db, copy = setup
     council(setup, batched_client(), scan_batch_size=3).run(max_steps=2)
-    assert load_job_settings(db, "job-1")["cli_adapter_version"] == 1
+    # Whatever the running code says, not a literal -- the constant is meant to be bumped,
+    # and a test that has to be edited on every bump is a test people learn to edit.
+    assert load_job_settings(db, "job-1")["cli_adapter_version"] == CLI_ADAPTER_VERSION
 
     # A deployment lands while the job is in flight.
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr("oatutor_council.council.CLI_ADAPTER_VERSION", 2)
+        patch.setattr(
+            "oatutor_council.council.CLI_ADAPTER_VERSION", CLI_ADAPTER_VERSION + 1
+        )
         result = council(setup, batched_client(), scan_batch_size=3).run()
 
     assert result.state is JobState.FAILED
