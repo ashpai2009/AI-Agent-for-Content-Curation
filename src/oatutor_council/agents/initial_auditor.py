@@ -155,7 +155,15 @@ def audit_block(
     if taint is not None:
         # The auditor sees no private text today, but the check runs anyway: the cost is
         # nothing and the guarantee should not depend on that staying true.
-        taint.assert_clean(payload, context="initial_auditor")
+        #
+        # Every section here is the workbook, a deterministic finding, or the curator's
+        # own document -- public by provenance. Enumerated from the sections so a section
+        # added later carrying agent prose is still checked rather than silently exempt.
+        taint.assert_clean(
+            payload,
+            context="initial_auditor",
+            public=tuple(section.content for section in sections),
+        )
 
     response = call_structured(
         client,
@@ -349,7 +357,13 @@ def audit_blocks(
     bundle = ContextBundle.build(BATCH_INSTRUCTIONS, sections)
     payload = bundle.render()
     if taint is not None:
-        taint.assert_clean(payload, context="initial_auditor")
+        # As in the single-block path: workbook, deterministic findings and the curator's
+        # document, enumerated rather than blanket-exempted.
+        taint.assert_clean(
+            payload,
+            context="initial_auditor",
+            public=tuple(section.content for section in sections),
+        )
 
     response = call_structured(
         client,

@@ -19,7 +19,10 @@ Three mechanisms, in increasing order of paranoia:
 3. **`TaintRegistry.assert_clean` runs before every dispatch.** Types catch the leak
    someone declared; this catches the one someone pasted. It compares exact text *and*
    12-token shingles, because a paraphrase or a partial quote defeats exact matching
-   while still handing the reviewer the Writer's argument.
+   while still handing the reviewer the Writer's argument. Matches explained by **public
+   ground** -- the workbook, the curator's document, the deterministic findings -- are
+   subtracted first: a derivation quotes the cells it reasons about, the reviewer is
+   shown those same cells, and the shared mathematics is a quotation rather than a leak.
 
 A violation is `ContextIsolationError` and terminates the job as
 `FAILED(ISOLATION_VIOLATION)`. Never a warning, never a retry: a retry would send the
@@ -252,12 +255,34 @@ class TaintRegistry:
             registry.register(label, text)
         return registry
 
-    def assert_clean(self, payload: str, *, context: str) -> None:
+    def assert_clean(
+        self, payload: str, *, context: str, public: Iterable[str] = ()
+    ) -> None:
         """Refuse to dispatch a payload carrying registered private text.
 
         Exact containment catches a copy-paste. Shingle overlap catches the paraphrase,
         the partial quote, and the summary -- all of which hand the reviewer the argument
         while defeating an exact match.
+
+        **`public` is the ground truth that stops a quotation looking like a leak.** A
+        Writer's derivation quotes the cells it is reasoning about -- that is what a
+        derivation *is* -- and those same cells are rendered into the reviewer's block,
+        because the reviewer is judging them. Twelve consecutive tokens of shared
+        mathematics is therefore the normal case rather than evidence of anything, and
+        treating it as a violation failed a live job whose first repair was correct.
+
+        So a span is disqualifying only when it is **not** explained by public ground:
+        `public` shingles are subtracted from each private entry before the comparison,
+        and an entry that is wholly a public quotation is skipped.
+
+        What `public` must never be is *the payload itself*. Passing the outgoing text
+        back in would subtract everything from everything and leave a check that cannot
+        fail -- mechanism 3 deleted while still appearing to run. Callers pass only text
+        whose **provenance** is the curator's workbook, the curator's own document, or the
+        deterministic rule engine: sources that contain no agent prose and so cannot
+        launder a rationale. Agent-authored free text (an issue summary an auditor wrote)
+        is deliberately not public ground, because that is exactly where a rationale could
+        be smuggled and then declared exempt.
         """
         if not self.entries:
             return
@@ -265,8 +290,13 @@ class TaintRegistry:
         # Padded so containment matches on token boundaries. Without the padding, the
         # private string `"d"` matches inside the word `"old"` and every payload is a
         # violation.
-        haystack = f" {' '.join(_tokens(payload))} "
-        payload_shingles = _shingles(_tokens(payload))
+        payload_tokens = _tokens(payload)
+        haystack = f" {' '.join(payload_tokens)} "
+        payload_shingles = _shingles(payload_tokens)
+
+        public_tokens = _tokens("\n".join(public))
+        public_haystack = f" {' '.join(public_tokens)} " if public_tokens else ""
+        public_shingles = _shingles(public_tokens)
 
         for label, private in self.entries.items():
             private_tokens = _tokens(private)
@@ -276,18 +306,27 @@ class TaintRegistry:
             # Reasoning shorter than a shingle produces none, so exact containment is the
             # only check available for it -- and is sufficient, since there is little to
             # paraphrase in a sentence that short.
-            if f" {' '.join(private_tokens)} " in haystack:
+            sequence = f" {' '.join(private_tokens)} "
+            if sequence in haystack:
+                # The entry reached the payload -- but if the identical run of tokens is
+                # also in the workbook, what reached it was the workbook.
+                if public_haystack and sequence in public_haystack:
+                    continue
                 raise ContextIsolationError(
                     f"{context} payload contains private text registered as {label!r}",
                     label=label,
                     context=context,
                 )
 
-            overlap = _shingles(private_tokens) & payload_shingles
+            # Only the spans this private text does not share with public ground can
+            # testify that private text is what arrived.
+            distinctive = _shingles(private_tokens) - public_shingles
+            overlap = distinctive & payload_shingles
             if overlap:
                 raise ContextIsolationError(
                     f"{context} payload shares a {SHINGLE_SIZE}-token sequence with "
-                    f"private text {label!r}, which means a paraphrase or partial quote "
+                    f"private text {label!r} that does not appear in the workbook or the "
+                    "deterministic findings, which means a paraphrase or partial quote "
                     "reached it",
                     label=label,
                     context=context,

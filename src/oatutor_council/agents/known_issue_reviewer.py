@@ -100,7 +100,27 @@ def review(
     if taint is not None:
         # The load-bearing check. A violation raises and the job fails; it is never
         # downgraded to a warning, because a leaked review still counts as a review.
-        taint.assert_clean(payload, context=role.value)
+        #
+        # Public ground is the workbook and the rule engine -- the block before, the block
+        # now, the diff between them, the conventions and the deterministic findings. A
+        # Writer's derivation quotes those cells because that is what reasoning about a
+        # cell looks like, and the reviewer is shown the same cells because that is what
+        # it is judging; without this the overlap reads as a leak and fails a correct job.
+        #
+        # `issue_summary` is **not** on this list. It can carry prose an agent wrote, and
+        # exempting it would let a rationale smuggled into a description exempt itself.
+        taint.assert_clean(
+            payload,
+            context=role.value,
+            public=(
+                context.original_block,
+                context.current_block,
+                context.block_diff,
+                context.conventions,
+                context.deterministic_findings,
+                context.curator_rules,
+            ),
+        )
 
     agent_role = (
         AgentRole.KNOWN_ISSUE_REVIEWER

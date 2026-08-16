@@ -72,27 +72,31 @@ def sweep_block(
     #: is right for a call made outside a job and wrong for one made inside it.
     prompt_version: int | None = None,
 ) -> SweepResult:
+    # Named rather than inlined because the taint check needs the same strings as public
+    # ground: they come from the workbook and the rule engine, so a private entry that
+    # merely quotes them is a quotation and not a leak.
+    block_text = render_block(block)
+    conventions_text = render_conventions(conventions)
+    findings_text = render_findings(deterministic_findings)
+    rules_text = "\n".join(f"- {rule}" for rule in curator_rules)
+
     sections = [
-        DataSection("The problem block", render_block(block)),
-        DataSection(
-            "Conventions this workbook follows", render_conventions(conventions)
-        ),
-        DataSection(
-            "Deterministic findings for this block",
-            render_findings(deterministic_findings),
-        ),
+        DataSection("The problem block", block_text),
+        DataSection("Conventions this workbook follows", conventions_text),
+        DataSection("Deterministic findings for this block", findings_text),
     ]
     if curator_rules:
         sections.append(
-            DataSection(
-                "Curation rules the curator supplied",
-                "\n".join(f"- {rule}" for rule in curator_rules),
-            )
+            DataSection("Curation rules the curator supplied", rules_text)
         )
     bundle = ContextBundle.build(INSTRUCTIONS, sections)
     payload = bundle.render()
     if taint is not None:
-        taint.assert_clean(payload, context="independent_reviewer")
+        taint.assert_clean(
+            payload,
+            context="independent_reviewer",
+            public=(block_text, conventions_text, findings_text, rules_text),
+        )
 
     response = call_structured(
         client,
@@ -238,7 +242,16 @@ def sweep_blocks(
     bundle = ContextBundle.build(BATCH_INSTRUCTIONS, sections)
     payload = bundle.render()
     if taint is not None:
-        taint.assert_clean(payload, context="independent_reviewer")
+        # Every section above is workbook content, a rendered convention, a deterministic
+        # finding, or the curator's own rules -- all public by provenance, so all of them
+        # are public ground. This is enumerated from the sections rather than written as
+        # "the whole payload" on purpose: a section added later that carries agent prose
+        # will not appear here, and so will still be checked.
+        taint.assert_clean(
+            payload,
+            context="independent_reviewer",
+            public=tuple(section.content for section in sections),
+        )
 
     response = call_structured(
         client,

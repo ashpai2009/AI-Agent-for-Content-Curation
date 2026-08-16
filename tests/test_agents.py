@@ -214,6 +214,111 @@ def test_an_empty_registry_permits_everything():
     TaintRegistry().assert_clean(RATIONALE, context="reviewer")
 
 
+# -- public ground ---------------------------------------------------------------------
+#
+# The live failure these cover: a job whose first repair was correct was killed before its
+# reviewer ran, because the Writer's derivation quoted the cells it was reasoning about and
+# the reviewer was shown those same cells. Twelve tokens of shared mathematics is what a
+# derivation and a block rendering *always* have in common.
+
+
+#: A derivation that is almost entirely a quotation of the block it reasons about.
+QUOTING_DERIVATION = (
+    "The choices are 1/2, 3/4, 0.75, 2/3 and the answer column reads 3/4, so the answer "
+    "3/4 matches the choice 3/4 exactly and the duplicate 0.75 is the cell to change."
+)
+
+#: What the reviewer is legitimately shown, containing the same mathematics.
+PUBLIC_BLOCK = (
+    "row 11 | mc | Which fraction equals three quarters? | answer: 3/4 | "
+    "mcChoices: 1/2, 3/4, 0.75, 2/3 | the choices are 1/2, 3/4, 0.75, 2/3 and the answer "
+    "column reads 3/4, so the answer 3/4 matches the choice 3/4 exactly"
+)
+
+
+def test_mathematics_quoted_from_the_workbook_is_not_a_leak():
+    """The regression. Without public ground this raises and the job dies mid-repair."""
+    registry = TaintRegistry()
+    registry.register("writer.issue-1.1", QUOTING_DERIVATION)
+    registry.assert_clean(
+        f"Review this block. {PUBLIC_BLOCK}",
+        context="known_issue_reviewer",
+        public=(PUBLIC_BLOCK,),
+    )
+
+
+def test_public_ground_does_not_excuse_reasoning_that_is_not_in_it():
+    """The other half: the exemption must not become a way to pass anything.
+
+    The payload carries the block *and* the Writer's argument about it. The argument
+    appears nowhere in the block, so subtracting public ground leaves it exposed — by
+    exact containment when it is copied, and by shingle when it is paraphrased.
+    """
+    registry = TaintRegistry()
+    registry.register("writer.issue-1.1", RATIONALE)
+
+    with pytest.raises(ContextIsolationError, match="private text"):
+        registry.assert_clean(
+            f"Review this block. {PUBLIC_BLOCK} Note from the writer: {RATIONALE}",
+            context="known_issue_reviewer",
+            public=(PUBLIC_BLOCK,),
+        )
+
+    paraphrase = (
+        "converting thirty degrees to radians requires multiplying by pi over one "
+        "hundred and eighty, which gives pi over six"
+    )
+    with pytest.raises(ContextIsolationError, match=f"{SHINGLE_SIZE}-token"):
+        registry.assert_clean(
+            f"Review this block. {PUBLIC_BLOCK} {paraphrase}",
+            context="known_issue_reviewer",
+            public=(PUBLIC_BLOCK,),
+        )
+
+
+def test_a_short_private_string_that_is_itself_public_is_not_a_leak():
+    """The exact-containment path needs the same exemption as the shingle path.
+
+    `mcChoices: 1/2, 3/4, 0.75, 2/3` is a cell value. It reaching a reviewer is the
+    reviewer being shown the workbook.
+    """
+    quoted_cell = "mcChoices: 1/2, 3/4, 0.75, 2/3"
+    registry = TaintRegistry()
+    registry.register("writer.issue-1.1", quoted_cell)
+    registry.assert_clean(
+        f"Review this block. {PUBLIC_BLOCK}",
+        context="known_issue_reviewer",
+        public=(PUBLIC_BLOCK,),
+    )
+    # Same string, no public ground offered: the old behaviour is intact.
+    with pytest.raises(ContextIsolationError):
+        registry.assert_clean(
+            f"Review this block. {quoted_cell}", context="known_issue_reviewer"
+        )
+
+
+def test_public_ground_is_not_the_payload():
+    """A caller that passed the outgoing payload as its own public ground would delete the
+    check while leaving it apparently in place. Nothing in the package does that, and this
+    records what it would cost: a leak that sails through.
+
+    The assertion is deliberately the *broken* behaviour, so that if someone ever wires a
+    call site up this way the reason it is wrong is written down next to it.
+    """
+    registry = TaintRegistry()
+    registry.register("writer.issue-1.1", RATIONALE)
+    leaking_payload = f"Review this block. {PUBLIC_BLOCK} {RATIONALE}"
+
+    registry.assert_clean(
+        leaking_payload, context="reviewer", public=(leaking_payload,)
+    )  # passes, and must never be how a call site is written
+
+    with pytest.raises(ContextIsolationError):
+        registry.assert_clean(
+            leaking_payload, context="reviewer", public=(PUBLIC_BLOCK,)
+        )
+
+
 # --------------------------------------------------------------------------------------
 # Initial Auditor
 # --------------------------------------------------------------------------------------

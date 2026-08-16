@@ -215,6 +215,14 @@ violation fails the job — never a warning, never a retry. The registry is rebu
 database on every resume: one that lived only in the worker would be a guarantee that ended
 at the first crash, since the reasoning it was watching for is still on the patch.
 
+Text that is public **by provenance** — the workbook, the curator's document, the
+deterministic findings — is subtracted before that comparison, and the check is worthless
+without it. A derivation quotes the cells it reasons about; the reviewer is shown those same
+cells because they are what it is judging; twelve consecutive tokens of shared mathematics is
+the ordinary case rather than evidence of a leak. Reading it as one killed a live job whose
+first repair was correct. What is never public ground is the outgoing payload itself, which
+would subtract everything from everything and leave a check that cannot fail.
+
 **Every model call is written down.** One row per request — role, model, status, prompt
 hash, pinned prompt version, latency, token usage, and the exact prompt text — including
 the calls that failed, with the provider's own status. The recording is a wrapper around
@@ -385,8 +393,67 @@ read-only, hashing every file before and after.
 **`scripts/shadow_run.py`** runs the *whole council* over a **copy** of one real workbook
 and prints what a real job would report. Offline by default — the scripted agents examine
 and never edit — with `--live` as an explicit opt-in that says what it is about to send
-before it sends it. `scripts/smoke_provider.py` makes one live call with invented
+before it sends it. `scripts/smoke_claude_cli.py` makes one live call with invented
 arithmetic and no workbook content at all.
+
+### What the controlled live pilot established (15 problems, 2026-08-15)
+
+A 15-problem workbook — ten planted defects, five deliberately correct problems — run end to
+end against live Claude on the subscription CLI. Every number below is from that run:
+
+| | |
+| --- | --- |
+| Planted defects detected | **10 / 10** |
+| Planted defects repaired | **10 / 10** under the evaluation key |
+| Clean problems left untouched | **5 / 5** |
+| Cells changed | **exactly 10**, all in expected locations |
+| False-positive corrections | **none** |
+| Downloaded workbook vs job output | identical |
+
+The report showed **12 findings against 10 defects**: two defects each raised a pair of
+related findings, and in both cases a single repair resolved both. That is the intended
+behaviour rather than double-counting — the finding is what a rule saw, the issue is what
+gets repaired, and the two are deliberately not the same number.
+
+This run cleared the bar the previous pilot missed. That one found 10/10 and repaired only
+5/10, because deterministic gate rejections were never returned to the Writer and semantic
+duplicates could stay open after a sibling repair had already fixed them. Both are fixed,
+and this pilot is the evidence that the fixes work against live Claude rather than only
+against the scripted client.
+
+**Two editorial reservations the evaluation key does not capture**, and they are the more
+interesting half of the result. Both repairs below pass every deterministic gate, pass their
+reviewer, and are counted correct by the key — and a curator would still rewrite them:
+
+- A "Which fraction…" problem had its `Answer` changed from `3/4` to `0.75`. The mathematics
+  is equivalent and the choice now matches exactly, which is all the gates and the key ask
+  for. But the question asks for a *fraction*, so the correct repair was the other direction:
+  keep `3/4` and fix the choice that read `0.75`. Nothing in the system currently knows that
+  a question's wording constrains which side of a mismatch should move.
+- A new hint gave away the final answer (`5+5=10`) for a `2*5` problem. A hint that states the
+  answer is a hint that does no work; "rewrite `2*5` as adding 5 two times" is the same repair
+  done properly.
+
+Neither is a correctness bug, and neither should be chased with a deterministic rule — both
+are judgments about *what makes a good repair*, which is Writer-prompt territory. They are
+the open work, and they are recorded here rather than smoothed over because a pilot that only
+reports its score stops being evidence.
+
+**A later run on a different 15-problem workbook (2026-08-16) failed on the isolation
+false positive described above**, before any reviewer ran, so it says nothing about repair
+quality. It did surface two detection misses worth naming, because both are the same species
+as the editorial gaps: a trigonometry problem answered with the smaller solution where the
+question asks for the larger, and a multiple-choice problem answered with a real solution
+where the question asks for the non-solution. Valid mathematics answering a different question
+from the one on the page — invisible to every rule, and the reason the golden collection gets
+the next of these rather than a live run.
+
+One UI wording gap surfaced alongside them: the page reports **`STILL OPEN 1`** for a job with
+zero unresolved errors. The remaining item is the low-severity observation that the correct
+multiple-choice answer appears first — reported everywhere and deliberately never
+auto-corrected, since the rules require exact matching and never shuffling. Counting it beside
+errors tells a curator their finished workbook still needs work. It should read `OPEN ERRORS: 0`
+and `OBSERVATIONS: 1`.
 
 ---
 
