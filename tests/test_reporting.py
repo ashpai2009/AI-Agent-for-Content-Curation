@@ -437,6 +437,72 @@ def test_content_and_integrity_findings_are_kept_apart(tmp_path):
     ]
 
 
+def test_a_clean_final_round_reports_nothing_rather_than_the_previous_round(tmp_path):
+    """The bug this exists for, and it was the worst-shaped one this system can have.
+
+    Final validation of a repaired workbook records an empty list at round
+    `FINAL_GATE_ROUND`. `record_findings` wrote no rows for it, so deriving "the latest
+    round" from `MAX(round_no)` over the findings skipped the round entirely, landed on
+    round 0 and returned the six defects the job had already repaired. The API told a
+    curator their finished workbook still carried every fault it arrived with.
+
+    A round that finds nothing is a result. It just is not a row, which is why the round
+    itself has to be recorded and not inferred from its findings.
+    """
+    from oatutor_council.persistence import (
+        Database,
+        create_job,
+        latest_findings,
+        record_findings,
+    )
+
+    db = Database(tmp_path / "c.db")
+    create_job(db, CurationJob(job_id="job-1", source_filename="w.xlsx"))
+
+    record_findings(
+        db,
+        "job-1",
+        0,
+        [_finding("MC_ANSWER_NOT_IN_CHOICES", row=4), _finding("SCAFFOLD_MISSING_ANSWER", row=7)],
+        ["a", "b"],
+    )
+    assert len(latest_findings(db, "job-1")) == 2
+
+    # Everything was repaired; the final gate finds nothing.
+    record_findings(db, "job-1", 1000, [], [])
+
+    assert latest_findings(db, "job-1") == ()
+
+
+def test_an_empty_round_is_recorded_per_kind(tmp_path):
+    """A clean content round must not be read as a clean integrity round, or the reverse.
+
+    Integrity is the more dangerous direction: it is the difference between "the output is
+    an accounted-for descendant of your file" and "nobody has checked".
+    """
+    from oatutor_council.persistence import (
+        Database,
+        create_job,
+        latest_findings,
+        record_findings,
+    )
+
+    db = Database(tmp_path / "c.db")
+    create_job(db, CurationJob(job_id="job-1", source_filename="w.xlsx"))
+    record_findings(db, "job-1", 0, [_finding("MC_CHOICE_COUNT", row=3)], ["a"])
+    record_findings(
+        db, "job-1", 0, [_finding("UNRECORDED_CHANGE", row=9)], ["b"], kind="integrity"
+    )
+
+    # The content round comes back clean. Integrity was not re-run.
+    record_findings(db, "job-1", 1000, [], [])
+
+    assert latest_findings(db, "job-1", kind="content") == ()
+    assert [f.code for f in latest_findings(db, "job-1", kind="integrity")] == [
+        "UNRECORDED_CHANGE"
+    ]
+
+
 def test_re_recording_a_round_replaces_it_rather_than_doubling_it(tmp_path):
     """A round re-run after a crash must not report every finding twice."""
     from oatutor_council.persistence import (

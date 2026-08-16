@@ -669,6 +669,37 @@ def test_the_report_endpoint_shows_the_findings_the_report_file_shows(tmp_path):
         assert report["remaining_findings"][0]["code"] in rendered
 
 
+def test_the_report_endpoint_reports_nothing_when_the_final_round_is_clean(tmp_path):
+    """The same lie as the test above, pointed the other way — and this one reached a real
+    curator.
+
+    Final validation of a repaired workbook records an empty list at `FINAL_GATE_ROUND`,
+    which wrote no rows, so the latest round was derived from the findings and landed on
+    round 0. The endpoint answered with the defects the job had already fixed: a finished
+    workbook presented as still carrying every fault it arrived with.
+    """
+    from oatutor_council.council import FINAL_GATE_ROUND
+    from oatutor_council.models import CurationJob, ValidationFinding
+    from oatutor_council.persistence import create_job, latest_findings, record_findings
+
+    settings = settings_for(tmp_path)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    db = Database(settings.data_root / "council.db")
+    create_job(db, CurationJob(job_id="job-1", source_filename="w.xlsx"))
+
+    stale = ValidationFinding(
+        code="MC_ANSWER_NOT_IN_CHOICES",
+        message="the answer matches no choice",
+        severity="error",
+        row=4,
+        column=9,
+    )
+    record_findings(db, "job-1", 0, [stale], ["fp-1"])
+    record_findings(db, "job-1", FINAL_GATE_ROUND, [], [])
+
+    assert latest_findings(db, "job-1", kind="content") == ()
+
+
 def _client_that_never_repairs(_settings) -> ScriptedLLMClient:
     """A Writer that escalates instead of editing, so the defect is still there at the end."""
     replies = {

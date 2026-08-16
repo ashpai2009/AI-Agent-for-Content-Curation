@@ -193,6 +193,26 @@ CREATE TABLE IF NOT EXISTS validation_findings (
 );
 CREATE INDEX IF NOT EXISTS validation_findings_round ON validation_findings(job_id, round_no);
 
+-- Which validation rounds actually ran, recorded whether or not they found anything.
+--
+-- The bug this exists for: a clean final round writes **no finding rows at all**, so
+-- deriving "the latest round" from `MAX(round_no)` over `validation_findings` skipped it
+-- entirely and answered with the previous round's rows. A job whose final validation found
+-- nothing wrong reported the six findings it had already repaired -- the API telling a
+-- curator their finished workbook was still broken, which is `GET /report` returning
+-- `findings=()` all over again with the sign flipped.
+--
+-- A round that found nothing is a fact about the workbook and has to be stored as one.
+-- Absence of rows cannot carry it: it is indistinguishable from a round that never ran.
+CREATE TABLE IF NOT EXISTS validation_rounds (
+    job_id      TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    round_no    INTEGER NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'content',
+    finding_count INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, kind, round_no)
+);
+
 CREATE TABLE IF NOT EXISTS llm_calls (
     call_id    TEXT PRIMARY KEY,
     job_id     TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -1054,6 +1074,16 @@ def record_findings(
                     finding.model_dump_json(),
                 ),
             )
+        # The marker, written in the same transaction and **unconditionally**. A round
+        # that found nothing has to leave a trace, or `latest_findings` cannot tell it
+        # from a round that never happened and answers with stale rows. `REPLACE` for the
+        # same reason the delete above exists: a re-run round overwrites its own marker.
+        connection.execute(
+            """INSERT OR REPLACE INTO validation_rounds
+                   (job_id, round_no, kind, finding_count, recorded_at)
+               VALUES (?,?,?,?,?)""",
+            (job_id, round_no, kind, len(findings), _iso(_now())),
+        )
 
 
 def list_findings(
@@ -1084,7 +1114,26 @@ def latest_findings(
     round one asked for. Concatenating rounds would report defects that were fixed two
     rounds ago as though they were still there, which is the same lie as reporting
     success over a broken workbook, pointed the other way.
+
+    **The latest round is read from `validation_rounds`, not from the findings.** Deriving
+    it from `MAX(round_no)` over `validation_findings` meant the one round that matters
+    most -- a final validation that found nothing -- was invisible, because it writes no
+    rows. The query then landed on the previous round and returned the findings the job
+    had already repaired, so a clean workbook was reported as still carrying every defect
+    it arrived with. An empty round is a result; it just is not a row.
     """
+    row = db.connection.execute(
+        "SELECT MAX(round_no) AS latest FROM validation_rounds "
+        "WHERE job_id = ? AND kind = ?",
+        (job_id, kind),
+    ).fetchone()
+    if row is not None and row["latest"] is not None:
+        return list_findings(db, job_id, int(row["latest"]), kind=kind)
+
+    # No marker: a job recorded before this table existed. Fall back to the old derivation
+    # rather than claiming the job had no findings -- for those jobs it is the only
+    # evidence there is, and it errs towards reporting work that may already be done,
+    # which is the safe direction. New rounds always leave a marker.
     row = db.connection.execute(
         "SELECT MAX(round_no) AS latest FROM validation_findings "
         "WHERE job_id = ? AND kind = ?",
