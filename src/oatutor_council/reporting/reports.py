@@ -30,6 +30,7 @@ from ..models import (
     Severity,
     ValidationFinding,
 )
+from ..workbook.diff import net_changes
 
 #: Reading order for a report: worst first.
 _SEVERITY_ORDER = {
@@ -175,7 +176,12 @@ def _change_log(job_id: str, changes: Sequence[ChangeRecord]) -> dict[str, Any]:
     """
     return {
         "job_id": job_id,
-        "change_count": len(changes),
+        # Curators mean distinct cells whose final value differs from the source when
+        # they read “cells changed”. Retries and rejected-patch rollbacks remain below as
+        # audit operations, but they must not inflate that user-facing result metric.
+        "change_count": _net_change_count(changes),
+        "changed_cell_count": _net_change_count(changes),
+        "edit_operation_count": len(changes),
         "changes": [
             {
                 "change_id": change.change_id,
@@ -277,7 +283,8 @@ def _validation_report(
         "succeeded": state is JobState.SUCCEEDED,
         "integrity_passed": not integrity_findings,
         "integrity_findings": [_render_finding(f) for f in integrity_findings],
-        "changes_applied": len(changes),
+        "changes_applied": _net_change_count(changes),
+        "edit_operations": len(changes),
         # Every state that counts as resolved, not just `ACCEPTED`. A refuted claim was
         # checked and was not there, and a superseded one was fixed by another repair;
         # counting only accepted issues made the summary contradict its own first line.
@@ -326,6 +333,11 @@ def _validation_report(
     }
 
 
+def _net_change_count(changes: Sequence[ChangeRecord]) -> int:
+    """Count final source-to-output cell differences from the append-only edit log."""
+    return sum(change.before != change.after for change in net_changes(changes).values())
+
+
 def _count_claims(resolved: Sequence[dict[str, Any]], outcome: ClaimOutcome) -> int:
     return len([claim for claim in resolved if claim["outcome"] == outcome])
 
@@ -355,7 +367,8 @@ def unresolved_summary(
         return (
             f"{len(needing)} issue(s) could not be resolved automatically and need a "
             "person. The corrected workbook contains every change that was accepted; "
-            "the issues listed below were left untouched."
+            "the issues listed below remain unresolved, and their rejected proposals "
+            "were rolled back."
         )
     open_issues = ledger.open_issues
     if open_issues:

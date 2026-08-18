@@ -125,6 +125,7 @@ def _to_finding(item, block: ProblemBlock) -> ValidationFinding:
     rows = [row for row in item.rows if block.contains_row(row)]
     row = rows[0] if rows else block.start_row
     column = FIXED_COLUMNS[column_key(item.columns[0])] if item.columns else None
+    target_rows = rows or [block.start_row]
     return ValidationFinding(
         code="INDEPENDENT_FINDING",
         severity=item.severity,
@@ -138,7 +139,13 @@ def _to_finding(item, block: ProblemBlock) -> ValidationFinding:
         detail={
             "expected": item.expected,
             "category": item.category.value,
-            "rows": rows or [block.start_row],
+            "rows": target_rows,
+            "cells": [
+                [target_row, FIXED_COLUMNS[column_key(name)]]
+                for target_row in target_rows
+                for name in item.columns
+            ],
+            "column_keys": list(item.columns),
         },
     )
 

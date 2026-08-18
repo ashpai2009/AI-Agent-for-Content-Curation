@@ -169,7 +169,7 @@ avoid.
 ```
 src/oatutor_council/
   api.py           HTTP surface, upload validation, job runner
-  council.py       the five-stage loop; one step = one model call
+  council.py       the five-stage loop; one step = one bounded durable unit
   orchestrator.py  crash-safe apply, recovery after a crash
   state_machine.py job and issue transition tables, attempt accounting
   persistence.py   SQLite: WAL, synchronous=FULL, BEGIN IMMEDIATE, epoch fencing
@@ -177,7 +177,7 @@ src/oatutor_council/
   uploads.py       magic bytes, archive inspection, path containment
   config.py        every setting, read from the environment in one place
   workbook/        reader · writer · diff · styles
-  validation/      rules/ (60 rules) · mathematics · patch_gate · final_gate
+  validation/      rules/ (61 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
                    independent_reviewer · isolation · rendering · schemas · batching
   llm/             base · claude_cli · mock · context · prompts · audit
@@ -214,6 +214,17 @@ panes, data validations, hyperlinks, and images. Any difference not traceable to
 accepted edit or to the approved edited-row rule **fails the gate**. There is no blanket
 "formatting normalisation" category, because that bucket would absorb real damage.
 
+**Rejected proposals cannot leak into the download.** A reviewer examines the rendered
+working workbook, but `revise` and `human_review` immediately reverse the proposal through
+the same crash-safe intent protocol. The append-only audit log retains both operations;
+the UI's **cells changed** metric counts only distinct cells whose final value differs from
+the source.
+
+**Mechanical cleanup does not spend model calls.** Boundary whitespace is trimmed exactly,
+duplicate metadata on non-problem rows is cleared when the problem row already carries it,
+and an explicit variable equation labelled `numeric` is relabelled `algebra`. These narrow
+repairs still pass the ordinary patch gate and are recorded like any other change.
+
 **Reviewers never see the Writer's reasoning.** Enforced three ways: `PrivateText` is not a
 `str` subclass (a subclass interpolates silently into an f-string); `ReviewerContext` is
 checked at import time and cannot reference a private type anywhere in its field closure;
@@ -236,8 +247,9 @@ hash, pinned prompt version, latency, token usage, and the exact prompt text —
 the calls that failed, with the provider's own status. The recording is a wrapper around
 the client rather than a call inside each agent, so no agent can forget it. Prompt versions
 are pinned per job, so deploying a new prompt mid-job cannot mean one attempt ran under one
-set of instructions and the next under another. The API key reaches the SDK directly from
-settings and is not reachable from anything in that path.
+set of instructions and the next under another. Production launches one isolated Claude
+Code CLI process per physical call through the local subscription login; the application
+has no API key or SDK fallback.
 
 **Workbook cells are hostile input.** They reach every agent inside fenced, labelled data
 sections with a **per-call random delimiter**, and anything resembling a fence is

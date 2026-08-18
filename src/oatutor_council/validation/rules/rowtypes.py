@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 from ...models import (
@@ -44,6 +45,49 @@ def invalid_answer_type(context: RuleContext) -> Iterable[ValidationFinding]:
                 column_key=ColumnKey.ANSWER_TYPE,
                 found=text,
             )
+
+
+_VARIABLE_LEFT_HAND_SIDE = re.compile(
+    r"(?:[A-Za-z]|\\(?:theta|alpha|beta|gamma|phi|lambda))"
+)
+
+
+@rule(
+    "ANSWER_TYPE_MISMATCH",
+    severity=Severity.ERROR,
+    category=IssueCategory.ROW_TYPE,
+    description="answerType is numeric although Answer is an equation in a variable.",
+)
+def answer_type_mismatch(context: RuleContext) -> Iterable[ValidationFinding]:
+    """Catch the high-confidence semantic mismatch that cost the pilot a whole issue.
+
+    This intentionally recognizes only an explicit equation whose left side contains a
+    variable. It does not try to classify every mathematical string: fractions, radicals
+    and scientific notation can all be numeric, and a broad letters-means-algebra rule
+    would turn LaTeX commands such as ``\\frac`` into false positives.
+    """
+    block = context.block
+    if block is None:
+        return
+    for row in block.rows:
+        if row.answer_type is not AnswerType.NUMERIC:
+            continue
+        answer = row.get(ColumnKey.ANSWER).strip().strip("$").strip()
+        if "=" not in answer:
+            continue
+        left = answer.split("=", 1)[0]
+        if not _VARIABLE_LEFT_HAND_SIDE.search(left):
+            continue
+        yield finding(
+            context,
+            "ANSWER_TYPE_MISMATCH",
+            "answerType is numeric but Answer is an equation in a variable",
+            row=row.row,
+            column=FIXED_COLUMNS[ColumnKey.ANSWER_TYPE],
+            column_key=ColumnKey.ANSWER_TYPE,
+            answer=row.get(ColumnKey.ANSWER),
+            expected=AnswerType.ALGEBRA.value,
+        )
 
 
 @rule(

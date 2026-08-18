@@ -15,7 +15,7 @@ from datetime import datetime
 import pytest
 
 from conftest import cells, hint, problem, scaffold, step
-from oatutor_council.models import Severity
+from oatutor_council.models import ColumnKey, Severity
 from oatutor_council.validation.rules import REGISTRY, describe_rules, run_rules
 from oatutor_council.workbook.reader import read_workbook
 
@@ -575,6 +575,23 @@ def test_whitespace_padding(make_workbook):
     path = make_workbook([problem("a1"), step("a1", answer=" 1/2 ")])
     findings = findings_for(path, "WHITESPACE_PADDING")
     assert findings[0].detail["stripped"] == "1/2"
+
+
+def test_numeric_type_is_rejected_for_an_explicit_variable_equation(make_workbook):
+    path = make_workbook(
+        [problem("a1"), step("a1", answer=r"$$x=\sqrt{9}$$", answer_type="numeric")]
+    )
+    findings = findings_for(path, "ANSWER_TYPE_MISMATCH")
+    assert [(finding.column_key, finding.detail["expected"]) for finding in findings] == [
+        (ColumnKey.ANSWER_TYPE, "algebra")
+    ]
+
+
+def test_numeric_type_rule_does_not_misread_latex_numbers_as_variables(make_workbook):
+    path = make_workbook(
+        [problem("a1"), step("a1", answer=r"$$\frac{1}{2}$$", answer_type="numeric")]
+    )
+    assert findings_for(path, "ANSWER_TYPE_MISMATCH") == ()
 
 
 # --------------------------------------------------------------------------------------

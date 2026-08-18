@@ -34,19 +34,25 @@ from oatutor_council.models import (
     ColumnKey,
     CurationJob,
     FailureReason,
+    FindingScope,
+    IssueSource,
     IssueState,
     JobState,
+    Severity,
     SourcePath,
+    ValidationFinding,
 )
 from oatutor_council.persistence import (
     Database,
     create_job,
+    insert_issue,
     list_changes,
     list_events,
     list_attempts,
     list_issues,
     load_ledger,
 )
+from oatutor_council.reporting.ledger import issue_from_finding
 from oatutor_council.workbook.reader import read_workbook
 from oatutor_council.workbook.writer import create_working_copy
 
@@ -495,7 +501,7 @@ def test_a_reviewer_asking_for_a_revision_is_not_overruled_by_the_rule_being_sat
     though the rule is satisfied -- so superseding there would let a mechanically-clean
     but incorrect repair close the issue by silencing the reviewer.
     """
-    db, _ = setup
+    db, copy = setup
     client = quiet_client(
         **{
             AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(
@@ -508,6 +514,88 @@ def test_a_reviewer_asking_for_a_revision_is_not_overruled_by_the_rule_being_sat
     assert result.state is JobState.NEEDS_HUMAN_ATTENTION
     assert not any(
         i.state is IssueState.SUPERSEDED for i in list_issues(db, "job-1")
+    )
+    # Three rejected proposals may exist in the audit log, but none is allowed to leak
+    # into the workbook handed back to the curator.
+    assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == ""
+    corrected = copy.path.parent.parent / "outputs" / "corrected.xlsx"
+    assert read_workbook(corrected).blocks[0].rows[2].get(ColumnKey.ANSWER) == ""
+    report = (copy.path.parent.parent / "outputs" / "report.md").read_text()
+    assert "Cells changed: 0" in report
+    assert any(event["kind"] == "patch_rolled_back" for event in list_events(db, "job-1"))
+
+
+def test_exact_cleanup_uses_no_writer_or_reviewer_calls(make_workbook, tmp_path):
+    source = make_workbook(
+        [
+            problem(
+                "clean1",
+                title="A clean question",
+                oer_src="source",
+                openstax_kc="chapter",
+                taxonomy="topic",
+                license="CC",
+            ),
+            step(
+                "clean1",
+                answer=" 1/2 ",
+                answer_type="numeric",
+                openstax_kc="chapter",
+                taxonomy="topic",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "mechanical.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "mechanical-job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client()
+    result = council((db, copy), client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    parsed = read_workbook(copy.path)
+    repaired = parsed.blocks[0].rows[1]
+    assert repaired.get(ColumnKey.ANSWER) == "1/2"
+    assert repaired.get(ColumnKey.OPENSTAX_KC) == ""
+    assert repaired.get(ColumnKey.TAXONOMY) == ""
+    assert client.call_count(AgentRole.WRITER) == 0
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+    assert len([e for e in list_events(db, "job-1") if e["kind"] == "deterministic_repair"]) == 3
+
+
+def test_final_reconciliation_removes_a_stale_human_alert(setup):
+    db, copy = setup
+    parsed = read_workbook(copy.path)
+    block = parsed.blocks[0]
+    finding = ValidationFinding(
+        code="WHITESPACE_PADDING",
+        severity=Severity.WARNING,
+        scope=FindingScope.CELL,
+        message="cell value has leading or trailing whitespace",
+        row=4,
+        column=5,
+        column_key=ColumnKey.ANSWER,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+    )
+    stale = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    ).model_copy(update={"state": IssueState.NEEDS_HUMAN_REVIEW, "attempts_used": 3})
+    insert_issue(db, stale)
+
+    council(setup, quiet_client())._reconcile_stale_escalations(parsed)
+
+    reloaded = next(
+        issue for issue in list_issues(db, "job-1") if issue.issue_id == stale.issue_id
+    )
+    assert reloaded.state is IssueState.SUPERSEDED
+    assert any(
+        event["kind"] == "stale_escalation_reconciled"
+        for event in list_events(db, "job-1")
     )
 
 

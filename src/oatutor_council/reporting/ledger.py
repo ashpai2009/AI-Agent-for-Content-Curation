@@ -18,6 +18,7 @@ import hashlib
 from uuid import uuid4
 
 from ..models import (
+    ColumnKey,
     Issue,
     IssueCategory,
     IssueLedger,
@@ -77,6 +78,7 @@ def issue_from_finding(
             category = IssueCategory(str(finding.detail.get("category", "")))
         except ValueError:
             category = IssueCategory.STRUCTURE
+    cells = _finding_cells(finding)
     return Issue(
         issue_id=uuid4().hex,
         job_id=job_id,
@@ -90,9 +92,7 @@ def issue_from_finding(
         expected=str(finding.detail.get("expected", "") or ""),
         observed=str(finding.detail.get("observed", "") or ""),
         rule_codes=(finding.code,),
-        cells=((finding.row, finding.column),)
-        if finding.row is not None and finding.column is not None
-        else (),
+        cells=cells,
         is_structural=_is_structural(finding),
         reviewer_role=reviewer_role,
         fingerprint=fingerprint(finding),
@@ -105,6 +105,30 @@ def _location(finding: ValidationFinding) -> str:
     if finding.row is not None:
         return f"row {finding.row}"
     return finding.block_id or "the workbook"
+
+
+def _finding_cells(finding: ValidationFinding) -> tuple[tuple[int, int], ...]:
+    """All cells a finding explicitly authorises, primary location first.
+
+    Rule findings generally name one cell. Agent findings can name several rows and
+    columns because a single mathematical correction may be internally inconsistent
+    unless all of them change together. Older persisted findings have no `detail.cells`,
+    so the primary pair remains the backwards-compatible fallback.
+    """
+    candidates: list[tuple[int, int]] = []
+    if finding.row is not None and finding.column is not None:
+        candidates.append((finding.row, finding.column))
+    for cell in finding.detail.get("cells", ()):
+        if (
+            isinstance(cell, (list, tuple))
+            and len(cell) == 2
+            and isinstance(cell[0], int)
+            and isinstance(cell[1], int)
+            and cell[0] > 0
+            and cell[1] > 0
+        ):
+            candidates.append((cell[0], cell[1]))
+    return tuple(dict.fromkeys(candidates))
 
 
 #: Categories that are a structural claim in themselves. A finding that classifies itself
@@ -122,6 +146,13 @@ def _is_structural(finding: ValidationFinding) -> bool:
 
     if finding.column_key in STRUCTURAL_COLUMNS:
         return True
+
+    for name in finding.detail.get("column_keys", ()):
+        try:
+            if ColumnKey(str(name)) in STRUCTURAL_COLUMNS:
+                return True
+        except ValueError:
+            continue
 
     # The agent's own classification, when it made one. This does not rescue a finding
     # that cited the wrong cell *and* called itself mathematics -- nothing mechanical can,

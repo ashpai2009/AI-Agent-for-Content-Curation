@@ -54,9 +54,9 @@ class AuditorFinding(BaseModel):
     columns: list[ColumnName] = Field(
         default_factory=list,
         description=(
-            "The column(s) that must change to fix this. Not where the problem was "
-            "noticed -- if a correct answer is labelled with the wrong answerType, the "
-            "column is answerType"
+            "Every column that must change to complete this one repair. Not where the "
+            "problem was noticed. If Answer and answerType must both change, list both; "
+            "if only a correct answer's label is wrong, list answerType only"
         ),
     )
     problem: str = Field(description="What is wrong, in one sentence")
@@ -191,7 +191,13 @@ class ReviewerResponse(BaseModel):
 
 class IndependentFinding(BaseModel):
     rows: list[int]
-    columns: list[ColumnName] = Field(default_factory=list)
+    columns: list[ColumnName] = Field(
+        default_factory=list,
+        description=(
+            "Every column that must change to complete this one repair; list all "
+            "coordinated targets, not just where the defect was first noticed"
+        ),
+    )
     problem: str
     expected: str = ""
     severity: Severity = Severity.ERROR

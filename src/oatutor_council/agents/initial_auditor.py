@@ -221,9 +221,13 @@ def _to_finding(
     confirms = item.confirms_claim
     if confirms is not None and shown is not None and confirms not in shown:
         confirms = None
-    column = (
-        FIXED_COLUMNS[column_key(item.columns[0])] if item.columns else None
-    )
+    column = FIXED_COLUMNS[column_key(item.columns[0])] if item.columns else None
+    target_rows = rows or [block.start_row]
+    target_cells = [
+        [target_row, FIXED_COLUMNS[column_key(name)]]
+        for target_row in target_rows
+        for name in item.columns
+    ]
     return ValidationFinding(
         code="AUDITOR_FINDING",
         severity=item.severity,
@@ -237,7 +241,14 @@ def _to_finding(
         detail={
             "expected": item.expected,
             "category": item.category.value,
-            "rows": rows or [block.start_row],
+            "rows": target_rows,
+            # `row`/`column` retain the primary location for reporting and stable
+            # fingerprints. `cells` is the complete repair authority. A semantic defect
+            # can require coordinated edits (for example Answer and answerType on the
+            # same row), and throwing every target after the first away is what made the
+            # gate reject the only complete repair as an unrelated structural edit.
+            "cells": target_cells,
+            "column_keys": list(item.columns),
             "confirms_claim": confirms,
             "rows_outside_block": [r for r in item.rows if not block.contains_row(r)],
         },

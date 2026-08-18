@@ -120,6 +120,21 @@ def test_prompts_are_versioned_and_the_highest_is_chosen():
     assert load_prompt("writer") == load_prompt("writer", versions[-1])
 
 
+def test_current_semantic_prompts_pin_the_live_pilot_lessons():
+    auditor = re.sub(r"\s+", " ", system_prompt(AgentRole.INITIAL_AUDITOR))
+    writer = re.sub(r"\s+", " ", system_prompt(AgentRole.WRITER))
+    independent = re.sub(
+        r"\s+", " ", system_prompt(AgentRole.INDEPENDENT_REVIEWER)
+    )
+
+    assert "requested form, units, domain, number of solutions" in auditor
+    assert "every column that must change" in auditor
+    assert "Do not simplify, restyle, paraphrase" in writer
+    assert "exact fraction to a decimal" in writer
+    assert "requested form, units, domain, number of solutions" in independent
+    assert "every column that must change" in independent
+
+
 def test_an_unknown_prompt_is_fatal():
     """A council running with a prompt nobody wrote is doing something nobody
     specified."""
@@ -367,5 +382,4 @@ def test_the_mock_records_every_request_for_the_isolation_tests():
 
     assert client.call_count(AgentRole.WRITER) == 1
     assert client.payloads_for(AgentRole.KNOWN_ISSUE_REVIEWER) == ("fix this",)
-
 

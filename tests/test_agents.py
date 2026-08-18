@@ -49,6 +49,7 @@ from oatutor_council.models import (
     ReviewDecision,
     Severity,
 )
+from oatutor_council.reporting.ledger import issue_from_finding
 from oatutor_council.workbook.reader import read_workbook
 
 
@@ -345,6 +346,31 @@ def test_the_auditor_audits_a_block_with_no_document_at_all(parsed, block):
     assert len(result.findings) == 1
     assert result.findings[0].row == 3
     assert result.findings[0].column_key is ColumnKey.ANSWER
+
+
+def test_an_auditor_finding_keeps_every_coordinated_target_cell(parsed, block):
+    """The repair gate must receive the whole target set, not only the first column."""
+    client = ScriptedLLMClient(
+        default=AuditorResponse(
+            findings=[
+                {
+                    "rows": [3],
+                    "columns": ["answer", "answer_type"],
+                    "problem": "both the result and its grading type are wrong",
+                    "category": "row_type",
+                }
+            ]
+        )
+    )
+    finding = audit_block(
+        client, block=block, conventions=parsed.conventions
+    ).findings[0]
+    issue = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    )
+
+    assert issue.cells == ((3, 5), (3, 6))
+    assert issue.is_structural
 
 
 def test_zero_findings_is_a_valid_answer(parsed, block):

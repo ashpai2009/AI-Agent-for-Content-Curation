@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
+from openpyxl import load_workbook
+
 from .agents import independent_reviewer, initial_auditor, known_issue_reviewer, writer
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
@@ -47,6 +49,8 @@ from .llm.base import (
 from .llm.prompts import current_prompt_versions
 from .models import (
     ArtifactKind,
+    CellEdit,
+    ColumnKey,
     ClaimOutcome,
     AttemptOutcome,
     CurationJob,
@@ -56,6 +60,7 @@ from .models import (
     IssueState,
     JobState,
     ParsedWorkbook,
+    Patch,
     ProblemBlock,
     RejectionCode,
     RepairAttempt,
@@ -118,7 +123,8 @@ from .validation.patch_gate import (
     validate_patch,
 )
 from .validation.rules import run_rules
-from .workbook.reader import read_workbook
+from .workbook.diff import net_changes
+from .workbook.reader import read_workbook, render_cell
 from .workbook.writer import (
     EditRejected,
     WorkingCopy,
@@ -984,7 +990,6 @@ class CurationCouncil:
         """
         self._spend()
         job = self.job
-        ledger = load_ledger(self.db, self.job_id)
         changes = list_changes(self.db, self.job_id)
 
         gate = run_final_gate(
@@ -993,6 +998,13 @@ class CurationCouncil:
             output=self.copy.path,
             changes=changes,
         )
+
+        # A terminal issue ledger is history, while this decision is about the artifact
+        # being handed back. Another accepted repair can resolve a deterministic issue
+        # after that issue exhausted its own attempts. Re-derive those escalations against
+        # the final workbook so “needs a person” never points at a defect that is gone.
+        self._reconcile_stale_escalations(self.current_workbook())
+        ledger = load_ledger(self.db, self.job_id)
 
         outputs = self.copy.path.parent.parent / "outputs"
         outputs.mkdir(parents=True, exist_ok=True)
@@ -1064,6 +1076,35 @@ class CurationCouncil:
         self._advance(final_state)
         return StepOutcome(True, reports.validation_report["unresolved_summary"], final_state)
 
+    def _reconcile_stale_escalations(self, parsed: ParsedWorkbook) -> None:
+        changes = list_changes(self.db, self.job_id)
+        for issue in list_issues(self.db, self.job_id):
+            if issue.state is not IssueState.NEEDS_HUMAN_REVIEW or not issue.rule_codes:
+                continue
+            block = parsed.block_by_id(issue.block_id) if issue.block_id else None
+            if block is None:
+                continue
+            remaining = target_findings(issue, parsed, block)
+            if remaining is None or remaining:
+                continue
+            # Compatibility with jobs that began before rejected-patch rollback existed:
+            # a rule may be quiet only because this very issue's rejected bytes are still
+            # present. Superseding that issue would launder the unaccepted patch. A real
+            # sibling resolution has no surviving net edit owned by the stale issue.
+            own_net = net_changes(
+                change for change in changes if change.issue_id == issue.issue_id
+            )
+            if any(change.before != change.after for change in own_net.values()):
+                continue
+            save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
+            record_event(
+                self.db,
+                self.job_id,
+                "stale_escalation_reconciled",
+                f"{issue.issue_id}: final workbook no longer has "
+                f"{', '.join(issue.rule_codes)} at {issue.problem_name}",
+            )
+
     # -- issue-level steps -------------------------------------------------------------
 
     def _advance_issue(self, issue: Issue, state: JobState) -> StepOutcome:
@@ -1105,6 +1146,16 @@ class CurationCouncil:
                 f"{issue.problem_name}",
             )
             return StepOutcome(True, f"{issue.issue_id} no longer applies", state)
+
+        # Exact cleanup belongs to deterministic code, not a probabilistic Writer. The
+        # live pilot spent repeated Claude calls on one trailing space and copied the
+        # wrong `before` value each time. These two repairs are safe only when their
+        # preconditions prove no content is being inferred or discarded.
+        mechanical = self._mechanical_patch(issue, parsed, block)
+        if issue.state is IssueState.OPEN and issue.attempts_used == 0 and mechanical:
+            outcome = self._apply_mechanical_patch(issue, mechanical, state)
+            if outcome is not None:
+                return outcome
 
         # A semantic issue cannot be re-derived mechanically, but it may already have
         # been resolved by an earlier accepted repair in the same block. Sending it
@@ -1270,6 +1321,110 @@ class CurationCouncil:
         save_issue(self.db, advance_issue(issue, IssueState.PATCH_PROPOSED))
         return StepOutcome(True, f"patch proposed for {issue.issue_id}", state)
 
+    def _mechanical_patch(
+        self, issue: Issue, parsed: ParsedWorkbook, block: ProblemBlock
+    ) -> Patch | None:
+        if len(issue.cells) != 1 or len(issue.rule_codes) != 1:
+            return None
+        row_number, column_number = issue.cells[0]
+        row = next((candidate for candidate in block.rows if candidate.row == row_number), None)
+        key = parsed.column_map.key_at(column_number)
+        if row is None or key is None:
+            return None
+        before = row.get(key)
+        code = issue.rule_codes[0]
+
+        if code == "WHITESPACE_PADDING":
+            after = before.strip()
+            if not before or after == before:
+                return None
+            reason = "remove leading or trailing whitespace exactly"
+        elif code == "METADATA_ON_NON_PROBLEM_ROW":
+            # Clearing a misplaced value is lossless only when the problem row already
+            # carries that metadata field. Otherwise it may be displaced source content
+            # and the Writer/reviewer must decide where it belongs.
+            if not before or not block.problem_row.get(key).strip():
+                return None
+            after = ""
+            reason = "remove duplicate metadata from a non-problem row"
+        elif (
+            code == "ANSWER_TYPE_MISMATCH"
+            and key is ColumnKey.ANSWER_TYPE
+            and before.strip().lower() == "numeric"
+        ):
+            after = "algebra"
+            reason = "label an explicit variable equation as algebra"
+        else:
+            return None
+
+        return Patch(
+            patch_id=f"deterministic-{uuid4().hex}",
+            issue_id=issue.issue_id,
+            attempt_no=1,
+            edits=(
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            ),
+            reason=reason,
+            derivation=(
+                "removing boundary whitespace preserves the mathematical value exactly"
+                if code == "WHITESPACE_PADDING"
+                else ""
+            ),
+        )
+
+    def _apply_mechanical_patch(
+        self, issue: Issue, patch: Patch, state: JobState
+    ) -> StepOutcome | None:
+        parsed = self.current_workbook()
+        block = parsed.block_by_id(issue.block_id) if issue.block_id else None
+        if block is None:
+            return None
+        decision = validate_patch(patch, issue=issue, block=block, parsed=parsed)
+        if not decision.accepted:
+            # Fall back to the ordinary Writer path on the next step. Exact automation
+            # never weakens the same gate a model-authored patch must pass.
+            record_event(
+                self.db,
+                self.job_id,
+                "deterministic_repair_declined",
+                f"{issue.issue_id}: {decision.rejection.code.value}",
+            )
+            return None
+
+        self._spend()
+        insert_patch(self.db, patch)
+        progress = advance_issue(issue, IssueState.AWAITING_PATCH)
+        progress = advance_issue(progress, IssueState.PATCH_PROPOSED)
+        progress = advance_issue(progress, IssueState.APPLYING)
+        save_issue(self.db, progress)
+        assert_lease_held(
+            self.db, self.job_id, self.worker_id, run_epoch=self.run_epoch
+        )
+        apply_patch(
+            self.db,
+            self.job.model_copy(update={"run_epoch": self.run_epoch}),
+            self.copy,
+            patch,
+            block_id=issue.block_id,
+        )
+        progress = advance_issue(progress, IssueState.PATCH_APPLIED)
+        progress = advance_issue(progress, IssueState.AWAITING_REVIEW)
+        progress = advance_issue(progress, IssueState.ACCEPTED)
+        save_issue(self.db, progress)
+        record_event(
+            self.db,
+            self.job_id,
+            "deterministic_repair",
+            f"{issue.issue_id}: {patch.reason}; no model call required",
+        )
+        return StepOutcome(True, f"{issue.issue_id} repaired deterministically", state)
+
     def _apply(self, issue: Issue, state: JobState) -> StepOutcome:
         patch = _latest_patch(self.db, issue.issue_id)
         if patch is None:
@@ -1315,7 +1470,14 @@ class CurationCouncil:
             save_issue(self.db, advance_issue(issue, IssueState.AWAITING_REVIEW))
             issue = advance_issue(issue, IssueState.AWAITING_REVIEW)
 
-        verdict = self._ask_reviewer(issue)
+        # A verdict is persisted before a rejected patch is rolled back. If the worker
+        # dies in that narrow window, reuse the durable verdict rather than paying for a
+        # second physical model call to make the same decision.
+        patch = _latest_patch(self.db, issue.issue_id)
+        review_attempt_no = patch.attempt_no if patch is not None else (issue.attempts_used or 1)
+        verdict = _verdict_for_attempt(self.db, issue.issue_id, review_attempt_no)
+        if verdict is None:
+            verdict = self._ask_reviewer(issue, attempt_no=review_attempt_no)
         if verdict is None:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, "block vanished; escalating", state)
@@ -1324,6 +1486,16 @@ class CurationCouncil:
         if verdict.decision is ReviewDecision.ACCEPT:
             save_issue(self.db, advance_issue(issue, IssueState.ACCEPTED))
             return StepOutcome(True, f"{issue.issue_id} accepted", state)
+
+        # The reviewer judges a proposed patch, not a permission to keep it. Until this
+        # rollback existed, REVISE and HUMAN_REVIEW left the rejected bytes in the real
+        # working workbook. Later agents then reasoned over an unaccepted edit and the
+        # downloaded file could contain a change the UI simultaneously called unresolved.
+        # Reverse it under the same crash-safe intent protocol before another Writer sees
+        # the block or the file can be finalised.
+        if patch is not None:
+            self._rollback_rejected_patch(issue, patch, verdict.verdict_id)
+
         if verdict.decision is ReviewDecision.HUMAN_REVIEW:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
@@ -1335,6 +1507,64 @@ class CurationCouncil:
         )
         save_issue(self.db, advance_issue(issue, next_state))
         return StepOutcome(True, f"{issue.issue_id} revision requested", state)
+
+    def _rollback_rejected_patch(
+        self, issue: Issue, patch: Patch, verdict_id: str
+    ) -> None:
+        """Remove a non-accepted patch, idempotently and with a durable apply intent."""
+        workbook = load_workbook(self.copy.path, data_only=False, read_only=True)
+        try:
+            sheet = workbook.active
+            actual = [
+                render_cell(sheet.cell(row=edit.row, column=edit.column).value)
+                for edit in patch.edits
+            ]
+        finally:
+            workbook.close()
+
+        all_patched = all(value == edit.after for value, edit in zip(actual, patch.edits))
+        all_original = all(value == edit.before for value, edit in zip(actual, patch.edits))
+        if all_original:
+            return
+        if not all_patched:
+            raise JobCorrupted(
+                f"working copy is neither applied nor rolled back for rejected patch "
+                f"{patch.patch_id}",
+                job_id=self.job_id,
+            )
+
+        assert_lease_held(
+            self.db, self.job_id, self.worker_id, run_epoch=self.run_epoch
+        )
+        inverse = Patch(
+            patch_id=f"rollback-{verdict_id}",
+            issue_id=issue.issue_id,
+            attempt_no=patch.attempt_no,
+            edits=tuple(
+                CellEdit(
+                    row=edit.row,
+                    column=edit.column,
+                    column_key=edit.column_key,
+                    before=edit.after,
+                    after=edit.before,
+                )
+                for edit in patch.edits
+            ),
+            reason="automatic rollback: reviewer did not accept the proposed patch",
+        )
+        apply_patch(
+            self.db,
+            self.job.model_copy(update={"run_epoch": self.run_epoch}),
+            self.copy,
+            inverse,
+            block_id=issue.block_id,
+        )
+        record_event(
+            self.db,
+            self.job_id,
+            "patch_rolled_back",
+            f"{patch.patch_id} was removed after verdict {verdict_id}",
+        )
 
     def _review_prior_repair(self, issue: Issue, state: JobState) -> StepOutcome:
         """Check whether another accepted edit already resolved a semantic duplicate.
@@ -1370,7 +1600,7 @@ class CurationCouncil:
         save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
         return StepOutcome(True, f"{issue.issue_id} still needs a patch", state)
 
-    def _ask_reviewer(self, issue: Issue):
+    def _ask_reviewer(self, issue: Issue, *, attempt_no: int | None = None):
         source_parse = self.source_workbook()
         current = self.current_workbook()
         original_block = source_parse.block_by_id(issue.block_id)
@@ -1391,7 +1621,7 @@ class CurationCouncil:
             self.client,
             issue=issue,
             context=context,
-            attempt_no=issue.attempts_used or 1,
+            attempt_no=attempt_no or issue.attempts_used or 1,
             job_id=self.job_id,
             taint=self.taint,
             role=issue.reviewer_role,
@@ -1622,6 +1852,18 @@ def _latest_feedback(db: Database, issue_id: str) -> str:
             "symbolic-equivalence check in `derivation`; do not leave it empty."
         )
     return feedback
+
+
+def _verdict_for_attempt(db: Database, issue_id: str, attempt_no: int):
+    """A verdict already committed for this exact Writer attempt, if recovery needs it."""
+    from .models import ReviewVerdict
+
+    row = db.connection.execute(
+        "SELECT payload_json FROM review_verdicts WHERE issue_id = ? AND attempt_no = ? "
+        "ORDER BY decided_at DESC LIMIT 1",
+        (issue_id, attempt_no),
+    ).fetchone()
+    return ReviewVerdict.model_validate_json(row["payload_json"]) if row else None
 
 
 def _latest_attempt(db: Database, issue_id: str) -> RepairAttempt | None:

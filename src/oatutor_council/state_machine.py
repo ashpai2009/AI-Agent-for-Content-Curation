@@ -121,9 +121,11 @@ _ISSUE_FLOW: dict[IssueState, frozenset[IssueState]] = {
     IssueState.ACCEPTED: _REOPENABLE,
     IssueState.REFUTED: _REOPENABLE,
     IssueState.SUPERSEDED: _REOPENABLE,
-    # The one true dead end. An issue a person has to look at cannot be un-escalated by
-    # anything the council does next.
-    IssueState.NEEDS_HUMAN_REVIEW: frozenset(),
+    # A later accepted sibling repair can make an escalated deterministic finding cease
+    # to exist. `SUPERSEDED` is the only honest transition then: retaining the stale
+    # escalation tells a curator to inspect a defect the final workbook does not have.
+    # It cannot return to the repair loop or become accepted/refuted.
+    IssueState.NEEDS_HUMAN_REVIEW: frozenset({IssueState.SUPERSEDED}),
 }
 
 LEGAL_ISSUE_TRANSITIONS: dict[IssueState, frozenset[IssueState]] = {

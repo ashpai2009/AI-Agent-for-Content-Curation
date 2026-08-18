@@ -83,10 +83,11 @@ def test_a_failed_job_can_only_re_enter_at_the_beginning():
 
 
 
-def test_an_escalated_issue_goes_nowhere():
-    """The one true dead end. Nothing the council does next can un-escalate an issue a
-    person has been asked to look at."""
-    assert LEGAL_ISSUE_TRANSITIONS[IssueState.NEEDS_HUMAN_REVIEW] == frozenset()
+def test_an_escalated_issue_can_only_be_superseded_when_the_defect_disappears():
+    """It cannot re-enter repair; final reconciliation may only remove a stale alert."""
+    assert LEGAL_ISSUE_TRANSITIONS[IssueState.NEEDS_HUMAN_REVIEW] == frozenset(
+        {IssueState.SUPERSEDED}
+    )
 
 
 @pytest.mark.parametrize(

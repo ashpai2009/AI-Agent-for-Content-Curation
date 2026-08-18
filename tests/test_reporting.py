@@ -283,6 +283,44 @@ def test_the_report_still_hands_over_what_was_accepted(reports):
     assert reports.validation_report["issues_superseded"] == 0
 
 
+def test_cells_changed_is_net_output_not_retry_and_rollback_operations():
+    now = datetime.now(timezone.utc)
+    forward = ChangeRecord(
+        change_id="forward",
+        issue_id="a",
+        patch_id="p1",
+        block_id="block-0000",
+        row=3,
+        column=5,
+        column_key=ColumnKey.ANSWER,
+        before="1/2",
+        after="0.5",
+        applied_at=now,
+    )
+    rollback = forward.model_copy(
+        update={
+            "change_id": "rollback",
+            "patch_id": "rollback-v1",
+            "before": "0.5",
+            "after": "1/2",
+        }
+    )
+    reports = build_reports(
+        job_id="job-1",
+        state=JobState.NEEDS_HUMAN_ATTENTION,
+        ledger=IssueLedger(job_id="job-1", issues=()),
+        changes=[forward, rollback],
+        verdicts=(),
+        attempts=(),
+        findings=(),
+    )
+
+    assert reports.validation_report["changes_applied"] == 0
+    assert reports.validation_report["edit_operations"] == 2
+    assert reports.change_log["change_count"] == 0
+    assert reports.change_log["edit_operation_count"] == 2
+
+
 def test_an_integrity_failure_dominates_the_summary():
     """Content counts are irrelevant next to an output file that cannot be trusted."""
     ledger = IssueLedger(job_id="job-1", issues=())
