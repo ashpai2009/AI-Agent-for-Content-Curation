@@ -318,6 +318,11 @@ def _validation_report(
         "issues_reopened": (rediscoveries or {}).get("issue_reopened", 0),
         "findings_absorbed": (rediscoveries or {}).get("finding_absorbed", 0),
         "instruction_claims": resolved_claims,
+        # One flag on every stored segment records a document-wide event. Surface it in
+        # the report so a bounded extraction is never mistaken for complete instructions.
+        "instruction_document_truncated": any(
+            bool(claim.get("truncated")) for claim in claims
+        ),
         "instruction_claims_confirmed": _count_claims(
             resolved_claims, ClaimOutcome.CONFIRMED
         ),
@@ -358,9 +363,18 @@ def unresolved_summary(
             "It must not be used until a person has reviewed the validation report."
         )
     if state is JobState.SUCCEEDED:
+        # Scoped deliberately to what was *detected*. Every issue this job opened is
+        # resolved and every registered rule passes -- neither of which is a statement
+        # about defects nobody found. Detection is the model's judgment and is only
+        # measurable against an evaluation key, which an ordinary workbook does not have;
+        # held-out scoring found two missed defects in one job that reported this and five
+        # in another. Saying so here is the difference between a true claim and a
+        # comfortable one.
         return (
             f"All {len(ledger.issues)} issue(s) reached a resolved state and every "
-            "deterministic check passed."
+            "deterministic check passed. This covers what the council detected; "
+            "detection coverage for this workbook is unknown, so a curator should "
+            "review the result before publishing it."
         )
     needing = ledger.by_state(IssueState.NEEDS_HUMAN_REVIEW)
     if needing:
@@ -437,6 +451,15 @@ def render_markdown(reports: JobReports) -> str:
         lines += [f"- {f['message']}" for f in validation["integrity_findings"]]
 
     claims = validation.get("instruction_claims") or []
+    if validation.get("instruction_document_truncated"):
+        lines += [
+            "",
+            "## Instruction document warning",
+            "",
+            "The supplied instruction document exceeded the 200,000-character extraction "
+            "limit. Its tail was not sent to the agents; review the omitted material before "
+            "using this output.",
+        ]
     if claims:
         lines += ["", "## The instructions you supplied", ""]
         # Every claim, including the ones nothing concluded about. A report that listed
@@ -471,13 +494,26 @@ def render_markdown(reports: JobReports) -> str:
             )
 
     remaining = validation["remaining_findings"]
-    if remaining:
-        lines += ["", "## Remaining findings", ""]
-        for item in remaining[:100]:
+    remaining_work = [
+        item
+        for item in remaining
+        if item["repairable"] or item["severity"] in {"blocking", "error"}
+    ]
+    observations = [item for item in remaining if item not in remaining_work]
+    if remaining_work:
+        lines += ["", "## Remaining work", ""]
+        for item in remaining_work[:100]:
             location = f"row {item['row']}" if item["row"] else "workbook"
             lines.append(f"- `{item['severity']}` {item['code']} ({location}) — {item['message']}")
-        if len(remaining) > 100:
-            lines.append(f"- …and {len(remaining) - 100} more")
+        if len(remaining_work) > 100:
+            lines.append(f"- …and {len(remaining_work) - 100} more")
+    if observations:
+        lines += ["", "## Observations", ""]
+        for item in observations[:100]:
+            location = f"row {item['row']}" if item["row"] else "workbook"
+            lines.append(f"- `{item['severity']}` {item['code']} ({location}) — {item['message']}")
+        if len(observations) > 100:
+            lines.append(f"- …and {len(observations) - 100} more")
 
     return "\n".join(lines) + "\n"
 

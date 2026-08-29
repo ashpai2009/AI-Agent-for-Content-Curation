@@ -24,8 +24,10 @@ from ..models import (
 )
 from .isolation import assert_no_private_fields
 
-#: The columns worth showing an agent. Metadata is included because misplaced metadata is
-#: a real defect and the signature a column shift leaves behind.
+#: Every fixed A-P column an agent is allowed to name. Hiding a column while leaving it in
+#: the response schema asks the Writer to invent its exact `before` value and leaves both
+#: auditors unable to inspect it. `images` is sent only as the cell's text/reference; the
+#: service does not fetch, render, OCR, or otherwise inspect image content.
 DISPLAY_COLUMNS = (
     ColumnKey.PROBLEM_NAME,
     ColumnKey.ROW_TYPE,
@@ -36,8 +38,12 @@ DISPLAY_COLUMNS = (
     ColumnKey.HINT_ID,
     ColumnKey.DEPENDENCY,
     ColumnKey.MC_CHOICES,
+    ColumnKey.IMAGES,
+    ColumnKey.PARENT,
     ColumnKey.OER_SRC,
+    ColumnKey.OPENSTAX_KC,
     ColumnKey.KC,
+    ColumnKey.TAXONOMY,
     ColumnKey.LICENSE,
 )
 
@@ -123,6 +129,17 @@ def render_block_diff(original: ProblemBlock, current: ProblemBlock) -> str:
     return "\n".join(lines) if lines else "no changes"
 
 
+def render_candidate_edits(edits) -> str:
+    """The public patch artefact: locations and values, never Writer reasoning."""
+    if not edits:
+        return "none"
+    return "\n".join(
+        f"row {edit.row} {edit.column_key.value if edit.column_key else edit.column}: "
+        f"{edit.before!r} -> {edit.after!r}"
+        for edit in edits
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Reviewer context
 # --------------------------------------------------------------------------------------
@@ -143,6 +160,7 @@ class ReviewerContext:
     block_diff: str
     conventions: str
     deterministic_findings: str
+    candidate_edits: str = ""
     rules_reminder: str = ""
     #: Policy the curator supplied. A reviewer has to judge a repair against the rules it
     #: was made under, so these travel here -- unlike the errata claims, which are
@@ -158,6 +176,13 @@ class ReviewerContext:
             DataSection("Conventions this workbook follows", self.conventions),
             DataSection("Deterministic findings still open", self.deterministic_findings),
         ]
+        if self.candidate_edits.strip():
+            sections.append(
+                DataSection(
+                    "Candidate edits being reviewed (artifact only)",
+                    self.candidate_edits,
+                )
+            )
         if self.curator_rules.strip():
             sections.append(
                 DataSection("Curation rules the curator supplied", self.curator_rules)

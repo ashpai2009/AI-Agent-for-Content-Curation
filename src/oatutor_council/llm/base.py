@@ -14,6 +14,7 @@ the provider module stays small enough to check against the SDK notes line by li
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 import time
@@ -24,6 +25,13 @@ from typing import Any, Callable, Protocol, TypeVar
 from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def canonical_schema_json(schema: dict[str, Any]) -> str:
+    """The exact stable JSON bytes passed to the CLI and included in the call hash."""
+    return json.dumps(
+        schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
 
 class AgentRole(StrEnum):
@@ -230,8 +238,9 @@ class LLMRequest:
     system_prompt: str
     user_payload: str
     schema: dict[str, Any]
-    #: Reproducibility lever. There is no temperature in this API; determinism comes
-    #: from a fixed seed plus schema-constrained output.
+    #: Audit metadata retained for provider-neutral callers. The Claude CLI adapter has
+    #: no seed flag and does not transmit this value, so it must not be described as a
+    #: reproducibility control for production calls.
     seed: int | None = None
     #: Correlates the call with the job and issue it belongs to, for the audit trail.
     job_id: str = ""
@@ -248,6 +257,8 @@ class LLMRequest:
         digest.update(self.system_prompt.encode())
         digest.update(b"\x1f")
         digest.update(self.user_payload.encode())
+        digest.update(b"\x1f")
+        digest.update(canonical_schema_json(self.schema).encode())
         return digest.hexdigest()
 
 

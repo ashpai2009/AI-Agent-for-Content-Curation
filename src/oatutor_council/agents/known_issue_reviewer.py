@@ -32,6 +32,7 @@ from .rendering import (
     ReviewerContext,
     render_block,
     render_block_diff,
+    render_candidate_edits,
     render_conventions,
     render_findings,
     render_issue,
@@ -39,7 +40,14 @@ from .rendering import (
 from .schemas import ReviewerResponse
 
 INSTRUCTIONS = """\
-Decide whether the issue below has been resolved by the change made to this block.
+Decide whether the issue below is resolved by the current artifact shown.
+
+If a candidate-edits section is present, the candidate has not been written: `accept`
+authorises those exact edits, while `revise` or `human_review` leaves the workbook
+unchanged. If that section is absent, this may be an unbiased check before any Writer
+attempt. `accept` then means the current artifact is already correct and the claim should
+be refuted (or was resolved by a visible sibling repair); `revise` means the defect is
+genuinely present and your feedback must tell the Writer what to correct.
 
 Verify the mathematics yourself. Check the whole block, not only the changed cells: an
 edit can be right on its own line and still break a row that depends on it.
@@ -63,11 +71,12 @@ def build_context(
     conventions,
     deterministic_findings: Sequence[ValidationFinding] = (),
     curator_rules: Sequence[str] = (),
+    candidate_edits=(),
 ) -> ReviewerContext:
     """Assemble exactly what a reviewer may see.
 
-    Note what is not a parameter: the patch, its rationale, its confidence, and the
-    Writer's derivation. There is nowhere to put them.
+    Only the public patch artefact (cell locations and before/after values) may be passed.
+    Its rationale, confidence and derivation remain structurally unavailable.
     """
     return ReviewerContext(
         issue_summary=render_issue(issue),
@@ -76,6 +85,7 @@ def build_context(
         block_diff=render_block_diff(original_block, current_block),
         conventions=render_conventions(conventions),
         deterministic_findings=render_findings(deterministic_findings),
+        candidate_edits=render_candidate_edits(candidate_edits),
         curator_rules="\n".join(f"- {rule}" for rule in curator_rules),
     )
 
@@ -98,17 +108,15 @@ def review(
     payload = bundle.render()
 
     if taint is not None:
-        # The load-bearing check. A violation raises and the job fails; it is never
-        # downgraded to a warning, because a leaked review still counts as a review.
+        # A backstop against an exact copy of private text, not the boundary itself --
+        # that is `ReviewerContext`, which cannot name a private type. An exact copy still
+        # fails the job; a merely-similar span is recorded for a human.
         #
-        # Public ground is the workbook and the rule engine -- the block before, the block
-        # now, the diff between them, the conventions and the deterministic findings. A
-        # Writer's derivation quotes those cells because that is what reasoning about a
-        # cell looks like, and the reviewer is shown the same cells because that is what
-        # it is judging; without this the overlap reads as a leak and fails a correct job.
-        #
-        # `issue_summary` is **not** on this list. It can carry prose an agent wrote, and
-        # exempting it would let a rationale smuggled into a description exempt itself.
+        # Public ground is everything in this payload whose provenance is public: the
+        # workbook, the rule engine, the curator's rules, the public patch artefact, and
+        # the auditor's public finding. A Writer's derivation quotes the cells it reasons
+        # about because that is what reasoning about a cell looks like, and the reviewer is
+        # shown the same cells because that is what it is judging.
         taint.assert_clean(
             payload,
             context=role.value,
@@ -118,8 +126,16 @@ def review(
                 context.block_diff,
                 context.conventions,
                 context.deterministic_findings,
+                context.candidate_edits,
                 context.curator_rules,
             ),
+            # The issue summary is the auditor's own *public* finding -- the channel by
+            # which a defect is meant to reach a reviewer. So it is public ground for the
+            # auditor's private notes, which describe the same defect in the same sentence,
+            # and **not** for the Writer's rationale, which has no business being there.
+            # Blanket-exempting it would let a rationale smuggled into a description
+            # declare itself exempt, which is the leak this check exists for.
+            public_for={"auditor.": (context.issue_summary,)},
         )
 
     agent_role = (

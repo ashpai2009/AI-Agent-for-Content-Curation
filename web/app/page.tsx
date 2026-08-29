@@ -23,6 +23,7 @@ type Finding = {
   message: string;
   row?: number | null;
   problem_name?: string | null;
+  repairable: boolean;
 };
 
 type Report = {
@@ -39,6 +40,7 @@ type Report = {
   instruction_claims_confirmed: number;
   instruction_claims_refuted: number;
   instruction_claims_unresolved: number;
+  instruction_document_truncated: boolean;
   unresolved_summary: string;
 };
 
@@ -59,7 +61,7 @@ const PHASES: { states: string[]; label: string }[] = [
   { states: ["created", "ingesting"], label: "Reading the workbook" },
   { states: ["auditing"], label: "Auditing every problem block" },
   { states: ["repairing_known"], label: "Repairing what the audit found" },
-  { states: ["independent_review"], label: "Independent review of untouched problems" },
+  { states: ["independent_review"], label: "Independent review of every current problem" },
   {
     states: ["final_validation", "repairing_validation"],
     label: "Final validation",
@@ -84,8 +86,8 @@ function phaseIndex(state: string): number {
 const PURPOSES: { value: string; label: string; hint: string }[] = [
   {
     value: "auto",
-    label: "Work it out per paragraph",
-    hint: "Each passage is classified on its own wording. Right for mixed notes.",
+    label: "Auto-detect each passage",
+    hint: "Each blank-line-separated passage is classified separately. Best for mixed notes.",
   },
   {
     value: "errata",
@@ -95,17 +97,17 @@ const PURPOSES: { value: string; label: string; hint: string }[] = [
   {
     value: "rules",
     label: "Standing rules for the whole workbook",
-    hint: "Applied as policy by the writer and both reviewers, on every call.",
+    hint: "Applied as policy by the auditor, writer, and both reviewers.",
   },
   {
     value: "notes",
     label: "Background, not instructions",
-    hint: "Recorded with the job and not acted on.",
+    hint: "Shown to the first auditor as context, but never treated as a rule or defect claim.",
   },
 ];
 
-/** The service caps curator policy so it does not ride on every call unbounded. */
-const RULE_CHARACTER_CAP = 4000;
+/** The instruction reader's one documented extracted-text bound. */
+const INSTRUCTION_CHARACTER_CAP = 200_000;
 
 /* ---------------------------------------------------------------------------------- */
 /* Page                                                                                */
@@ -125,6 +127,14 @@ export default function Page() {
   const [submitting, setSubmitting] = useState(false);
 
   const fileInput = useRef<HTMLInputElement>(null);
+
+  // The job is durable on the backend, so its only browser reference must survive a
+  // refresh too. Keeping the latest opaque id locally restores polling/download without
+  // copying workbook content or the API token into browser storage.
+  useEffect(() => {
+    const saved = window.localStorage.getItem("oatutor-current-job");
+    if (saved && /^[a-f0-9]{32}$/.test(saved)) setJobId(saved);
+  }, []);
 
   /* -- readiness ------------------------------------------------------------------- */
 
@@ -151,7 +161,12 @@ export default function Page() {
         const body = await response.json();
         if (!live) return;
         if (!response.ok) {
-          setError(body.error || "the council service stopped answering");
+          if (response.status === 404) {
+            window.localStorage.removeItem("oatutor-current-job");
+            setJobId(null);
+            setStatus(null);
+          }
+          setError(body.error || body.detail || "the council service stopped answering");
           return;
         }
         setStatus(body as JobStatus);
@@ -191,10 +206,11 @@ export default function Page() {
       const response = await fetch("/api/jobs", { method: "POST", body: form });
       const body = await response.json();
       if (!response.ok) {
-        setError(body.error || "the workbook was not accepted");
+        setError(body.error || body.detail || "the workbook was not accepted");
         return;
       }
       setJobId(body.job_id);
+      window.localStorage.setItem("oatutor-current-job", body.job_id);
     } catch {
       setError("could not reach this site's own API route");
     } finally {
@@ -203,6 +219,7 @@ export default function Page() {
   }, [file, notes, purpose]);
 
   const reset = () => {
+    window.localStorage.removeItem("oatutor-current-job");
     setJobId(null);
     setStatus(null);
     setReport(null);
@@ -341,19 +358,17 @@ export default function Page() {
                 ))}
               </select>
               <span
-                className={`counter${
-                  purpose === "rules" && notes.length > RULE_CHARACTER_CAP ? " over" : ""
-                }`}
+                className={`counter${notes.length > INSTRUCTION_CHARACTER_CAP ? " over" : ""}`}
               >
                 {notes.length.toLocaleString()} characters
               </span>
             </div>
             <p className="hint" style={{ marginTop: 10 }}>
               {PURPOSES.find((option) => option.value === purpose)?.hint}{" "}
-              {purpose === "rules" && notes.length > RULE_CHARACTER_CAP && (
+              {notes.length > INSTRUCTION_CHARACTER_CAP && (
                 <strong>
-                  Rules are capped at {RULE_CHARACTER_CAP.toLocaleString()} characters
-                  because they ride on every call; the rest will be cut.
+                  Shorten this to {INSTRUCTION_CHARACTER_CAP.toLocaleString()} characters
+                  so no instruction text is omitted.
                 </strong>
               )}
             </p>
@@ -367,7 +382,12 @@ export default function Page() {
             <button
               className="primary"
               onClick={submit}
-              disabled={!file || submitting || (health ? !health.ready : false)}
+              disabled={
+                !file ||
+                submitting ||
+                notes.length > INSTRUCTION_CHARACTER_CAP ||
+                (health ? !health.ready : false)
+              }
             >
               {submitting ? "Starting…" : "Start curation"}
             </button>
@@ -461,9 +481,15 @@ function Result({
       : status.state === "needs_human_attention"
         ? "warn"
         : "bad";
+  // "Succeeded" means the pipeline completed and every issue it *opened* reached a
+  // resolved state. It does not mean every mathematical defect in the workbook was found:
+  // detection is the model's judgment and is not measurable without an evaluation key.
+  // Held-out scoring caught two missed defects in one job that reported this, and five in
+  // another. The old wording — "nothing left outstanding" — told a curator the opposite,
+  // which is the same class of lie as reporting success over a broken file.
   const headline =
     status.state === "succeeded"
-      ? "Finished — nothing left outstanding"
+      ? "Pipeline completed — all detected issues resolved"
       : status.state === "needs_human_attention"
         ? "Finished, but some of it needs a person"
         : "The job could not finish";
@@ -471,17 +497,17 @@ function Result({
   // Artefacts exist for the first two; a job that failed mid-pipeline may have none.
   const downloadable = status.state === "succeeded" || status.state === "needs_human_attention";
 
-  // Remaining findings are split by severity rather than counted together, because the two
-  // halves mean opposite things to a curator. `blocking`/`error` is work left undone.
-  // `warning`/`observation` is the council reporting something it deliberately never
-  // corrects -- the correct MC answer sitting first, or an optional header this workbook
-  // does not carry. Counting them as one number told a curator whose workbook was finished
-  // that it was not, which is the failure mode this whole system exists to avoid.
-  const openErrors = report.remaining_findings.filter(
-    (f) => f.severity === "blocking" || f.severity === "error",
+  // Repairability and severity answer different questions. A warning such as trailing
+  // whitespace is repairable and remains work; a warning about a valid house style is an
+  // observation. A non-repairable error still needs a person. This mirrors the backend's
+  // unresolved predicate rather than guessing from severity alone.
+  const openIssues = report.remaining_findings.filter(
+    (f) =>
+      f.repairable || f.severity === "blocking" || f.severity === "error",
   );
   const observations = report.remaining_findings.filter(
-    (f) => f.severity !== "blocking" && f.severity !== "error",
+    (f) =>
+      !f.repairable && f.severity !== "blocking" && f.severity !== "error",
   );
 
   return (
@@ -506,8 +532,8 @@ function Result({
             <dd>{report.changes_applied}</dd>
           </div>
           <div>
-            <dt>Open errors</dt>
-            <dd>{openErrors.length}</dd>
+            <dt>Open issues</dt>
+            <dd>{openIssues.length}</dd>
           </div>
           <div>
             <dt>Observations</dt>
@@ -521,6 +547,16 @@ function Result({
               The integrity check did not pass. Something in the output file cannot be
               traced to an approved edit, so do not use it until the findings below are
               understood.
+            </p>
+          </div>
+        )}
+
+        {report.instruction_document_truncated && (
+          <div className="notice" style={{ marginTop: 16 }}>
+            <p>
+              The instruction document exceeded the 200,000-character extraction limit.
+              Its tail was not sent to the agents, so review that omitted material before
+              using this output.
             </p>
           </div>
         )}
@@ -559,11 +595,11 @@ function Result({
         </section>
       )}
 
-      {openErrors.length > 0 && (
+      {openIssues.length > 0 && (
         <Findings
-          title="Open errors"
+          title="Open issues"
           hint="Still present in the workbook as handed back, and still work to do."
-          findings={openErrors}
+          findings={openIssues}
         />
       )}
 

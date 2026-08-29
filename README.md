@@ -6,16 +6,18 @@ A curator uploads one `.xlsx`, optionally attaches a text instruction document, 
 **one** job. They get back a corrected workbook, a complete issue ledger, a cell-level
 change log, every reviewer decision and repair attempt, and a final validation report.
 
-**The curator never names a problem, a cell, or a correction.** The system finds the
-issues itself.
+The system finds issues autonomously even when the curator supplies no problem name, cell,
+or correction. Optional notes can also point it at a known defect or add workbook-specific
+policy.
 
 ```
 XLSX (required) + optional instruction document (.pdf/.docx/.txt/.md)
   → Initial Auditor          scans every problem block
+  → Claim Reviewer           verifies unsupported findings before any edit
   → Writer                   corrects identified issues
-  → Known-Issue Reviewer     checks those corrections (fresh context)
+  → Known-Issue Reviewer     checks simulated corrections before they are written
   → repair loop              bounded at three attempts per issue
-  → Independent Reviewer     sweeps problems nobody flagged (different prompt)
+  → Independent Reviewer     rechecks every current problem from scratch
   → repair loop
   → final deterministic validation
   → corrected XLSX + reports
@@ -29,9 +31,9 @@ XLSX (required) + optional instruction document (.pdf/.docx/.txt/.md)
 safety-critical.**
 
 The model decides what is mathematically wrong, what the correction should be, whether a
-correction is right, and what feedback to give. Python parses the workbook, applies exact
-cell edits, enforces the rules, checks edit scope, compares source against output, manages
-retries, and generates every report.
+correction is right, and what feedback to give. Python parses the workbook, simulates exact
+cell edits, enforces the rules, checks edit scope, writes only reviewer-approved patches,
+compares source against output, manages retries, and generates every report.
 
 If you find yourself asking a model to do something a function could do exactly, that is a
 design error. Nothing about a specific problem, cell, or correction is hardcoded anywhere.
@@ -152,10 +154,11 @@ go through the same `RULES | ERRATA | NOTES` classification and the same untrust
 fencing as an attached file. The agents' own prompts stay in the service and are never
 served to the page.
 
-What is left over is reported in two figures, never one: **open errors** (`blocking` and
-`error` — work still to do) and **observations** (`warning` and `observation` — things the
-council reports and deliberately never corrects, like a correct answer that happens to be
-listed first, or an optional column this workbook does not use). They are counted apart
+What is left over is reported in two figures, never one: **open issues** (anything still
+repairable, plus non-repairable errors that need a person) and **observations**
+(non-repairable warnings/observations, like a correct answer that happens to be listed
+first, a valid house-style namespace, or an optional column this workbook does not use).
+They are counted apart
 because a single total makes a finished workbook look unfinished, and a curator who cannot
 trust the summary has to re-check the file by hand, which is the whole job they came here to
 avoid.
@@ -193,6 +196,9 @@ The prompts ship **inside** the package. They started outside it, on the reasoni
 they are content rather than code — which does not survive a wheel install, where the
 directory beside the source tree is site-packages and every agent raises on its first
 call. `OATUTOR_PROMPT_ROOT` overrides the location for anyone iterating on wording.
+`scripts/verify_wheel.py dist/*.whl` also refuses a release artifact that omits the newest
+prompts, declares a retired SDK, or resurrects the deleted provider module from a stale
+local `build/` directory; CI runs it before installing the wheel.
 
 ### The guarantees, and how each is enforced
 
@@ -214,11 +220,20 @@ panes, data validations, hyperlinks, and images. Any difference not traceable to
 accepted edit or to the approved edited-row rule **fails the gate**. There is no blanket
 "formatting normalisation" category, because that bucket would absorb real damage.
 
-**Rejected proposals cannot leak into the download.** A reviewer examines the rendered
-working workbook, but `revise` and `human_review` immediately reverse the proposal through
-the same crash-safe intent protocol. The append-only audit log retains both operations;
-the UI's **cells changed** metric counts only distinct cells whose final value differs from
-the source.
+**Rejected proposals cannot leak into the download.** A Writer patch is simulated in
+memory. The reviewer sees the full simulated block, source-to-candidate diff, and exact
+candidate cells before deciding. `revise` and `human_review` write nothing; only `accept`
+creates an approved patch that the next crash-safe step may apply. A rollback path exists
+only to resume jobs created under the former apply-before-review lifecycle. The UI's
+**cells changed** metric counts distinct source-to-output cell differences.
+
+**Unsupported findings do not authorize edits by themselves.** A deterministic finding
+is backed by its registered rule. For a model-only finding, the other audit role examines
+the current block from scratch without seeing the original accusation, target cells,
+explanation, or proposed replacement. Only an independently rediscovered defect at the
+same exact cells and in the same category reaches the Writer. This separates “is the source
+wrong?” from the later, independently recorded question “is this candidate correction
+right?” and prevents a plausible accusation from anchoring both judgments.
 
 **Mechanical cleanup does not spend model calls.** Boundary whitespace is trimmed exactly,
 duplicate metadata on non-problem rows is cleared when the problem row already carries it,
@@ -242,14 +257,16 @@ the ordinary case rather than evidence of a leak. Reading it as one killed a liv
 first repair was correct. What is never public ground is the outgoing payload itself, which
 would subtract everything from everything and leave a check that cannot fail.
 
-**Every model call is written down.** One row per request — role, model, status, prompt
-hash, pinned prompt version, latency, token usage, and the exact prompt text — including
-the calls that failed, with the provider's own status. The recording is a wrapper around
+**Every model call is written down.** One row per physical invocation — role, model,
+status, a hash over the complete system prompt + user payload + JSON response schema,
+pinned prompt version, latency, token usage, and prompt text up to the documented audit
+cap — including failed calls with the provider's own status. The recording is a wrapper around
 the client rather than a call inside each agent, so no agent can forget it. Prompt versions
-are pinned per job, so deploying a new prompt mid-job cannot mean one attempt ran under one
-set of instructions and the next under another. Production launches one isolated Claude
-Code CLI process per physical call through the local subscription login; the application
-has no API key or SDK fallback.
+and composed prompt hashes are enforced per job, and a separate pipeline-contract pin
+covers Python-side payload and orchestration changes. Deploying mid-job therefore cannot
+silently run later attempts under a different contract. Production launches one isolated
+Claude Code CLI process per physical call through the local subscription login; the
+application has no API key or SDK fallback.
 
 **Workbook cells are hostile input.** They reach every agent inside fenced, labelled data
 sections with a **per-call random delimiter**, and anything resembling a fence is
@@ -262,7 +279,8 @@ intent row before any byte is written, an atomic `os.replace` from a temp file i
 job directory, then the commit. Recovery decides roll-forward versus re-apply by **reading
 the target cells**, never by hashing the file — openpyxl output is not byte-reproducible,
 so the expected hash could never be computed in advance. A partially-applied patch is
-impossible under `os.replace` and therefore means external corruption.
+impossible under `os.replace` and therefore means external corruption. Recovery runs on
+the first step of every replacement worker, regardless of which durable phase it resumes.
 
 **The job always terminates.** Three independent brakes: three attempts per issue
 (reserved *before* the model call, so a crash loop cannot burn unbounded spend against a
@@ -344,6 +362,9 @@ The properties that matter:
 
 Settings are prefixed `COUNCIL_` because `CLAUDE_EFFORT` is a variable the CLI itself sets:
 unprefixed, the service would inherit an effort level from whatever session launched it.
+Optional per-role overrides use `COUNCIL_INITIAL_AUDITOR_EFFORT`,
+`COUNCIL_WRITER_EFFORT`, `COUNCIL_KNOWN_ISSUE_REVIEWER_EFFORT`, and
+`COUNCIL_INDEPENDENT_REVIEWER_EFFORT`; they are validated at startup and pinned per job.
 
 **The adapter is versioned, and the version is pinned per job.** `CLI_ADAPTER_VERSION` decides
 what flags every call carries, so a job that started under one set and finished under another
@@ -379,19 +400,25 @@ Above 1 the response is per block, keyed by an opaque id generated for that call
 not decoration: **a block the model omitted is indistinguishable from a block it examined
 and found clean**, and marking the first done would report a workbook as reviewed when
 nothing looked at it. So a block is marked done only when its own result is present and
-valid; missing, duplicated and unknown ids all send the block back to the queue, and a
-finding whose rows lie entirely outside the block it was filed under is discarded rather
-than relocated.
+valid; missing, duplicated and unknown ids all send the block back to the queue. Each
+semantic finding names exact `(row, column)` target pairs—never separate arrays whose
+Cartesian product can authorize unintended cells—and a finding with any target outside
+its assigned block is discarded and that block is requeued rather than credited.
 
 **There is no `Conversation` object anywhere in the codebase**, and a test greps the whole
 package to keep it that way. Context isolation is not a discipline anyone has to remember;
 there is simply no message list that could carry reasoning forward.
 
-See `docs/claude-cli-notes.md` before touching `llm/claude_cli.py`. It records which flags
-were verified against the installed binary and — just as importantly — which were *not*:
-the response envelope has not been observed, so the parser checks each plausible location
-for structured output and fails loudly rather than guessing. `scripts/smoke_claude_cli.py`
-is what closes that gap.
+See `docs/claude-cli-notes.md` before touching `llm/claude_cli.py`. It records the flags
+verified against the installed binary and the live smoke result that confirmed structured
+output. The parser still fails loudly on an unknown envelope rather than guessing.
+
+[`docs/llm-data-contract.md`](docs/llm-data-contract.md) enumerates every system prompt,
+payload, schema, workbook field and environment value sent to the backend, plus everything
+that is deliberately excluded. [`docs/pilot-failure-analysis.md`](docs/pilot-failure-analysis.md)
+classifies the controlled-run failures as architecture versus prompt/model judgment.
+[`docs/deployment-readiness.md`](docs/deployment-readiness.md) separates what the local
+prototype proves from the work required for an organization-funded deployment.
 
 ---
 
@@ -421,6 +448,11 @@ notation rather than a missing parenthesis.
 
 **`scripts/evaluate_workbooks.py`** runs the deterministic core over the real corpus,
 read-only, hashing every file before and after.
+
+**`scripts/evaluate_controlled_run.py`** compares a corrected synthetic pilot with its
+source and hidden key. Exact keyed cells and unexpected changes are machine-scored;
+expectations stated only in prose are surfaced for manual review rather than guessed into
+a pass.
 
 **`scripts/shadow_run.py`** runs the *whole council* over a **copy** of one real workbook
 and prints what a real job would report. Offline by default — the scripted agents examine
@@ -453,52 +485,81 @@ duplicates could stay open after a sibling repair had already fixed them. Both a
 and this pilot is the evidence that the fixes work against live Claude rather than only
 against the scripted client.
 
-**Two editorial reservations the evaluation key does not capture**, and they are the more
-interesting half of the result. Both repairs below pass every deterministic gate, pass their
-reviewer, and are counted correct by the key — and a curator would still rewrite them:
+**Two editorial reservations the evaluation key did not capture** were later promoted into
+regression requirements. Both repairs passed the old deterministic gate and reviewer:
 
 - A "Which fraction…" problem had its `Answer` changed from `3/4` to `0.75`. The mathematics
   is equivalent and the choice now matches exactly, which is all the gates and the key ask
   for. But the question asks for a *fraction*, so the correct repair was the other direction:
-  keep `3/4` and fix the choice that read `0.75`. Nothing in the system currently knows that
-  a question's wording constrains which side of a mismatch should move.
+  keep `3/4` and fix the choice that read `0.75`. The gate now preserves fractional answers
+  when the task explicitly requests an exact value or fraction.
 - A new hint gave away the final answer (`5+5=10`) for a `2*5` problem. A hint that states the
   answer is a hint that does no work; "rewrite `2*5` as adding 5 two times" is the same repair
   done properly.
 
-Neither is a correctness bug, and neither should be chased with a deterministic rule — both
-are judgments about *what makes a good repair*, which is Writer-prompt territory. They are
-the open work, and they are recorded here rather than smoothed over because a pilot that only
-reports its score stops being evidence.
+The first has a safe deterministic boundary; the second remains instructional-quality
+judgment and is now explicit in the Writer and reviewer prompts. They remain recorded here
+because a pilot that only reports its score stops being evidence.
 
-**A later run on a harder 15-problem workbook (2026-08-16) first failed on the isolation
-false positive described above**, before any reviewer ran. After that fix the rerun passed at
-100% correctness and precision.
+### What the later controlled files established (2026-08-16 to 2026-08-17)
 
-It surfaced two detection misses worth naming, because both are the same species as the
-editorial gaps: a trigonometry problem answered with the smaller solution where the question
-asks for the larger, and a multiple-choice problem answered with a real solution where the
-question asks for the non-solution. Valid mathematics answering a different question from the
-one on the page — invisible to every rule, and the reason the golden collection gets the next
-of these rather than a live run.
+The later outputs do **not** support a claim of 100% correctness. Scoring the saved files
+directly with `scripts/evaluate_controlled_run.py` produced these exact-key results:
 
-It also produced two software fixes. `--max-turns` was 1, and four independent-review calls
-died on `Reached maximum number of turns (1)` before emitting their structured output; retry
-recovered every one, which made the ceiling a source of extra billed processes rather than a
-brake on them. It is now `COUNCIL_CLAUDE_MAX_TURNS`, default 2. And the page counted warnings
-and observations together under "still open", which told a curator that a finished workbook
-was unfinished; open errors and observations are now separate figures.
+| Workbook | Exact target cells | Unexpected changed cells |
+| --- | ---: | ---: |
+| hard 15 | 7 / 11 | 1 |
+| realistic 24 | 15 / 17 | 5 |
+| adversarial 24 | 21 / 31 | 4 |
+| adversarial interrupted rerun (working copy) | 24 / 31 | 3 |
 
-That second fix is worth stating as a rule rather than an incident. The backend was already
-right — `ledger.unresolved` deliberately excludes observations and non-repairable warnings,
-which is why the job reported `succeeded` — and only the page disagreed with it. A count that
-adds "the correct answer is listed first" and "this workbook omits an optional header" to the
-errors is a page telling a curator their finished work is unfinished, which is the exact
-failure this system exists to prevent, arriving through the one component nobody was auditing
-for it.
+Some key expectations may admit a manually acceptable alternative, so this is an exact-key
+score rather than a universal mathematical verdict. It is still enough to reject the old
+readiness claim: unexpected edits and missed exact targets are not a clean pass.
 
-The pilot has nothing left to teach. The next live test is a real workbook, on a copy, through
-`scripts/shadow_run.py`.
+Those files exposed architecture faults that prompt wording could never repair. The second
+reviewer skipped every block with an earlier ledger entry; rejected edits were written before
+review and then imperfectly rolled back; agents could not see all A–P fields; custom background
+was stored but sent nowhere; semantic target locations were represented ambiguously; and a
+second hidden cap silently omitted most of a long custom rules document. Those paths are now
+reworked. The Writer's proposal is simulated and independently accepted before any workbook
+byte changes, the second reviewer examines every current block, findings name exact cell pairs,
+and all accepted instructions reach their documented roles.
+
+The interrupted rerun is not a new accuracy claim: the job failed before final validation.
+It exposed an architecture crash where a Writer copied the `before` value from a neighboring
+cell into a candidate. Candidate review had moved before file application, but the exact-cell
+check had not moved with it. The gate now checks `before` against the parsed current block
+before simulation and again against the live file at apply time. The same run also led to a
+claim-blind cross-agent audit, root-defect queue priority, removal of the invalid
+“identifier numbers must be consecutive” assumption, an exact/fraction form guard, and a
+non-editing inverse-operation hint signal backed by explicit semantic prompt checks.
+
+Two semantic misses remain model-quality questions: answering with the smaller solution when
+the question asks for the larger, and selecting a real solution when the question asks for the
+non-solution. The prompts now require requested-form, domain and solution-count checks, but only
+a fresh held-out live evaluation at the intended model/effort/batch settings can measure that
+improvement. The historical files are regression evidence; they are not deployment proof.
+
+The next evaluation set is deliberately fresh: four plain workbooks in
+`outputs/deployment-heldout-suite-20260819/` contain 60 problems, 38 defect groups,
+52 automated checks and 22 clean controls. Their keys support valid alternatives,
+mathematical equivalence and multiple-choice invariants rather than requiring one arbitrary
+string.
+
+**They have now been run, and they are no longer held out.** Five live jobs against three of
+the four workbooks are recorded in `jobs/council.db`: two succeeded, one needed a person, and
+two were killed by the isolation false positive since fixed. Their failures went on to shape
+the architecture — the isolation demotion, the auditor/reviewer corroboration questions — so
+scoring against them now measures how well the system was fitted to them. **Reclassify these
+four as regression tests**: they can prove a known failure no longer recurs, which is worth
+having, and they cannot measure accuracy on unseen material.
+
+The fourth workbook (`heldout-04`) has never been run and is the only genuinely unseen
+material left. Deployment evidence needs a new set built after the architecture stops moving.
+
+Do not expose the `evaluation-keys/` files in an upload or custom prompt; score the corrected
+downloads only after every run finishes.
 
 ---
 

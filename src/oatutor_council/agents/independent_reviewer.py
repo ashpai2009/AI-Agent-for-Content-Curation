@@ -1,13 +1,12 @@
-"""The Independent Reviewer. Sweeps the problems nobody flagged.
+"""The Independent Reviewer. Sweeps every problem after known repairs.
 
 A different system prompt and a fresh context, because this is a genuinely different task
 from checking a correction. Here there is no claim to verify -- the reviewer works the
 mathematics from scratch and decides whether the block is sound.
 
-Silence is not evidence. A block reaching this stage was either never reported or had its
-only claim refuted, and neither says anything about whether it is correct. Treating "not
-mentioned" as "fine" would mean a bogus claim, once refuted, bought a problem permanent
-immunity from review.
+Silence is not evidence, and neither is one finding exhaustive. A block where the first
+auditor found one defect may contain a second defect the issue reviewer is not authorised
+to invent. Every current block is therefore reviewed from scratch after known repairs.
 
 Re-reviewing corrections to its own findings reuses the Known-Issue Reviewer's flow with
 this role's prompt: the task is identical once a claim exists, and duplicating it would
@@ -29,7 +28,7 @@ from ..models import (
     ValidationFinding,
     WorkbookConventions,
 )
-from .batching import attribute, make_items, rows_for_block
+from .batching import FindingAttributionError, attribute, cells_for_block, make_items
 from .isolation import TaintRegistry
 from .known_issue_reviewer import review as review_correction  # noqa: F401 - re-exported
 from .rendering import render_block, render_conventions, render_findings
@@ -40,7 +39,8 @@ from .schemas import (
 )
 
 INSTRUCTIONS = """\
-This problem block was not reported as defective. Examine it yourself.
+Examine this current problem block from scratch, whether or not another agent previously
+reported or repaired something in it.
 
 Solve the problem as a student would and check that the stated answer is what you get.
 Check that each step follows from the last, that hints point toward the answer, and that a
@@ -122,18 +122,24 @@ def sweep_block(
 
 
 def _to_finding(item, block: ProblemBlock) -> ValidationFinding:
-    rows = [row for row in item.rows if block.contains_row(row)]
-    row = rows[0] if rows else block.start_row
-    column = FIXED_COLUMNS[column_key(item.columns[0])] if item.columns else None
-    target_rows = rows or [block.start_row]
+    cells = [cell for cell in item.cells if block.contains_row(cell.row)]
+    if len(cells) != len(item.cells):
+        raise FindingAttributionError(
+            "finding names a cell outside the block it reviewed"
+        )
+    cells = list({(cell.row, cell.column): cell for cell in cells}.values())
+    row = cells[0].row
+    column = FIXED_COLUMNS[column_key(cells[0].column)]
+    target_rows = list(dict.fromkeys(cell.row for cell in cells))
+    target_columns = list(dict.fromkeys(cell.column for cell in cells))
     return ValidationFinding(
         code="INDEPENDENT_FINDING",
         severity=item.severity,
-        scope=FindingScope.CELL if column else FindingScope.ROW,
+        scope=FindingScope.CELL,
         message=item.problem,
         row=row,
         column=column,
-        column_key=column_key(item.columns[0]) if item.columns else None,
+        column_key=column_key(cells[0].column),
         block_id=block.block_id,
         problem_name=block.problem_name,
         detail={
@@ -141,23 +147,25 @@ def _to_finding(item, block: ProblemBlock) -> ValidationFinding:
             "category": item.category.value,
             "rows": target_rows,
             "cells": [
-                [target_row, FIXED_COLUMNS[column_key(name)]]
-                for target_row in target_rows
-                for name in item.columns
+                [cell.row, FIXED_COLUMNS[column_key(cell.column)]] for cell in cells
             ],
-            "column_keys": list(item.columns),
+            "column_keys": target_columns,
+            "cells_outside_block": [],
         },
     )
 
 
-def blocks_to_sweep(all_blocks: Sequence[ProblemBlock], reviewed: frozenset[str]):
-    """Every block without a surviving ledger entry.
+def blocks_to_sweep(
+    all_blocks: Sequence[ProblemBlock], reviewed: frozenset[str] = frozenset()
+):
+    """Every block, including blocks with an earlier finding or accepted repair.
 
-    `reviewed` deliberately excludes blocks whose only issue was refuted -- see
-    `IssueLedger.blocks_with_ledger_entry`. A refuted claim leaves the block untouched, so
-    it belongs in this sweep.
+    `reviewed` is retained as an ignored compatibility parameter for callers and old
+    integrations. A known-issue reviewer decides only whether one claim was resolved; it
+    cannot certify that the rest of the block contains no independent defect.
     """
-    return tuple(block for block in all_blocks if block.block_id not in reviewed)
+    del reviewed
+    return tuple(all_blocks)
 
 
 # --------------------------------------------------------------------------------------
@@ -165,14 +173,16 @@ def blocks_to_sweep(all_blocks: Sequence[ProblemBlock], reviewed: frozenset[str]
 # --------------------------------------------------------------------------------------
 
 BATCH_INSTRUCTIONS = """\
-Review each problem block below as a fresh reader who has been told nothing about it.
+Review each current problem block below from scratch, whether or not another agent
+previously reported or repaired something in it.
 
 Each block is in its own section whose label carries a `batch_item` id. Return one result
 per block, copying that id into `batch_item_id` exactly. A block you consider sound still
 needs its own result, with `block_is_sound` true and an empty `findings` list -- omitting a
 block does not mean it is sound, it means it was not reviewed, and it will be sent again.
 
-Report a finding only under the block it belongs to, and only with rows from that block.
+Report a finding only under the block it belongs to, and name only exact target cells
+whose rows are inside that block.
 
 Solve each problem as a student would and check that the stated answer is what you get.
 Check that each step follows from the last, that hints point toward the answer, and that a
@@ -204,17 +214,20 @@ def sweep_blocks(
     if not blocks:
         return (), ()
     if len(blocks) == 1:
-        result = sweep_block(
-            client,
-            block=blocks[0],
-            conventions=conventions,
-            deterministic_findings=findings_for(blocks[0]) if findings_for else (),
-            curator_rules=curator_rules,
-            job_id=job_id,
-            seed=seed,
-            taint=taint,
-            prompt_version=prompt_version,
-        )
+        try:
+            result = sweep_block(
+                client,
+                block=blocks[0],
+                conventions=conventions,
+                deterministic_findings=findings_for(blocks[0]) if findings_for else (),
+                curator_rules=curator_rules,
+                job_id=job_id,
+                seed=seed,
+                taint=taint,
+                prompt_version=prompt_version,
+            )
+        except FindingAttributionError:
+            return (), (blocks[0],)
         return (result,), ()
 
     items = make_items(blocks)
@@ -285,12 +298,12 @@ def sweep_blocks(
         findings: list[ValidationFinding] = []
         relocated = False
         for finding in result.findings:
-            rows = rows_for_block(finding.rows, item.block)
-            if rows is None:
+            cells = cells_for_block(finding.cells, item.block)
+            if cells is None:
                 relocated = True
                 continue
             findings.append(
-                _to_finding(finding.model_copy(update={"rows": rows}), item.block)
+                _to_finding(finding.model_copy(update={"cells": cells}), item.block)
             )
 
         if relocated:

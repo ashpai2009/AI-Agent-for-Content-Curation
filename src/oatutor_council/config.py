@@ -48,6 +48,12 @@ DEFAULT_CLAUDE_CLI_PATH = "claude"
 DEFAULT_CLAUDE_MODEL = "sonnet"
 DEFAULT_CLAUDE_EFFORT = "medium"
 VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+ROLE_EFFORT_ENV = {
+    "initial_auditor": "COUNCIL_INITIAL_AUDITOR_EFFORT",
+    "writer": "COUNCIL_WRITER_EFFORT",
+    "known_issue_reviewer": "COUNCIL_KNOWN_ISSUE_REVIEWER_EFFORT",
+    "independent_reviewer": "COUNCIL_INDEPENDENT_REVIEWER_EFFORT",
+}
 
 #: Turns per call. **2, not 1, and measured rather than chosen.** At 1 the live pilot lost
 #: four independent-review calls to `Reached maximum number of turns (1)` before the model
@@ -97,13 +103,6 @@ def _float(name: str, default: float) -> float:
         return float(raw)
     except ValueError as error:
         raise ValueError(f"{name} must be a number, got {raw!r}") from error
-
-
-def _bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -170,10 +169,6 @@ class Settings:
     #: deterministic findings and labels together, not `render_block` alone.
     scan_batch_max_characters: int = DEFAULT_SCAN_BATCH_MAX_CHARACTERS
 
-    #: Decision 1: reviewers judge the artefact, not the Writer's argument for it. Kept
-    #: as a flag so the opposite reading stays testable rather than unimaginable.
-    reviewer_sees_writer_rationale: bool = False
-
     def __post_init__(self) -> None:
         if not 1 <= self.scan_batch_size <= MAX_SCAN_BATCH_SIZE:
             raise ConfigurationError(
@@ -188,6 +183,23 @@ class Settings:
             raise ConfigurationError(
                 f"COUNCIL_CLAUDE_EFFORT must be one of {', '.join(VALID_EFFORT_LEVELS)}, "
                 f"got {self.claude_effort!r}"
+            )
+        unknown_roles = set(self.role_effort or {}) - set(ROLE_EFFORT_ENV)
+        if unknown_roles:
+            raise ConfigurationError(
+                "role_effort contains unknown role(s): "
+                + ", ".join(sorted(unknown_roles))
+            )
+        invalid_role_effort = {
+            role: effort
+            for role, effort in (self.role_effort or {}).items()
+            if effort not in VALID_EFFORT_LEVELS
+        }
+        if invalid_role_effort:
+            role, effort = next(iter(invalid_role_effort.items()))
+            raise ConfigurationError(
+                f"{ROLE_EFFORT_ENV[role]} must be one of "
+                f"{', '.join(VALID_EFFORT_LEVELS)}, got {effort!r}"
             )
         if self.claude_max_turns < 1:
             raise ConfigurationError(
@@ -272,6 +284,12 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
     if env_file is not None and Path(env_file).is_file():
         load_dotenv(env_file, override=False)
 
+    role_effort = {
+        role: os.environ[variable].strip()
+        for role, variable in ROLE_EFFORT_ENV.items()
+        if os.environ.get(variable, "").strip()
+    }
+
     return Settings(
         claude_cli_path=os.environ.get("COUNCIL_CLAUDE_CLI_PATH", DEFAULT_CLAUDE_CLI_PATH).strip()
         or DEFAULT_CLAUDE_CLI_PATH,
@@ -311,9 +329,9 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         run_deadline_seconds=_float("RUN_DEADLINE_SECONDS", DEFAULT_RUN_DEADLINE_SECONDS),
         api_token=os.environ.get("API_TOKEN", "").strip(),
         retention_days=_float("RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
+        role_effort=role_effort or None,
         scan_batch_size=_int("SCAN_BATCH_SIZE", DEFAULT_SCAN_BATCH_SIZE),
         scan_batch_max_characters=_int(
             "SCAN_BATCH_MAX_CHARACTERS", DEFAULT_SCAN_BATCH_MAX_CHARACTERS
         ),
-        reviewer_sees_writer_rationale=_bool("REVIEWER_SEES_WRITER_RATIONALE", False),
     )

@@ -103,6 +103,7 @@ def finding(
     column_key=None,
     severity: Severity | None = None,
     scope: FindingScope | None = None,
+    repairable: bool | None = None,
     **detail,
 ) -> ValidationFinding:
     """Build a finding, inheriting severity and scope from the registered rule.
@@ -122,7 +123,11 @@ def finding(
         column_key=column_key,
         block_id=context.block.block_id if context.block else None,
         problem_name=context.block.problem_name if context.block else None,
-        repairable=registered.repairable if registered else True,
+        repairable=(
+            repairable
+            if repairable is not None
+            else (registered.repairable if registered else True)
+        ),
         detail=detail,
     )
 

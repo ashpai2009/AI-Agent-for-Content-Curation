@@ -121,6 +121,44 @@ def test_hint_without_a_body(make_workbook):
     assert codes_for(path, "HINT_MISSING_BODY") == ["HINT_MISSING_BODY"]
 
 
+@pytest.mark.parametrize(
+    ("title", "wrong", "right"),
+    [
+        ("Undo the subtraction", "Subtract 7 from both sides.", "Add 7 to both sides."),
+        ("Undo addition", "Add 4 to both sides.", "Subtract 4 from both sides."),
+        ("Undo the multiplication", "Multiply both sides by 3.", "Divide both sides by 3."),
+        ("Undo division", "Divide both sides by 5.", "Multiply both sides by 5."),
+    ],
+)
+def test_a_hint_cannot_repeat_the_operation_it_says_it_undoes(
+    make_workbook, title, wrong, right
+):
+    bad = make_workbook(
+        [problem("a1"), step("a1", answer="3"), hint("a1", "h1", title=title, body=wrong)]
+    )
+    good = make_workbook(
+        [problem("a1"), step("a1", answer="3"), hint("a1", "h1", title=title, body=right)]
+    )
+
+    findings = findings_for(bad, "HINT_INVERSE_OPERATION_CONTRADICTION")
+    assert len(findings) == 1
+    assert findings[0].column == 4
+    assert findings[0].severity is Severity.WARNING
+    assert REGISTRY["HINT_INVERSE_OPERATION_CONTRADICTION"].repairable is False
+    assert codes_for(good, "HINT_INVERSE_OPERATION_CONTRADICTION") == []
+
+
+def test_ordinary_explanation_of_an_operation_is_not_an_inverse_claim(make_workbook):
+    path = make_workbook(
+        [
+            problem("a1"),
+            step("a1", answer="3"),
+            hint("a1", "h1", title="Practice subtraction", body="Subtract 7."),
+        ]
+    )
+    assert codes_for(path, "HINT_INVERSE_OPERATION_CONTRADICTION") == []
+
+
 def test_answer_without_a_type(make_workbook):
     path = make_workbook(
         [problem("a1"), cells(problem_name="a1", row_type="step", answer="1")]
@@ -181,6 +219,7 @@ def test_a_consistent_alternative_namespace_is_a_warning_not_an_error(make_workb
     findings = findings_for(path, "SCAFFOLD_NAMESPACE_DEVIATION")
     assert len(findings) == 2
     assert all(f.severity is Severity.WARNING for f in findings)
+    assert all(f.repairable is False for f in findings)
     assert all(f.detail["workbook_is_consistent"] for f in findings)
 
 
@@ -191,6 +230,7 @@ def test_a_mixed_namespace_workbook_keeps_the_error(make_workbook):
     )
     findings = findings_for(path, "SCAFFOLD_NAMESPACE_DEVIATION")
     assert [f.severity for f in findings] == [Severity.ERROR]
+    assert [f.repairable for f in findings] == [True]
 
 
 def test_the_specified_namespace_produces_no_finding(make_workbook):
@@ -198,15 +238,14 @@ def test_the_specified_namespace_produces_no_finding(make_workbook):
     assert codes_for(path, "SCAFFOLD_NAMESPACE_DEVIATION") == []
 
 
-def test_numbering_gap(make_workbook):
+def test_identifier_numbers_are_labels_and_may_have_gaps(make_workbook):
     path = make_workbook(
         [problem("a1"), step("a1"), scaffold("a1", "s1"), scaffold("a1", "s4")]
     )
-    findings = findings_for(path, "DEPENDENCY_NUMBERING_GAP")
-    assert findings[0].detail == {"previous": 1, "current": 4}
+    assert codes_for(path, "DEPENDENCY_NUMBERING_GAP") == []
 
 
-def test_contiguous_numbering_is_silent(make_workbook):
+def test_contiguous_numbering_is_also_silent(make_workbook):
     path = make_workbook(
         [problem("a1"), step("a1"), scaffold("a1", "s1"), scaffold("a1", "s2")]
     )

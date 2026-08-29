@@ -12,6 +12,7 @@ import pytest
 from oatutor_council.validation.mathematics import (
     MathVerdict,
     UnparseableExpression,
+    answers_equivalent,
     equations_equivalent,
     equivalent,
     is_numeric_literal,
@@ -119,6 +120,28 @@ def test_different_equations_are_different():
 
 def test_an_equation_and_a_bare_expression_are_not_the_same_kind_of_thing():
     assert equations_equivalent("x = 2", "2") is MathVerdict.DIFFERENT
+
+
+@pytest.mark.parametrize(
+    ("equation", "value"),
+    [
+        ("x=sqrt(4)", "2"),
+        (r"$$x=\sqrt{4}$$", "2"),
+        (r"$$\lim_{x\to2^-}f(x)=4$$", "4"),
+        ("f(2)=4", "4"),
+    ],
+)
+def test_a_graded_equation_and_its_value_are_the_same_answer(equation, value):
+    assert answers_equivalent(equation, value) is MathVerdict.EQUIVALENT
+
+
+def test_a_working_equation_is_not_collapsed_to_its_right_hand_side():
+    assert answers_equivalent("2*x=4", "4") is MathVerdict.DIFFERENT
+    assert answers_equivalent("x+1=3", "3") is MathVerdict.DIFFERENT
+
+
+def test_a_different_solved_value_is_still_different():
+    assert answers_equivalent("x=3", "2") is MathVerdict.DIFFERENT
 
 
 @pytest.mark.parametrize(

@@ -102,6 +102,32 @@ def test_a_well_formed_content_edit_is_accepted(parsed, block):
     assert result.accepted, result.rejection
 
 
+def test_a_candidate_with_the_before_value_from_a_different_cell_is_rejected(parsed, block):
+    """Pre-write review must never approve a simulation that cannot later be applied.
+
+    The live adversarial run copied the problem Body Text as the `before` value for its
+    Title edit. The old apply-before-review lifecycle caught that in the file writer; the
+    simulated-review lifecycle needs the same exact check before review.
+    """
+    result = check(
+        make_patch(
+            edit(
+                2,
+                ColumnKey.TITLE,
+                "this came from the body-text cell",
+                "Corrected title",
+            ),
+            derivation="",
+        ),
+        make_issue(cells=((2, 3),)),
+        block,
+        parsed,
+    )
+
+    assert result.rejection.code is RejectionCode.BEFORE_MISMATCH
+    assert result.rejection.detail == {"actual": "Convert"}
+
+
 def test_an_escalation_carries_no_edits_and_is_not_a_rejection(parsed, block):
     patch = Patch(
         patch_id="p1",
@@ -177,6 +203,101 @@ def test_a_non_mathematical_edit_needs_no_derivation(parsed, block):
     assert result.accepted, result.rejection
 
 
+def test_a_mathematics_issue_cannot_rewrite_a_provably_equivalent_answer(parsed, block):
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER, "pi/6", "2*pi/12")),
+        make_issue(category=IssueCategory.MATHEMATICS),
+        block,
+        parsed,
+    )
+    assert result.rejection.code is RejectionCode.MATHEMATICALLY_EQUIVALENT_REWRITE
+
+
+def test_an_exact_fraction_request_cannot_be_repaired_by_decimalizing_the_answer(
+    make_workbook,
+):
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("mc1", title="Select an exact fraction"),
+                step(
+                    "mc1",
+                    title="Choose the exact probability.",
+                    answer="1/2",
+                    answer_type="mc",
+                    mc_choices="0.5|1/3|1/4",
+                ),
+            ]
+        )
+    )
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER, "1/2", "0.5")),
+        make_issue(
+            category=IssueCategory.MULTIPLE_CHOICE,
+            rule_codes=("MC_ANSWER_NOT_IN_CHOICES",),
+            cells=((3, FIXED_COLUMNS[ColumnKey.ANSWER]),),
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.rejection.code is RejectionCode.REQUESTED_FORM_VIOLATION
+
+
+def test_exact_form_language_on_a_sibling_step_does_not_govern_this_answer(
+    make_workbook,
+):
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("mixed1", title="Complete both parts"),
+                step(
+                    "mixed1",
+                    title="Give an exact fraction.",
+                    answer="1/2",
+                    answer_type="algebra",
+                ),
+                step(
+                    "mixed1",
+                    title="Give a decimal approximation.",
+                    answer="0.25",
+                    answer_type="numeric",
+                ),
+            ]
+        )
+    )
+
+    result = check(
+        make_patch(edit(4, ColumnKey.ANSWER, "0.25", "0.5")),
+        make_issue(category=IssueCategory.MATHEMATICS),
+        parsed.blocks[0],
+        parsed,
+    )
+
+    assert result.accepted, result.rejection
+
+
+def test_a_model_cannot_renumber_a_valid_identifier_merely_to_close_a_gap(parsed, block):
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(
+            edit(5, ColumnKey.HINT_ID, "s2", "s3"),
+            derivation="",
+        ),
+        make_issue(
+            category=IssueCategory.DEPENDENCY,
+            is_structural=True,
+            rule_codes=("INDEPENDENT_FINDING",),
+            cells=((5, FIXED_COLUMNS[ColumnKey.HINT_ID]),),
+        ),
+        block,
+        parsed,
+    )
+    assert result.rejection.code is RejectionCode.STRUCTURAL_EVIDENCE_MISSING
+
+
 # --------------------------------------------------------------------------------------
 # Regression detection
 # --------------------------------------------------------------------------------------
@@ -207,7 +328,7 @@ def test_pre_existing_findings_do_not_block_a_patch(make_workbook):
         )
     )
     result = check(
-        make_patch(edit(3, ColumnKey.ANSWER, "x^2", "x**2")),
+        make_patch(edit(3, ColumnKey.ANSWER, "x^2", "x^3")),
         make_issue(),
         parsed.blocks[0],
         parsed,
@@ -260,7 +381,7 @@ def test_an_unrelated_title_edit_under_an_answer_issue_is_refused(unanswered):
     perfectly valid edit that has nothing to do with the issue, and nothing about it
     breaks a rule -- so only a scope check catches it."""
     result = check(
-        make_patch(edit(4, ColumnKey.TITLE, "", "First part")),
+        make_patch(edit(4, ColumnKey.TITLE, "Work through this part", "First part")),
         missing_answer_issue(),
         unanswered.blocks[0],
         unanswered,
@@ -273,7 +394,7 @@ def test_an_unrelated_edit_with_an_explanation_still_has_to_fix_the_issue(unansw
     sentence; it cannot produce a defect that is no longer there."""
     result = check(
         make_patch(
-            edit(4, ColumnKey.TITLE, "", "First part"),
+            edit(4, ColumnKey.TITLE, "Work through this part", "First part"),
             related_edits_reason="the title clarifies what the scaffold is asking",
         ),
         missing_answer_issue(),
@@ -332,7 +453,7 @@ def test_an_edit_the_repair_did_not_need_is_refused_even_with_an_explanation(una
     result = check(
         make_patch(
             edit(4, ColumnKey.ANSWER, "", "30"),
-            edit(4, ColumnKey.TITLE, "", "First part"),
+            edit(4, ColumnKey.TITLE, "Work through this part", "First part"),
             related_edits_reason="the title makes the scaffold clearer",
         ),
         missing_answer_issue(),
@@ -348,7 +469,7 @@ def test_an_issue_with_no_rule_code_is_left_to_its_reviewer(unanswered):
     re-run. The gate must not read "cannot be checked" as "not fixed" -- that would make
     every semantic issue permanently unrepairable."""
     result = check(
-        make_patch(edit(4, ColumnKey.TITLE, "", "First part")),
+        make_patch(edit(4, ColumnKey.TITLE, "Work through this part", "First part")),
         make_issue(rule_codes=("AUDITOR_FINDING",)),
         unanswered.blocks[0],
         unanswered,
@@ -440,6 +561,77 @@ def test_a_mathematics_issue_is_allowed_to_change_the_value(caret):
     assert result.accepted, result.rejection
 
 
+def test_a_mathematics_issue_cannot_replace_a_solved_equation_with_its_value(
+    make_workbook,
+):
+    """Preservation is semantic, not string-shaped.
+
+    The live false positive changed ``x=sqrt(4)``/algebra to ``2``/numeric.  One is an
+    equation and one is a scalar, so generic equation comparison calls them different;
+    as graded answers they represent the same solved value and the change is merely a
+    normalization of already-correct content.
+    """
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("a1", title="Solve for x", oer_src="s", license="CC"),
+                step("a1", answer="x=sqrt(4)", answer_type="algebra"),
+            ]
+        )
+    )
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(
+            edit(3, ColumnKey.ANSWER, "x=sqrt(4)", "2"),
+            edit(3, ColumnKey.ANSWER_TYPE, "algebra", "numeric"),
+        ),
+        make_issue(
+            category=IssueCategory.MATHEMATICS,
+            rule_codes=("AUDITOR_FINDING",),
+            cells=(
+                (3, FIXED_COLUMNS[ColumnKey.ANSWER]),
+                (3, FIXED_COLUMNS[ColumnKey.ANSWER_TYPE]),
+            ),
+            is_structural=True,
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.rejection.code is RejectionCode.MATHEMATICALLY_EQUIVALENT_REWRITE
+
+
+def test_a_genuinely_wrong_solved_value_can_still_be_corrected(make_workbook):
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("a1", title="Solve for x", oer_src="s", license="CC"),
+                step("a1", answer="x=3", answer_type="algebra"),
+            ]
+        )
+    )
+    from oatutor_council.models import FIXED_COLUMNS
+
+    result = check(
+        make_patch(
+            edit(3, ColumnKey.ANSWER, "x=3", "2"),
+            edit(3, ColumnKey.ANSWER_TYPE, "algebra", "numeric"),
+        ),
+        make_issue(
+            category=IssueCategory.MATHEMATICS,
+            rule_codes=("AUDITOR_FINDING",),
+            cells=(
+                (3, FIXED_COLUMNS[ColumnKey.ANSWER]),
+                (3, FIXED_COLUMNS[ColumnKey.ANSWER_TYPE]),
+            ),
+            is_structural=True,
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+    assert result.accepted, result.rejection
+
+
 def test_mathematics_sympy_cannot_decide_is_left_to_the_reviewer(make_workbook):
     """SymPy is a gate, not a proof. An expression it cannot parse yields UNKNOWN, and
     UNKNOWN must pass through to a reviewer -- refusing it would reject most correct
@@ -484,9 +676,8 @@ def test_a_structural_edit_under_a_non_structural_issue_is_refused(parsed, block
     assert "hint_id" in result.rejection.message
 
 
-def test_a_structural_edit_under_a_structural_issue_is_permitted(parsed, block):
-    """The whole point of not refusing these outright: a blanket ban would make the real
-    column-shift corruption permanently unrepairable."""
+def test_a_pure_identifier_rename_without_a_defect_is_refused(parsed, block):
+    """Structural authority alone does not make a gap-closing rename a repair."""
     result = check(
         make_patch(
             edit(4, ColumnKey.HINT_ID, "s1", "s3"),
@@ -496,7 +687,7 @@ def test_a_structural_edit_under_a_structural_issue_is_permitted(parsed, block):
         block,
         parsed,
     )
-    assert result.accepted, result.rejection
+    assert result.rejection.code is RejectionCode.STRUCTURAL_EVIDENCE_MISSING
 
 
 def test_a_column_shift_repair_that_moves_content_is_accepted(make_workbook):

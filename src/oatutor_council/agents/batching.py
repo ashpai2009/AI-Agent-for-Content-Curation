@@ -23,6 +23,10 @@ from typing import Any, Iterable, Sequence
 from ..models import ProblemBlock
 
 
+class FindingAttributionError(ValueError):
+    """A finding names no target cell in the block whose result contains it."""
+
+
 @dataclass(frozen=True)
 class BatchItem:
     """One block as dispatched: the block, its opaque id, and the claims it was shown."""
@@ -111,20 +115,11 @@ def attribute(
     return attribution
 
 
-def rows_for_block(rows: Sequence[int], block: ProblemBlock) -> list[int] | None:
-    """Which of a finding's rows belong to the block it was filed under.
+def cells_for_block(cells: Sequence[Any], block: ProblemBlock) -> list[Any] | None:
+    """Accept exact targets only when every one belongs to the attributed block.
 
-    Three cases, and the third is the one that matters:
-
-    * **No rows** — the finding is about the block as a whole; the caller attaches it to
-      the block's start row, as the single-block path always has.
-    * **Some rows inside** — keep those, drop the rest.
-    * **Every row outside** — return `None`. The caller discards the finding *and* requeues
-      the block. It is never relocated: with one block in play, clamping was safe because
-      there was one candidate; in a batch, moving a finding to the block it was filed under
-      invents a defect at a location nobody reported.
+    Dropping only the outside members would turn one coordinated repair into a different,
+    incomplete repair. The whole finding is unattributable, so its block must be requeued.
     """
-    if not rows:
-        return []
-    inside = [row for row in rows if block.contains_row(row)]
-    return inside or None
+    inside = [cell for cell in cells if block.contains_row(cell.row)]
+    return inside if cells and len(inside) == len(cells) else None

@@ -166,6 +166,7 @@ def test_a_crash_after_the_write_rolls_forward(db, job, copy):
         patch_id=patch.patch_id,
         run_epoch=job.run_epoch,
         edits=[{"row": 3, "column": 5, "column_key": "answer", "before": "1/2", "after": "1/3"}],
+        block_id="block-0000",
     )
     # Simulate the write having landed without its commit.
     workbook = load_workbook(copy.path)
@@ -180,6 +181,7 @@ def test_a_crash_after_the_write_rolls_forward(db, job, copy):
     assert [(c.row, c.before, c.after) for c in list_changes(db, "job-1")] == [
         (3, "1/2", "1/3")
     ]
+    assert list_changes(db, "job-1")[0].block_id == "block-0000"
     assert open_apply_intents(db, "job-1") == ()
 
 
@@ -270,7 +272,10 @@ def test_an_attempt_that_produced_a_patch_stays_spent(db, job, copy):
     report = recover_job(db, job, copy, MACHINE, [issue])
 
     assert report.attempts_refunded == []
-    assert report.attempts_closed == ["a1"]
+    # It stays open until the reviewer records whether the completed proposal was
+    # accepted, revised or escalated. "Interrupted" would be a false outcome.
+    assert report.attempts_closed == []
+    assert [attempt.attempt_id for attempt in open_attempts(db, "job-1")] == ["a1"]
     assert get_issue(db, "issue-1").attempts_used == 1
 
 

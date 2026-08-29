@@ -293,7 +293,6 @@ def _later_row_finding(
             target_row=target,
         )
 
-
 @rule(
     "DEPENDENCY_CROSSES_STEP",
     severity=Severity.ERROR,
@@ -571,63 +570,7 @@ def scaffold_namespace_deviation(context: RuleContext) -> Iterable[ValidationFin
             column=FIXED_COLUMNS[ColumnKey.HINT_ID],
             column_key=ColumnKey.HINT_ID,
             severity=Severity.WARNING if consistent else Severity.ERROR,
+            repairable=not consistent,
             namespace=namespace,
             workbook_is_consistent=consistent,
         )
-
-
-@rule(
-    "DEPENDENCY_NUMBERING_GAP",
-    severity=Severity.WARNING,
-    category=IssueCategory.DEPENDENCY,
-    description="Identifier numbering within a step skips a value.",
-)
-def dependency_numbering_gap(context: RuleContext) -> Iterable[ValidationFinding]:
-    """Numbering should run without holes within whatever the convention is.
-
-    Under `RESET_PER_STEP` that means 1, 2, 3 inside each step. Under `CONTINUOUS` it
-    means the sequence keeps climbing across the whole block, so the check has to run
-    block-wide -- a per-step check there would read the legitimate jump from step one's
-    `h2` to step two's `h3` as a fresh sequence starting at 3.
-    """
-    block = context.block
-    if block is None:
-        return
-
-    if context.conventions.dependency_convention is DependencyConvention.CONTINUOUS:
-        yield from _report_gaps(context, _numbers_of(block.rows))
-        return
-
-    for scope in block.step_scopes():
-        yield from _report_gaps(context, _numbers_of(scope.identified))
-
-
-def _numbers_of(rows) -> list[tuple[int, int]]:
-    numbers = []
-    for row in rows:
-        if row.row_type not in (RowType.HINT, RowType.SCAFFOLD):
-            continue
-        match = IDENTIFIER.match(_identifier(row))
-        if match:
-            numbers.append((int(match.group(2)), row.row))
-    return numbers
-
-
-def _report_gaps(
-    context: RuleContext, numbers: list[tuple[int, int]]
-) -> Iterable[ValidationFinding]:
-    if len(numbers) < 2:
-        return
-    ordered = sorted(numbers)
-    for (previous, _), (current, row) in zip(ordered, ordered[1:]):
-        if current > previous + 1:
-            yield finding(
-                context,
-                "DEPENDENCY_NUMBERING_GAP",
-                f"identifier numbering jumps from {previous} to {current}",
-                row=row,
-                column=FIXED_COLUMNS[ColumnKey.HINT_ID],
-                column_key=ColumnKey.HINT_ID,
-                previous=previous,
-                current=current,
-            )

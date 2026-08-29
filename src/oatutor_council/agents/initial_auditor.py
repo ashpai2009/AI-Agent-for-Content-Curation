@@ -29,7 +29,7 @@ from ..models import (
     ValidationFinding,
     WorkbookConventions,
 )
-from .batching import attribute, make_items, rows_for_block
+from .batching import FindingAttributionError, attribute, cells_for_block, make_items
 from .isolation import AuditorPrivate, TaintRegistry
 from .rendering import (
     render_block,
@@ -102,6 +102,9 @@ never merely because the claim seems to be about something else.
 Curation rules, where present, are policy rather than hypotheses. Apply them; do not
 confirm or refute them.
 
+Background notes, where present, are context only. They are neither policy nor evidence
+that a defect exists; never create a finding solely because a background note says so.
+
 Zero findings is a valid answer. A block that is correct should be reported as correct.
 """
 
@@ -114,6 +117,7 @@ def audit_block(
     deterministic_findings: Sequence[ValidationFinding] = (),
     seed_claims: Sequence[SeedClaim] = (),
     curator_rules: Sequence[str] = (),
+    curator_notes: Sequence[str] = (),
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
@@ -147,6 +151,13 @@ def audit_block(
             DataSection(
                 "Curation rules the curator supplied (policy, not hypotheses)",
                 "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
+    if curator_notes:
+        sections.append(
+            DataSection(
+                "Background the curator supplied (context, not policy or a defect claim)",
+                "\n".join(f"- {note}" for note in curator_notes),
             )
         )
 
@@ -203,11 +214,10 @@ def _to_finding(
 ) -> ValidationFinding:
     """Convert a model finding into the same type the rules engine produces.
 
-    Rows outside the block are dropped, not trusted: an agent naming a row it was not
-    shown is either confused or being steered, and either way the finding belongs to the
-    block that was audited. (In a *batch*, a finding whose rows are all outside its block
-    is discarded entirely rather than kept -- see `batching.rows_for_block`, which the
-    caller applies first.)
+    A finding containing any cell outside the block is rejected as a unit. Keeping only
+    its in-block cells would silently turn one coordinated repair into a different,
+    incomplete repair. The caller requeues that block for a fresh audit rather than
+    relocating or pruning what the model said.
 
     `shown` filters `confirms_claim` the same way refutations have always been filtered.
     Without it a block can confirm a claim it was never given, and since one confirmation
@@ -216,26 +226,30 @@ def _to_finding(
     nothing about whether the mathematics is wrong, and discarding the finding would lose a
     real defect because the model attached a bad citation to it.
     """
-    rows = [row for row in item.rows if block.contains_row(row)]
-    row = rows[0] if rows else block.start_row
+    cells = [cell for cell in item.cells if block.contains_row(cell.row)]
+    if len(cells) != len(item.cells):
+        raise FindingAttributionError(
+            "finding names a cell outside the block it audited"
+        )
+    cells = list({(cell.row, cell.column): cell for cell in cells}.values())
+    row = cells[0].row
     confirms = item.confirms_claim
     if confirms is not None and shown is not None and confirms not in shown:
         confirms = None
-    column = FIXED_COLUMNS[column_key(item.columns[0])] if item.columns else None
-    target_rows = rows or [block.start_row]
+    column = FIXED_COLUMNS[column_key(cells[0].column)]
     target_cells = [
-        [target_row, FIXED_COLUMNS[column_key(name)]]
-        for target_row in target_rows
-        for name in item.columns
+        [cell.row, FIXED_COLUMNS[column_key(cell.column)]] for cell in cells
     ]
+    target_rows = list(dict.fromkeys(cell.row for cell in cells))
+    target_columns = list(dict.fromkeys(cell.column for cell in cells))
     return ValidationFinding(
         code="AUDITOR_FINDING",
         severity=item.severity,
-        scope=FindingScope.CELL if column else FindingScope.ROW,
+        scope=FindingScope.CELL,
         message=item.problem,
         row=row,
         column=column,
-        column_key=column_key(item.columns[0]) if item.columns else None,
+        column_key=column_key(cells[0].column),
         block_id=block.block_id,
         problem_name=block.problem_name,
         detail={
@@ -248,9 +262,9 @@ def _to_finding(
             # same row), and throwing every target after the first away is what made the
             # gate reject the only complete repair as an unrelated structural edit.
             "cells": target_cells,
-            "column_keys": list(item.columns),
+            "column_keys": target_columns,
             "confirms_claim": confirms,
-            "rows_outside_block": [r for r in item.rows if not block.contains_row(r)],
+            "cells_outside_block": [],
         },
     )
 
@@ -272,7 +286,8 @@ per block, copying that id into `batch_item_id` exactly. A block with nothing wr
 needs its own result, with an empty `findings` list -- omitting a block does not mean it is
 correct, it means it was not examined, and it will be sent again.
 
-Report a finding only under the block it belongs to, and only with rows from that block.
+Report a finding only under the block it belongs to, and name only exact target cells
+whose rows are inside that block.
 
 Report only what requires understanding the mathematics. Deterministic checks already
 cover formatting, notation, identifiers and delimiters, and their current findings are
@@ -284,6 +299,9 @@ claim is a hypothesis about the block it was shown with.
 
 Curation rules, where present, are policy rather than hypotheses. Apply them; do not
 confirm or refute them.
+
+Background notes, where present, are context only. They are neither policy nor evidence
+that a defect exists; never create a finding solely because a background note says so.
 """
 
 
@@ -295,6 +313,7 @@ def audit_blocks(
     findings_for=None,
     seed_claims: Sequence[SeedClaim] = (),
     curator_rules: Sequence[str] = (),
+    curator_notes: Sequence[str] = (),
     job_id: str = "",
     seed: int | None = None,
     taint: TaintRegistry | None = None,
@@ -311,18 +330,22 @@ def audit_blocks(
     if not blocks:
         return (), ()
     if len(blocks) == 1:
-        result = audit_block(
-            client,
-            block=blocks[0],
-            conventions=conventions,
-            deterministic_findings=findings_for(blocks[0]) if findings_for else (),
-            seed_claims=seed_claims,
-            curator_rules=curator_rules,
-            job_id=job_id,
-            seed=seed,
-            taint=taint,
-            prompt_version=prompt_version,
-        )
+        try:
+            result = audit_block(
+                client,
+                block=blocks[0],
+                conventions=conventions,
+                deterministic_findings=findings_for(blocks[0]) if findings_for else (),
+                seed_claims=seed_claims,
+                curator_rules=curator_rules,
+                curator_notes=curator_notes,
+                job_id=job_id,
+                seed=seed,
+                taint=taint,
+                prompt_version=prompt_version,
+            )
+        except FindingAttributionError:
+            return (), (blocks[0],)
         return (result,), ()
 
     items = make_items(
@@ -364,6 +387,13 @@ def audit_blocks(
                 "\n".join(f"- {rule}" for rule in curator_rules),
             )
         )
+    if curator_notes:
+        sections.append(
+            DataSection(
+                "Background the curator supplied (context, not policy or a defect claim)",
+                "\n".join(f"- {note}" for note in curator_notes),
+            )
+        )
 
     bundle = ContextBundle.build(BATCH_INSTRUCTIONS, sections)
     payload = bundle.render()
@@ -401,15 +431,15 @@ def audit_blocks(
         findings: list[ValidationFinding] = []
         relocated = False
         for finding in result.findings:
-            rows = rows_for_block(finding.rows, item.block)
-            if rows is None:
+            cells = cells_for_block(finding.cells, item.block)
+            if cells is None:
                 # Every row it named is in some other block. Discard it and send this
                 # block back: relocating it would invent a defect nobody reported.
                 relocated = True
                 continue
             findings.append(
                 _to_finding(
-                    finding.model_copy(update={"rows": rows}),
+                    finding.model_copy(update={"cells": cells}),
                     item.block,
                     shown=item.claims_shown,
                 )

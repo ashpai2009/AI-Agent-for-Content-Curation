@@ -128,11 +128,11 @@ def test_current_semantic_prompts_pin_the_live_pilot_lessons():
     )
 
     assert "requested form, units, domain, number of solutions" in auditor
-    assert "every column that must change" in auditor
+    assert "every exact row-and-column cell that must change" in auditor
     assert "Do not simplify, restyle, paraphrase" in writer
     assert "exact fraction to a decimal" in writer
     assert "requested form, units, domain, number of solutions" in independent
-    assert "every column that must change" in independent
+    assert "every exact row-and-column cell that must change" in independent
 
 
 def test_an_unknown_prompt_is_fatal():
@@ -282,6 +282,16 @@ def test_the_prompt_hash_identifies_exactly_what_was_sent():
     assert a.prompt_sha256 == request(user_payload="one").prompt_sha256
 
 
+def test_the_prompt_hash_includes_the_transmitted_response_schema():
+    """The schema is a CLI argument and changes the allowed answer; omitting it made the
+    supposedly exact audit identity incomplete."""
+    original = request(schema={"type": "object", "properties": {"a": {"type": "string"}}})
+    changed = request(schema={"type": "object", "properties": {"b": {"type": "string"}}})
+    reordered = request(schema={"properties": {"a": {"type": "string"}}, "type": "object"})
+    assert original.prompt_sha256 != changed.prompt_sha256
+    assert original.prompt_sha256 == reordered.prompt_sha256
+
+
 # --------------------------------------------------------------------------------------
 # Retry is the outermost layer
 # --------------------------------------------------------------------------------------
@@ -382,4 +392,3 @@ def test_the_mock_records_every_request_for_the_isolation_tests():
 
     assert client.call_count(AgentRole.WRITER) == 1
     assert client.payloads_for(AgentRole.KNOWN_ISSUE_REVIEWER) == ("fix this",)
-

@@ -155,6 +155,7 @@ def apply_patch(
         patch_id=patch.patch_id,
         run_epoch=job.run_epoch,
         edits=_edit_payload(patch.edits),
+        block_id=block_id,
     )
 
     try:
@@ -239,7 +240,7 @@ def _changes_from(
             change_id=uuid4().hex,
             issue_id=intent["issue_id"],
             patch_id=intent["patch_id"],
-            block_id=None,
+            block_id=intent.get("block_id"),
             row=edit.row,
             column=edit.column,
             column_key=edit.column_key,
@@ -269,6 +270,12 @@ def recover_attempts(
     from .models import AttemptOutcome
 
     for attempt in open_attempts(db, job.job_id):
+        if attempt.patch_id is not None:
+            # The Writer returned and its patch is durable. The attempt is intentionally
+            # open until a reviewer supplies the outcome; calling it interrupted here
+            # makes a clean crash boundary look like failed infrastructure and prevents
+            # `_settle_reviewed_attempt` from ever recording the real verdict.
+            continue
         settle_attempt(
             db,
             attempt.model_copy(
@@ -281,7 +288,7 @@ def recover_attempts(
         report.attempts_closed.append(attempt.attempt_id)
 
         issue = issues.get(attempt.issue_id)
-        if issue is None or attempt.patch_id is not None:
+        if issue is None:
             continue
 
         refunded = machine.refund_interrupted(issue)
@@ -348,6 +355,7 @@ def issue_is_retryable(issue: Issue) -> bool:
         IssueState.OPEN,
         IssueState.AWAITING_PATCH,
         IssueState.PATCH_PROPOSED,
+        IssueState.PATCH_APPROVED,
         IssueState.APPLYING,
         IssueState.PATCH_APPLIED,
         IssueState.AWAITING_REVIEW,

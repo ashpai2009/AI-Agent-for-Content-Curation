@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from oatutor_council.config import ConfigurationError, Settings
+from oatutor_council.config import ConfigurationError, Settings, load_settings
 from oatutor_council.llm.base import (
     AgentRole,
     LLMRequest,
@@ -186,6 +186,28 @@ def test_the_turn_ceiling_is_a_setting_rather_than_a_literal(tmp_path, recorder)
     sent = args.read_text().splitlines()
 
     assert sent[sent.index("--max-turns") + 1] == "1"
+
+
+def test_role_effort_overrides_are_loaded_and_sent(tmp_path, recorder, monkeypatch):
+    """A documented quality control must be reachable from the service environment,
+    not only by constructing ``Settings`` inside a test."""
+    executable, args, _, _ = recorder
+    monkeypatch.setenv("COUNCIL_CLAUDE_CLI_PATH", executable)
+    monkeypatch.setenv("COUNCIL_CLAUDE_EFFORT", "medium")
+    monkeypatch.setenv("COUNCIL_INITIAL_AUDITOR_EFFORT", "high")
+    configured = load_settings(env_file=None)
+
+    ClaudeCLIClient(configured).complete(request(role=AgentRole.INITIAL_AUDITOR))
+    sent = args.read_text().splitlines()
+
+    assert configured.effort_for(AgentRole.WRITER.value) == "medium"
+    assert configured.effort_for(AgentRole.INITIAL_AUDITOR.value) == "high"
+    assert sent[sent.index("--effort") + 1] == "high"
+
+
+def test_invalid_role_effort_is_a_startup_configuration_error(tmp_path):
+    with pytest.raises(ConfigurationError, match="COUNCIL_WRITER_EFFORT"):
+        settings(tmp_path, "claude", role_effort={"writer": "extreme"})
 
 
 def test_a_turn_ceiling_below_one_is_refused(tmp_path):

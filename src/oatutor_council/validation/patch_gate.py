@@ -19,6 +19,7 @@ everyone than discovering it in review.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
@@ -35,11 +36,12 @@ from ..models import (
     PatchRejection,
     ProblemBlock,
     RejectionCode,
+    RowType,
     Severity,
     ValidationFinding,
     WorkbookRow,
 )
-from .mathematics import MathVerdict, equations_equivalent
+from .mathematics import MathVerdict, answers_equivalent, equations_equivalent
 from .rules import REGISTRY, run_rules
 
 #: Columns describing provenance rather than content. An edit here under a mathematics
@@ -264,6 +266,150 @@ def _value_changed(issue: Issue, edits: Sequence[CellEdit]) -> tuple[CellEdit, s
     return None
 
 
+def _equivalent_mathematics_rewrite(
+    issue: Issue, edits: Sequence[CellEdit]
+) -> CellEdit | None:
+    """A mathematics correction must correct mathematics, not merely restyle it.
+
+    The live control `x=sqrt(4)` was changed to `x=2` after an auditor called the
+    equivalent original "wrong". Representation issues have their own categories; under
+    `mathematics`, a patch whose every mathematical change is provably equivalent has not
+    repaired the alleged defect and must not modify a clean cell.
+    """
+    if issue.category is not IssueCategory.MATHEMATICS:
+        return None
+    candidates = [
+        edit
+        for edit in edits
+        if edit.column_key in MATHEMATICAL_COLUMNS
+        and edit.before.strip()
+        and edit.after.strip()
+    ]
+    if not candidates:
+        return None
+    verdicts = [
+        (
+            answers_equivalent(edit.before, edit.after)
+            if edit.column_key is ColumnKey.ANSWER
+            else equations_equivalent(edit.before, edit.after)
+        )
+        for edit in candidates
+    ]
+    if all(verdict is MathVerdict.EQUIVALENT for verdict in verdicts):
+        return candidates[0]
+    return None
+
+
+def _requested_form_violation(
+    block: ProblemBlock, edits: Sequence[CellEdit]
+) -> CellEdit | None:
+    """Do not replace an exact/fraction answer with a decimal the question did not ask for.
+
+    Form language is scoped to the edited row and its enclosing step, plus the problem
+    stem. A multi-step block may ask for an exact fraction in step one and a decimal in
+    step two; scanning every row would incorrectly let the first instruction govern the
+    second answer.
+    """
+    decimal = re.compile(r"^[+-]?\d+\.\d+$")
+    fraction = re.compile(r"^[+-]?\d+\s*/\s*\d+$")
+    for edit in edits:
+        if edit.column_key is not ColumnKey.ANSWER:
+            continue
+        edited_row = next((row for row in block.rows if row.row == edit.row), None)
+        if edited_row is None:
+            continue
+        context_rows = [block.problem_row, edited_row]
+        if edited_row.row_type not in {RowType.PROBLEM, RowType.STEP}:
+            preceding_step = next(
+                (
+                    row
+                    for row in reversed(block.rows)
+                    if row.row < edited_row.row and row.row_type is RowType.STEP
+                ),
+                None,
+            )
+            if preceding_step is not None:
+                context_rows.append(preceding_step)
+        prompt_text = " ".join(
+            value
+            for row in context_rows
+            for value in (
+                row.get(ColumnKey.TITLE),
+                row.get(ColumnKey.BODY_TEXT),
+            )
+        ).casefold()
+        if "exact" not in prompt_text and "fraction" not in prompt_text:
+            continue
+        before = edit.before.strip().removeprefix("$$").removesuffix("$$").strip()
+        after = edit.after.strip().removeprefix("$$").removesuffix("$$").strip()
+        before_is_fraction = "\\frac" in before or bool(fraction.fullmatch(before))
+        if before_is_fraction and decimal.fullmatch(after):
+            return edit
+    return None
+
+
+def _unsupported_identifier_renumber(
+    issue: Issue,
+    parsed: ParsedWorkbook,
+    block: ProblemBlock,
+    edits: Sequence[CellEdit],
+) -> CellEdit | None:
+    """Reject a model-only rename that changes no dependency semantics.
+
+    Identifiers are labels, not a sequence that has to be gap-free.  The live pilot
+    renamed a valid ``s3`` to ``s2`` solely because the preceding label happened to be
+    ``s1``.  A blanket requirement for deterministic evidence is too strong: displaced
+    cells and malformed row types are exactly the structural defects for which the model
+    is useful.  The safe mechanical boundary is narrower:
+
+    * the finding is model-only;
+    * every structural edit touches only ``HintID`` or ``Dependency``;
+    * the edits are a consistent label substitution; and
+    * no registered structural rule currently supports the cited row.
+
+    Such a patch preserves the graph and merely renames its nodes, so it cannot repair a
+    structural defect.  Real dependency repairs, row-type repairs, and column shifts do
+    not match this shape and continue through the full simulation gate.
+    """
+    if target_findings(issue, parsed, block) is not None:
+        return None
+
+    structural = [edit for edit in edits if edit.is_structural]
+    if not structural or any(
+        edit.column_key not in {ColumnKey.HINT_ID, ColumnKey.DEPENDENCY}
+        for edit in structural
+    ):
+        return None
+
+    # A rename may touch one unreferenced identifier, or both its declaration and every
+    # reference. Different substitutions are a substantive graph edit, not this case.
+    substitutions = {
+        (edit.before.strip(), edit.after.strip())
+        for edit in structural
+        if edit.before.strip() and edit.after.strip()
+    }
+    if len(substitutions) != 1 or any(
+        not edit.before.strip() or not edit.after.strip() for edit in structural
+    ):
+        return None
+
+    issue_cells = set(issue.cells)
+    structural_categories = {
+        IssueCategory.STRUCTURE,
+        IssueCategory.ROW_TYPE,
+        IssueCategory.DEPENDENCY,
+    }
+    for finding in _findings_for(parsed, block):
+        registered = REGISTRY.get(finding.code)
+        if finding.code in issue.rule_codes or (
+            (finding.row, finding.column) in issue_cells
+            and registered is not None
+            and registered.category in structural_categories
+        ):
+            return None
+    return structural[0]
+
+
 def _choices_changed(edit: CellEdit) -> str | None:
     before = [part.strip() for part in edit.before.split(MC_CHOICE_DELIMITER)]
     after = [part.strip() for part in edit.after.split(MC_CHOICE_DELIMITER)]
@@ -350,8 +496,6 @@ def _block_invariants_broken(patched: ProblemBlock) -> str | None:
     breaks. A rule engine and a gate that both decide what a valid identifier is will
     disagree eventually, and the gate is the one nobody re-measures against the corpus.
     """
-    from ..models import RowType
-
     if patched.problem_row.row_type is not RowType.PROBLEM:
         return "the first row of the block is no longer a problem row"
 
@@ -388,9 +532,11 @@ def validate_patch(
 ) -> GateResult:
     """Decide whether this patch may be applied.
 
-    `before` values are **not** verified here -- that happens against the live file in
-    `workbook.writer`, which is the only place that can know what a cell currently holds.
-    Checking a stale copy here would give a false pass.
+    `before` values are verified here against the current parsed block *and* again against
+    the live file during application. The first check is required now that review happens
+    on an in-memory simulation: simulating an edit whose `before` names a different cell
+    would show the reviewer a candidate that can never be applied. The second check keeps
+    the write safe if the file changes after this gate.
     """
     if patch.needs_human_review:
         # Not a rejection: an escalation is a valid outcome, and it carries no edits.
@@ -439,6 +585,26 @@ def validate_patch(
                 f"{edit.column} is {actual_key.value} in this workbook",
                 row=edit.row,
                 column=edit.column,
+            )
+
+        current_row = next((row for row in block.rows if row.row == edit.row), None)
+        actual_value = current_row.get(actual_key) if current_row is not None else None
+        if actual_value is None:
+            return _reject(
+                RejectionCode.CELL_NOT_FOUND,
+                f"row {edit.row} is not present in the current problem block",
+                row=edit.row,
+                column=edit.column,
+            )
+        if actual_value != edit.before:
+            return _reject(
+                RejectionCode.BEFORE_MISMATCH,
+                f"row {edit.row} column {edit.column} currently holds "
+                f"{actual_value!r}, but the patch copied {edit.before!r}; copy the exact "
+                "value from the named cell",
+                row=edit.row,
+                column=edit.column,
+                detail={"actual": actual_value},
             )
 
         if (
@@ -524,6 +690,28 @@ def validate_patch(
                 f"the structural patch does not conserve content: {failure}",
             )
 
+    form_violation = _requested_form_violation(block, patch.edits)
+    if form_violation:
+        return _reject(
+            RejectionCode.REQUESTED_FORM_VIOLATION,
+            "the question requests an exact value or fraction, so the repair may not "
+            "replace the existing fractional Answer with a decimal; repair the matching "
+            "choice list instead",
+            row=form_violation.row,
+            column=form_violation.column,
+        )
+
+    equivalent = _equivalent_mathematics_rewrite(issue, patch.edits)
+    if equivalent:
+        return _reject(
+            RejectionCode.MATHEMATICALLY_EQUIVALENT_REWRITE,
+            "the proposed mathematics edit is equivalent to the existing value; an "
+            "equivalent simplification is not a correction unless the issue is explicitly "
+            "about representation",
+            row=equivalent.row,
+            column=equivalent.column,
+        )
+
     changed = _value_changed(issue, patch.edits)
     if changed:
         edit, why = changed
@@ -550,6 +738,19 @@ def validate_patch(
                 detail={"codes": [f.code for f in regressions]},
             ),
             regressions=regressions,
+        )
+
+    unsupported_renumber = _unsupported_identifier_renumber(
+        issue, parsed, block, patch.edits
+    )
+    if unsupported_renumber is not None:
+        return _reject(
+            RejectionCode.STRUCTURAL_EVIDENCE_MISSING,
+            "the patch only renames an identifier without changing the dependency "
+            "graph or resolving a deterministic defect; identifiers are labels and are "
+            "not renumbered merely to close a numeric gap",
+            row=unsupported_renumber.row,
+            column=unsupported_renumber.column,
         )
 
     # Sufficiency, last, because every check above describes damage and this one only

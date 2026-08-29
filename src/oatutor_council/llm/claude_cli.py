@@ -57,6 +57,7 @@ from .base import (
     ProviderUnavailable,
     ProviderUsageLimited,
     RateLimited,
+    canonical_schema_json,
     sanitize_provider_message,
 )
 
@@ -142,7 +143,7 @@ def build_command(settings: Settings, request: LLMRequest) -> list[str]:
         settings.claude_cli_path,
         "--print",
         "--output-format", "json",
-        "--json-schema", json.dumps(request.schema),
+        "--json-schema", canonical_schema_json(request.schema),
         "--model", settings.claude_model,
         "--effort", effort,
         # Replaces the CLI's own system prompt rather than appending to it. The agent's

@@ -15,6 +15,7 @@ from conftest import problem, scaffold, step
 from oatutor_council.agents.schemas import (
     AuditorFinding,
     AuditorResponse,
+    IndependentFinding,
     IndependentReviewResponse,
     ReviewerResponse,
     WriterResponse,
@@ -38,6 +39,7 @@ from oatutor_council.models import (
     IssueSource,
     IssueState,
     JobState,
+    RepairAttempt,
     Severity,
     SourcePath,
     ValidationFinding,
@@ -45,11 +47,13 @@ from oatutor_council.models import (
 from oatutor_council.persistence import (
     Database,
     create_job,
+    insert_attempt,
     insert_issue,
     list_changes,
     list_events,
     list_attempts,
     list_issues,
+    list_verdicts,
     load_ledger,
 )
 from oatutor_council.reporting.ledger import issue_from_finding
@@ -149,6 +153,75 @@ def test_the_whole_council_runs_offline_and_succeeds(setup, source):
     changes = list_changes(db, "job-1")
     assert [(c.row, c.after) for c in changes] == [(4, "30")]
     assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == "30"
+
+
+def test_a_candidate_is_reviewed_before_any_workbook_byte_is_written(setup):
+    """The reviewer sees the simulated after-state while the real copy is still at the
+    exact before-state. Accept is authorization to write, not approval after the fact."""
+    _, copy = setup
+    client = ScriptedLLMClient()
+
+    def reply(request):
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the graded scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        if request.role is AgentRole.KNOWN_ISSUE_REVIEWER:
+            live = read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER)
+            assert live == ""
+            assert "Candidate edits being reviewed" in request.user_payload
+            assert "'' -> '30'" in request.user_payload
+            return ReviewerResponse(decision="accept")
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse()
+        return IndependentReviewResponse(block_is_sound=True)
+
+    client.default = reply
+    result = council(setup, client).run()
+    assert result.state is JobState.SUCCEEDED
+    assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == "30"
+
+
+def test_a_replacement_council_recovers_before_resuming_any_phase(setup):
+    """Recovery is not tied to INGESTING: a dead process normally leaves the job in the
+    repair/audit phase it was actually running."""
+    db, copy = setup
+    parsed = read_workbook(copy.path)
+    finding = ValidationFinding(
+        code="TEST_INTERRUPTED",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        message="test",
+        row=4,
+        column=5,
+        column_key=ColumnKey.ANSWER,
+        block_id=parsed.blocks[0].block_id,
+        problem_name=parsed.blocks[0].problem_name,
+    )
+    issue = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    ).model_copy(update={"state": IssueState.AWAITING_PATCH, "attempts_used": 1})
+    insert_issue(db, issue)
+    insert_attempt(
+        db, RepairAttempt(attempt_id="interrupted", issue_id=issue.issue_id, attempt_no=1)
+    )
+
+    outcome = council(setup, quiet_client()).step()
+    reloaded = next(item for item in list_issues(db, "job-1") if item.issue_id == issue.issue_id)
+    assert "recovered interrupted work" in outcome.description
+    assert reloaded.attempts_used == 0
+    assert reloaded.interrupted_retries_used == 1
+    assert outcome.state is JobState.CREATED
+
+
+def test_the_independent_sweep_rechecks_a_block_with_an_accepted_repair(setup):
+    client = quiet_client()
+    result = council(setup, client).run()
+    assert result.state is JobState.SUCCEEDED
+    payloads = client.payloads_for(AgentRole.INDEPENDENT_REVIEWER)
+    assert payloads
+    assert any("angles1" in payload for payload in payloads)
 
 
 def test_the_source_workbook_is_never_modified(setup, source):
@@ -361,8 +434,7 @@ def test_a_semantic_duplicate_is_reviewed_before_another_writer_call(setup):
     duplicate = AuditorResponse(
         findings=[
             AuditorFinding(
-                rows=[4],
-                columns=["answer"],
+                cells=[{"row": 4, "column": "answer"}],
                 problem="The graded scaffold is missing its answer.",
                 expected="30",
                 category="row_type",
@@ -380,6 +452,156 @@ def test_a_semantic_duplicate_is_reviewed_before_another_writer_call(setup):
     assert semantic.expected == "30"
     assert len([i for i in issues if i.state is IssueState.NEEDS_HUMAN_REVIEW]) == 0
     assert client.call_count(AgentRole.WRITER) == 1
+
+
+def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(setup):
+    """A second agent must verify an unsupported semantic claim against the original.
+
+    The adversarial run let an auditor call an equivalent answer wrong, then asked the
+    reviewer only whether the replacement looked plausible. By then the review was
+    anchored on the proposed change. Attempt zero is the unbiased claim check.
+    """
+    db, _ = setup
+    false_claim = AuditorResponse(
+        findings=[
+            AuditorFinding(
+                cells=[{"row": 2, "column": "title"}],
+                problem="The already-correct title should be reworded.",
+                expected="A different but equivalent title",
+                category="mathematics",
+            )
+        ]
+    )
+    client = quiet_client(**{AgentRole.INITIAL_AUDITOR: false_claim})
+
+    result = council(setup, client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    semantic = next(
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.rule_codes == ("AUDITOR_FINDING",)
+    )
+    assert semantic.state is IssueState.REFUTED
+    # The one Writer call belongs to the real deterministic missing-answer issue.
+    assert client.call_count(AgentRole.WRITER) == 1
+    precheck = next(
+        verdict
+        for verdict in list_verdicts(db, "job-1")
+        if verdict.issue_id == semantic.issue_id
+    )
+    assert precheck.attempt_no == 0
+    # The corroborator saw the workbook, conventions and rules -- never the accusation
+    # or its proposed wording.  This is a blind audit, not an issue-framed review.
+    independent_payloads = client.payloads_for(AgentRole.INDEPENDENT_REVIEWER)
+    assert independent_payloads
+    assert all("already-correct title" not in payload for payload in independent_payloads)
+    assert all("different but equivalent" not in payload for payload in independent_payloads)
+
+
+def test_a_blind_second_agent_can_corroborate_a_real_model_only_claim(setup):
+    """Agreement is derived from independently named targets, not prose similarity."""
+    db, copy = setup
+    client = ScriptedLLMClient()
+    independent_calls = 0
+
+    def reply(request):
+        nonlocal independent_calls
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(
+                findings=[
+                    AuditorFinding(
+                        cells=[{"row": 2, "column": "title"}],
+                        problem="The title states the wrong requested operation.",
+                        expected="Convert the angle",
+                        category="mathematics",
+                    )
+                ]
+            )
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            independent_calls += 1
+            if independent_calls == 1:
+                assert "wrong requested operation" not in request.user_payload
+                return IndependentReviewResponse(
+                    block_is_sound=False,
+                    findings=[
+                        IndependentFinding(
+                            cells=[{"row": 2, "column": "title"}],
+                            problem="The title asks for the wrong operation.",
+                            expected="Convert the angle",
+                            category="mathematics",
+                        )
+                    ],
+                )
+            return IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.WRITER:
+            if "row 2" in request.user_payload:
+                return WriterResponse(
+                    derivation="",
+                    edits=[
+                        {
+                            "row": 2,
+                            "column": "title",
+                            "before": "Convert",
+                            "after": "Convert the angle",
+                        }
+                    ],
+                )
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    issue = next(
+        item for item in list_issues(db, "job-1") if item.rule_codes == ("AUDITOR_FINDING",)
+    )
+    assert issue.state is IssueState.ACCEPTED
+    assert read_workbook(copy.path).blocks[0].problem_row.get(ColumnKey.TITLE) == "Convert the angle"
+
+
+def test_root_structural_findings_enter_a_blocks_queue_before_their_symptoms(setup):
+    """A displaced row can produce answer, choice, and dependency errors downstream.
+    Repairing those symptoms first spends attempts on values the root repair will move.
+    """
+    db, copy = setup
+    block = read_workbook(copy.path).blocks[0]
+    symptom = ValidationFinding(
+        code="STEP_MISSING_ANSWER",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        message="step has no answer",
+        row=4,
+        column=5,
+        column_key=ColumnKey.ANSWER,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+    )
+    root = ValidationFinding(
+        code="ROW_SHIFT_RIGHT",
+        severity=Severity.BLOCKING,
+        scope=FindingScope.ROW,
+        message="every value is displaced one column right",
+        row=4,
+        column=2,
+        column_key=ColumnKey.ROW_TYPE,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+    )
+
+    runner = council(setup, quiet_client())
+    assert runner._open_issues(
+        (symptom, root), source=IssueSource.INITIAL_AUDITOR
+    ) == 2
+
+    assert [issue.rule_codes[0] for issue in list_issues(db, "job-1")] == [
+        "ROW_SHIFT_RIGHT",
+        "STEP_MISSING_ANSWER",
+    ]
 
 
 def test_an_accepted_patch_records_the_reviewed_attempt_outcome(setup):
@@ -411,7 +633,12 @@ def test_the_council_terminates_against_an_adversary_that_never_accepts(setup):
             ),
             AgentRole.INDEPENDENT_REVIEWER: IndependentReviewResponse(
                 block_is_sound=False,
-                findings=[{"rows": [3], "columns": ["answer"], "problem": "still wrong"}],
+                findings=[
+                    {
+                        "cells": [{"row": 3, "column": "answer"}],
+                        "problem": "still wrong",
+                    }
+                ],
             ),
         }
     )
@@ -515,14 +742,16 @@ def test_a_reviewer_asking_for_a_revision_is_not_overruled_by_the_rule_being_sat
     assert not any(
         i.state is IssueState.SUPERSEDED for i in list_issues(db, "job-1")
     )
-    # Three rejected proposals may exist in the audit log, but none is allowed to leak
-    # into the workbook handed back to the curator.
+    # Three rejected proposals may exist in the audit log, but none was ever written to
+    # the working workbook or the file handed back to the curator.
     assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == ""
     corrected = copy.path.parent.parent / "outputs" / "corrected.xlsx"
     assert read_workbook(corrected).blocks[0].rows[2].get(ColumnKey.ANSWER) == ""
     report = (copy.path.parent.parent / "outputs" / "report.md").read_text()
     assert "Cells changed: 0" in report
-    assert any(event["kind"] == "patch_rolled_back" for event in list_events(db, "job-1"))
+    events = list_events(db, "job-1")
+    assert any(event["kind"] == "candidate_patch_rejected" for event in events)
+    assert not any(event["kind"] == "patch_rolled_back" for event in events)
 
 
 def test_exact_cleanup_uses_no_writer_or_reviewer_calls(make_workbook, tmp_path):
@@ -830,6 +1059,20 @@ def test_a_governing_rule_is_not_treated_as_a_claim(tmp_path, make_workbook):
     )
     assert council.seed_claims == ()
     assert council.curator_rules == ("Steps must not carry dependencies.",)
+
+
+def test_every_accepted_rule_segment_reaches_the_agents(tmp_path, make_workbook):
+    """The document reader's declared bound is the bound; routing must not silently
+    impose a much smaller one after the upload has already been accepted."""
+    first = "Every answer must preserve exact form. " + "a" * 3_700
+    second = "Every hint must remain useful. " + "b" * 3_700
+    council = council_with_document(
+        tmp_path, make_workbook, f"{first}\n\n{second}\n"
+    )
+
+    assert len(council.curator_rules) == 2
+    assert first in council.curator_rules
+    assert second in council.curator_rules
 
 
 def test_a_report_about_one_problem_is_treated_as_a_hypothesis(tmp_path, make_workbook):
@@ -1197,6 +1440,25 @@ def test_a_job_keeps_the_prompt_version_it_started_with(setup, monkeypatch):
     for call in calls:
         assert call["payload"]["prompt_version"] == pinned[call["role"]]
     assert 99 not in {c["payload"]["prompt_version"] for c in calls}
+
+
+def test_a_pinned_prompt_hash_is_enforced_not_merely_recorded(setup):
+    db, _ = setup
+    council(setup, quiet_client()).run(max_steps=2)
+    with db.write() as connection:
+        connection.execute(
+            "UPDATE job_prompts SET sha256 = ? WHERE job_id = ? AND role = ?",
+            ("0" * 64, "job-1", AgentRole.WRITER.value),
+        )
+
+    result = council(setup, quiet_client()).run()
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.CONFIG
+    events = list_events(db, "job-1")
+    assert any(
+        event["kind"] == "settings_migration_required" and "changed on disk" in event["detail"]
+        for event in events
+    )
 
 
 def test_the_audit_trail_never_contains_a_credential(setup):

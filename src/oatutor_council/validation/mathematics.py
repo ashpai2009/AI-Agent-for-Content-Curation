@@ -209,7 +209,12 @@ def parse_expression(text: str) -> sympy.Expr:
 
 def split_equation(text: str) -> tuple[str, str] | None:
     """Split `a = b` into its sides, ignoring `<=`, `>=`, `!=` and `==`."""
-    stripped = text.strip()
+    # A complete LaTeX equation is normally wrapped once around the whole statement.
+    # Splitting first turns ``$$x=2$$`` into the two invalid fragments ``$$x`` and
+    # ``2$$`` and makes every later comparison return UNKNOWN.  Remove only a balanced
+    # outer container; commands within either side remain protected by the ordinary
+    # LaTeX parser.
+    stripped = strip_latex_delimiters(text)
     positions = [
         index
         for index, character in enumerate(stripped)
@@ -308,6 +313,70 @@ def equations_equivalent(left: str, right: str) -> MathVerdict:
         return direct
     # `a = b` and `b = a` are the same equation, as are `a - b = 0` and `b - a = 0`.
     return _compare_expressions(a, -b)
+
+
+def answers_equivalent(left: str, right: str) -> MathVerdict:
+    """Compare two *graded answers*, including equation-to-value restatements.
+
+    ``equations_equivalent`` deliberately says that ``x=2`` and ``2`` are different
+    kinds of mathematical statement.  That is the right generic answer, but it is too
+    literal for the preservation gate: replacing an already-correct ``x=sqrt(4)`` with
+    ``2`` is a change of answer representation, not a correction of the mathematics.
+
+    This function recognizes only the narrow forms where one side of the equation names
+    the quantity being answered and the other side is its value:
+
+    * a bare symbol, such as ``x=2``; or
+    * a named evaluation such as ``f(2)=4`` or a limit expression.
+
+    It intentionally does **not** collapse a working equation such as ``2*x=4`` or
+    ``x+1=3`` to either side.  Those are equations a student may still need to solve, and
+    treating their right-hand side as the answer would hide real mistakes.
+    """
+    direct = equations_equivalent(left, right)
+    if direct is MathVerdict.EQUIVALENT:
+        return direct
+
+    left_sides, right_sides = split_equation(left), split_equation(right)
+    if (left_sides is None) == (right_sides is None):
+        return direct
+
+    equation = left_sides if left_sides is not None else right_sides
+    value = right if left_sides is not None else left
+    assert equation is not None
+    lhs, rhs = equation
+
+    for target, represented_value in ((lhs, rhs), (rhs, lhs)):
+        if not _is_answer_target(target):
+            continue
+        verdict = equivalent(represented_value, value)
+        if verdict is not MathVerdict.UNKNOWN:
+            return verdict
+    return direct
+
+
+def _is_answer_target(text: str) -> bool:
+    """Whether one equation side merely names the quantity whose value follows."""
+    candidate = text.strip()
+    try:
+        parsed = parse_expression(candidate)
+    except UnparseableExpression:
+        parsed = None
+    if isinstance(parsed, sympy.Symbol):
+        return True
+
+    # Function evaluation and named operators are useful answer labels, unlike compound
+    # equations such as x+1.  The patterns are conservative on purpose: an unrecognized
+    # quantity yields UNKNOWN and goes to review rather than being guessed equivalent.
+    plain = candidate.replace(" ", "")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\([^=]*\)", plain):
+        return True
+    return bool(
+        re.match(
+            r"^(?:\\?lim(?:_|\b)|\\?int(?:_|\b)|d/d[A-Za-z]|P\()",
+            plain,
+        )
+    )
 
 
 def _compare_expressions(a: sympy.Expr, b: sympy.Expr) -> MathVerdict:

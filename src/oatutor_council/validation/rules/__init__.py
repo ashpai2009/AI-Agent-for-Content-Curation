@@ -25,6 +25,7 @@ from .registry import (  # noqa: F401
 # but every module must be listed or its rules do not exist.
 from . import appearance as appearance  # noqa: E402,F401
 from . import dependencies as dependencies  # noqa: E402,F401
+from . import instructional as instructional  # noqa: E402,F401
 from . import latex as latex  # noqa: E402,F401
 from . import mc as mc  # noqa: E402,F401
 from . import notation as notation  # noqa: E402,F401

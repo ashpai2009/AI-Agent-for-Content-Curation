@@ -17,16 +17,31 @@ Three mechanisms, in increasing order of paranoia:
    from a type that cannot hold private data cannot leak it by construction.
 
 3. **`TaintRegistry.assert_clean` runs before every dispatch.** Types catch the leak
-   someone declared; this catches the one someone pasted. It compares exact text *and*
-   12-token shingles, because a paraphrase or a partial quote defeats exact matching
-   while still handing the reviewer the Writer's argument. Matches explained by **public
-   ground** -- the workbook, the curator's document, the deterministic findings -- are
-   subtracted first: a derivation quotes the cells it reasons about, the reviewer is
-   shown those same cells, and the shared mathematics is a quotation rather than a leak.
+   someone declared; this catches the one someone pasted -- an **exact copy** of
+   registered private text, which nothing but a copy produces.
 
-A violation is `ContextIsolationError` and terminates the job as
-`FAILED(ISOLATION_VIOLATION)`. Never a warning, never a retry: a retry would send the
-same tainted payload again, and a warning would let a leaked review count as a review.
+**Mechanisms 1 and 2 are the guarantee. 3 is a backstop, and its fuzzy half is only a
+signal.** That ordering was inverted for most of this module's life, and the cost was
+paid in real jobs: 12-token shingle overlap was treated as proof of a leak and used to
+kill jobs outright. It never caught a leak. It did kill two held-out runs after 42 and 45
+paid model calls -- one of them because the Initial Auditor privately wrote that a body
+"says subtract 8 from both sides to obtain y=21" and the Independent Reviewer later
+reported the same defect in the same words. Two agents agreeing about one equation is the
+system working, and the detector called it a breach.
+
+The reason no threshold fixes this: a paraphrase detector cannot distinguish *agreement*
+from *transmission*. Two agents reasoning correctly about the same cell produce the same
+sentence, and that is not a signal that can be tuned away -- it is the intended behaviour
+of the pipeline. So overlap is recorded as a `Suspicion` for a human to read, and only an
+exact copy raises.
+
+What actually keeps the Writer's rationale away from a reviewer is that `ReviewerContext`
+**cannot name a private type**, checked at import. That is structural, and no amount of
+text agreement weakens it.
+
+A `ContextIsolationError` still terminates the job as `FAILED(ISOLATION_VIOLATION)`, never
+a warning and never a retry -- a retry would send the same tainted payload again. It is
+now raised only where the evidence is conclusive.
 """
 
 from __future__ import annotations
@@ -61,6 +76,34 @@ class ContextIsolationError(Exception):
         super().__init__(message)
         self.label = label
         self.context = context
+
+
+@dataclass(frozen=True)
+class Suspicion:
+    """A shared span that is *consistent with* a leak but does not establish one.
+
+    Recorded rather than raised. The distinction is the whole lesson of this module: an
+    exact copy of registered private text is evidence, because nothing else produces it;
+    a shared twelve-token span is not, because two agents examining the same equation
+    reach the same sentence about it all the time. Treating the second as proof killed
+    two held-out jobs after 42 and 45 paid model calls, and the leak it was hunting has
+    never once occurred.
+
+    These are surfaced so a human can look, which is the appropriate response to a
+    signal that is suggestive and not conclusive.
+    """
+
+    label: str
+    context: str
+    shared_tokens: int
+
+    def describe(self) -> str:
+        return (
+            f"{self.context} payload shares a {self.shared_tokens}-token sequence with "
+            f"private text {self.label!r} that public ground does not explain. This is "
+            "not proof of a leak -- two agents describing the same defect produce the "
+            "same sentence -- but it is worth a look."
+        )
 
 
 class PrivateText:
@@ -221,10 +264,15 @@ class TaintRegistry:
     """
 
     entries: dict[str, str] = None  # label -> text
+    #: Non-fatal shared spans, accumulated across the job for a human to review. Not a
+    #: failure channel: nothing reads this to decide whether the job may continue.
+    suspicions: list = None
 
     def __post_init__(self) -> None:
         if self.entries is None:
             self.entries = {}
+        if self.suspicions is None:
+            self.suspicions = []
 
     def register(self, label: str, text: str | PrivateText) -> None:
         value = text.reveal() if isinstance(text, PrivateText) else text
@@ -256,7 +304,12 @@ class TaintRegistry:
         return registry
 
     def assert_clean(
-        self, payload: str, *, context: str, public: Iterable[str] = ()
+        self,
+        payload: str,
+        *,
+        context: str,
+        public: Iterable[str] = (),
+        public_for: dict[str, Iterable[str]] | None = None,
     ) -> None:
         """Refuse to dispatch a payload carrying registered private text.
 
@@ -303,6 +356,18 @@ class TaintRegistry:
             if len(private_tokens) < MIN_PRIVATE_TOKENS:
                 continue
 
+            # Ground that is public *for this entry's author only*. An agent's own public
+            # output is not a leak of that agent's private notes -- they describe one
+            # finding in one sentence -- but it is emphatically not ground for anybody
+            # else's reasoning, so the exemption is keyed by label rather than global.
+            own_haystack, own_shingles = public_haystack, public_shingles
+            for prefix, texts in (public_for or {}).items():
+                if label.startswith(prefix):
+                    own_tokens = public_tokens + _tokens("\n".join(texts))
+                    own_haystack = f" {' '.join(own_tokens)} "
+                    own_shingles = _shingles(own_tokens)
+                    break
+
             # Reasoning shorter than a shingle produces none, so exact containment is the
             # only check available for it -- and is sufficient, since there is little to
             # paraphrase in a sentence that short.
@@ -310,7 +375,7 @@ class TaintRegistry:
             if sequence in haystack:
                 # The entry reached the payload -- but if the identical run of tokens is
                 # also in the workbook, what reached it was the workbook.
-                if public_haystack and sequence in public_haystack:
+                if own_haystack and sequence in own_haystack:
                     continue
                 raise ContextIsolationError(
                     f"{context} payload contains private text registered as {label!r}",
@@ -320,14 +385,18 @@ class TaintRegistry:
 
             # Only the spans this private text does not share with public ground can
             # testify that private text is what arrived.
-            distinctive = _shingles(private_tokens) - public_shingles
+            distinctive = _shingles(private_tokens) - own_shingles
             overlap = distinctive & payload_shingles
             if overlap:
-                raise ContextIsolationError(
-                    f"{context} payload shares a {SHINGLE_SIZE}-token sequence with "
-                    f"private text {label!r} that does not appear in the workbook or the "
-                    "deterministic findings, which means a paraphrase or partial quote "
-                    "reached it",
-                    label=label,
-                    context=context,
+                # **Recorded, not raised.** See the class docstring: a shared span is
+                # equally consistent with a leak and with two agents reaching the same
+                # conclusion about the same equation, and this check cannot tell them
+                # apart. Killing the job on it destroyed two held-out runs after 42 and
+                # 45 paid model calls, and never once caught a real leak.
+                self.suspicions.append(
+                    Suspicion(
+                        label=label,
+                        context=context,
+                        shared_tokens=len(next(iter(overlap))),
+                    )
                 )

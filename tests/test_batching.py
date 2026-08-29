@@ -18,7 +18,13 @@ import pytest
 
 from conftest import problem, scaffold, step
 from oatutor_council.agents import independent_reviewer, initial_auditor
-from oatutor_council.agents.batching import BatchItem, attribute, make_items, rows_for_block
+from oatutor_council.agents.batching import (
+    BatchItem,
+    attribute,
+    cells_for_block,
+    make_items,
+)
+from oatutor_council.agents.schemas import FindingCell
 from oatutor_council.agents.schemas import (
     AuditorBlockResult,
     AuditorFinding,
@@ -335,15 +341,16 @@ def test_a_duplicated_id_invalidates_both_and_requeues(setup):
 
 
 def test_a_finding_naming_only_another_blocks_rows_is_never_relocated(setup):
-    """Clamping is safe with one block in play because there is one candidate. In a batch
-    it invents a defect at a location nobody reported."""
+    """A target outside its attributed block is never moved to a convenient row."""
     _, copy = setup
     blocks = read_workbook(copy.path).blocks
     first, second = blocks[0], blocks[1]
 
-    assert rows_for_block([second.start_row], first) is None
-    assert rows_for_block([], first) == []
-    assert rows_for_block([first.start_row, second.start_row], first) == [first.start_row]
+    inside = FindingCell(row=first.start_row, column="answer")
+    outside = FindingCell(row=second.start_row, column="answer")
+    assert cells_for_block([outside], first) is None
+    assert cells_for_block([inside, outside], first) is None
+    assert cells_for_block([inside], first) == [inside]
 
 
 def test_a_cross_block_finding_requeues_its_block(setup):
@@ -361,7 +368,10 @@ def test_a_cross_block_finding_requeues_its_block(setup):
                 AuditorBlockResult(
                     batch_item_id=ids[0],
                     findings=[
-                        AuditorFinding(rows=[other_row], problem="wrong block entirely")
+                        AuditorFinding(
+                            cells=[{"row": other_row, "column": "answer"}],
+                            problem="wrong block entirely",
+                        )
                     ],
                 ),
                 AuditorBlockResult(batch_item_id=ids[1]),
@@ -459,7 +469,9 @@ def test_a_claim_shown_to_one_block_cannot_be_settled_by_another(setup):
     client.default = lambda r: AuditorResponse(
         findings=[
             AuditorFinding(
-                rows=[parsed.blocks[1].start_row],
+                cells=[
+                    {"row": parsed.blocks[1].start_row, "column": "answer"}
+                ],
                 problem="something else",
                 confirms_claim=7,
             )
@@ -489,7 +501,9 @@ def test_an_invalid_confirmation_keeps_the_finding(setup):
     client.default = lambda r: AuditorResponse(
         findings=[
             AuditorFinding(
-                rows=[block.start_row], problem="the answer is wrong", confirms_claim=99
+                cells=[{"row": block.start_row, "column": "answer"}],
+                problem="the answer is wrong",
+                confirms_claim=99,
             )
         ]
     )

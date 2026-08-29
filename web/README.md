@@ -89,13 +89,23 @@ which is the mechanism the service already has. It is split into passages, each 
 
 - **errata** go to the Initial Auditor as claims, and only to the blocks a claim could be
   about. Each comes back confirmed, refuted or unresolved, and the report says which.
-- **rules** go to the Writer and both reviewers as policy, capped at 4,000 characters
-  because they ride on every call for the whole job.
-- **notes** are recorded and not acted on.
+- **rules** go to the Initial Auditor, Writer and both reviewers as policy. Every passage
+  accepted by the instruction reader is sent; there is no smaller routing cap.
+- **notes** go only to the Initial Auditor as non-authoritative background. They are not
+  a defect claim, do not authorize a change, and do not reach the Writer or reviewers.
 
 The dropdown overrides the classification for the whole document. Either way the text is
 rendered inside a fenced, labelled data section: it is content the agents read, not
 instructions they follow, and it cannot override the system prompt.
+
+The instruction reader's one bound is 200,000 extracted characters. The page prevents a
+pasted note above that size; API-uploaded documents report truncation in the submission
+response and final report rather than silently pretending the tail was read.
+
+The result page separates **open issues** from **observations** using the backend's actual
+repairability contract, not color or severity alone. A repairable warning such as trailing
+whitespace remains open work; a non-repairable house-style warning is only an observation;
+and a non-repairable error still needs a person.
 
 ---
 
@@ -106,9 +116,10 @@ instructions they follow, and it cannot override the system prompt.
 - **One job at a time**, by design (`MAX_CONCURRENT_JOBS=1`): SQLite in WAL over one file
   wants one writer.
 - **Closing the tab does not cancel a job.** The job is a durable row; the worker keeps
-  going and the poller picks it up after a crash. The corrected file is still produced —
-  but this page holds no job list, so you would need the job id to fetch it.
-- **Refreshing loses the job id.** A deliberate floor rather than a design: keeping a list
-  means deciding where job ids live and how long they stay, which is a retention question
-  rather than a UI feature.
-- **4 MB upload guard** in `app/api/jobs/route.ts`. Real OATutor workbooks are 30–96 KB.
+  going and the poller picks it up after a crash. The page stores the latest opaque job id
+  in local browser storage, so reopening or refreshing resumes polling and download access.
+- **The page remembers only the latest job.** It does not provide a multi-job history or
+  cross-device account view; those require user identities and a retention policy rather
+  than more browser storage.
+- **50 MB upload guard** in `app/api/jobs/route.ts`, matching the council default. The
+  backend remains authoritative if an operator configures a different limit.

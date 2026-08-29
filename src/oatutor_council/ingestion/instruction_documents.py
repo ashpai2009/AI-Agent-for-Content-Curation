@@ -78,11 +78,12 @@ class SegmentPurpose(StrEnum):
     twenty-nine of them.
     """
 
-    #: Authoritative instruction. Goes to the Writer and both reviewers as policy.
+    #: Authoritative instruction. Goes to the Initial Auditor, Writer and both reviewers.
     RULES = "rules"
     #: A suspected defect. Goes to the Initial Auditor as a claim to verify.
     ERRATA = "errata"
-    #: Context that is neither. Recorded, shown to the auditor, never treated as a claim.
+    #: Context that is neither. Shown only to the auditor, never treated as a claim or
+    #: policy and never passed to the Writer or reviewers.
     NOTES = "notes"
 
 

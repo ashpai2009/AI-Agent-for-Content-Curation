@@ -387,6 +387,13 @@ def create_app(
             job_id,
             ArtifactKind.SOURCE_WORKBOOK,
             str(source_path),
+            # The hash was computed one line above, when the working copy was made, and
+            # was being dropped -- so reports described the curator's own source workbook
+            # as "sha256 not hashed" while every other artefact carried one. Artefacts are
+            # reported by kind and hash rather than by path precisely so a curator can
+            # check that what they downloaded descends from what they uploaded; the one
+            # artefact that claim is *about* was the one with nothing to check against.
+            copy.source_sha256,
             data_root=resolved.data_root,
         )
 
@@ -424,6 +431,9 @@ def create_app(
             "source_filename": job.source_filename,
             "instruction_filename": job.instruction_filename,
             "seed_claims": seed_claim_count,
+            "instruction_document_truncated": bool(
+                parsed_document and parsed_document.truncated
+            ),
         }
 
     # -- observation ------------------------------------------------------------------

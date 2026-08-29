@@ -32,6 +32,7 @@ from uuid import uuid4
 from openpyxl import load_workbook
 
 from .agents import independent_reviewer, initial_auditor, known_issue_reviewer, writer
+from .agents.batching import FindingAttributionError
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
 from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
@@ -46,7 +47,7 @@ from .llm.base import (
     RetryingClient,
     sanitize_provider_message,
 )
-from .llm.prompts import current_prompt_versions
+from .llm.prompts import current_prompt_versions, resolve_prompt
 from .models import (
     ArtifactKind,
     CellEdit,
@@ -56,6 +57,7 @@ from .models import (
     CurationJob,
     FailureReason,
     Issue,
+    IssueCategory,
     IssueSource,
     IssueState,
     JobState,
@@ -65,6 +67,7 @@ from .models import (
     RejectionCode,
     RepairAttempt,
     ReviewDecision,
+    ReviewVerdict,
     ReviewerRole,
     SourcePath,
     ValidationFinding,
@@ -91,6 +94,7 @@ from .persistence import (
     load_ledger,
     load_job_settings,
     load_private_blobs,
+    load_prompt_pins,
     load_prompt_versions,
     pin_job_settings,
     pin_prompt_versions,
@@ -119,6 +123,7 @@ from .state_machine import AttemptsExhausted, IssueMachine, advance_issue
 from .validation.final_gate import run_final_gate
 from .validation.patch_gate import (
     rejection_consumes_attempt,
+    simulate_block,
     target_findings,
     validate_patch,
 )
@@ -141,18 +146,65 @@ _NEEDS_WRITER = frozenset(
         IssueState.PATCH_REJECTED,
     }
 )
-_NEEDS_APPLY = frozenset({IssueState.PATCH_PROPOSED, IssueState.APPLYING})
-_NEEDS_REVIEW = frozenset({IssueState.PATCH_APPLIED, IssueState.AWAITING_REVIEW})
+_NEEDS_APPLY = frozenset({IssueState.PATCH_APPROVED, IssueState.APPLYING})
+_NEEDS_REVIEW = frozenset(
+    {IssueState.PATCH_PROPOSED, IssueState.PATCH_APPLIED, IssueState.AWAITING_REVIEW}
+)
 LIVE_ISSUE_STATES = _NEEDS_WRITER | _NEEDS_APPLY | _NEEDS_REVIEW
 
-#: How much curator-supplied policy may ride along in every repair and review call. These
-#: travel on every one of them for the whole job, so an uncapped section turns a long
-#: document into a cost paid hundreds of times for text that mostly repeats.
-MAX_CURATOR_RULE_CHARACTERS = 4_000
-
+#: Findings that explain several downstream symptoms in the same block. Repairing the
+#: displaced/mis-typed row first lets the ordinary rule recheck supersede the answer,
+#: dependency and choice errors it caused. The adversarial run did the reverse, spending
+#: eleven Writer calls on symptoms before eventually applying the one root repair.
+_ROOT_FINDING_CODES = frozenset(
+    {
+        "ROW_SHIFT_RIGHT",
+        "COLUMN_SHIFT",
+        "BLOCK_BOUNDARY_DISAGREEMENT",
+        "PROBLEM_NAME_MISMATCH_IN_BLOCK",
+        "MISSING_PROBLEM_NAME",
+        "ROW_HAS_FORBIDDEN_CONTENT",
+        "PROBLEM_ROW_HAS_GRADED_CONTENT",
+    }
+)
 
 #: The durable event kind counted against `provider_failure_budget`.
 PROVIDER_FAILURE_EVENT = "provider_failure"
+
+
+def _finding_targets(finding: ValidationFinding) -> frozenset[tuple[int, int]]:
+    """The exact cells a model finding says must change."""
+    detailed = finding.detail.get("cells") or ()
+    if detailed:
+        return frozenset((int(row), int(column)) for row, column in detailed)
+    if finding.row is not None and finding.column is not None:
+        return frozenset({(finding.row, finding.column)})
+    return frozenset()
+
+
+def _corroborating_finding(
+    issue: Issue, findings: Sequence[ValidationFinding]
+) -> ValidationFinding | None:
+    """Return a genuinely independent finding for the same claim, if one exists.
+
+    Prose similarity is deliberately irrelevant: asking another model whether an
+    accusation *sounds like* the first accusation is another form of anchoring.  A blind
+    audit corroborates a model-only issue only when it independently names the same exact
+    repair targets and category.  Disagreement preserves the workbook; the later full
+    sweep can rediscover a real defect, while an unsupported edit cannot be undone after
+    it has already overwritten correct source content.
+    """
+    wanted = frozenset(issue.cells)
+    if not wanted:
+        return None
+    for finding in findings:
+        try:
+            category = IssueCategory(str(finding.detail.get("category", "")))
+        except ValueError:
+            continue
+        if category is issue.category and _finding_targets(finding) == wanted:
+            return finding
+    return None
 
 #: The round number the final gate's findings are stored under. Deliberately above any
 #: repair round: it is what the workbook looked like when it was handed over, which is the
@@ -179,6 +231,11 @@ FINAL_GATE_ROUND = 1_000
 #: output arrived. That changes what every call carries, which is exactly what this
 #: constant exists to record -- a job that started under 1 must not finish under 2.
 CLI_ADAPTER_VERSION = 2
+
+#: Version of orchestration and user-payload construction that changes what agents see or
+#: when workbook bytes are committed. Prompt files are pinned separately; this covers the
+#: Python-side instructions, context sections, review coverage and patch lifecycle.
+PIPELINE_CONTRACT_VERSION = 3
 
 
 class BudgetExhausted(Exception):
@@ -213,15 +270,50 @@ def _adapter_mismatch(pinned: dict[str, object]) -> str | None:
     in flight across this very deployment.
     """
     recorded = pinned.get("cli_adapter_version")
-    if recorded is None or int(recorded) == CLI_ADAPTER_VERSION:
-        return None
-    return (
-        f"this job was pinned to CLI adapter version {int(recorded)} and this process "
-        f"is running version {CLI_ADAPTER_VERSION}. The adapter decides what flags each "
-        "model call carries, so continuing would finish the job under different "
-        "instructions from the ones it started under. Resume it on a process running "
-        f"adapter {int(recorded)}, or submit the workbook again."
-    )
+    if recorded is not None and int(recorded) != CLI_ADAPTER_VERSION:
+        return (
+            f"this job was pinned to CLI adapter version {int(recorded)} and this process "
+            f"is running version {CLI_ADAPTER_VERSION}. The adapter decides what flags each "
+            "model call carries, so continuing would finish the job under different "
+            "instructions from the ones it started under. Resume it on a process running "
+            f"adapter {int(recorded)}, or submit the workbook again."
+        )
+
+    pipeline = pinned.get("pipeline_contract_version")
+    if pipeline is not None and int(pipeline) != PIPELINE_CONTRACT_VERSION:
+        return (
+            f"this job was pinned to pipeline contract version {int(pipeline)} and this "
+            f"process is running version {PIPELINE_CONTRACT_VERSION}. The contract decides "
+            "which blocks and context each agent sees and when an approved patch is written. "
+            "Resume it on the original version, or submit the workbook again."
+        )
+    return None
+
+
+def _prompt_mismatch(pins: dict[str, tuple[int, str]]) -> str | None:
+    """Refuse a same-version prompt whose composed bytes changed on disk.
+
+    The database always stored the hash but the runner previously loaded only the version,
+    so editing a shared prompt fragment changed in-flight jobs while their records still
+    claimed they were pinned. The hash is now an enforced premise, not decorative audit
+    metadata.
+    """
+    for role_name, (version, expected_sha) in pins.items():
+        try:
+            resolved = resolve_prompt(AgentRole(role_name), version)
+        except Exception as error:
+            return (
+                f"the pinned {role_name} prompt v{version} cannot be loaded: {error}. "
+                "Restore the pinned prompt files or submit the workbook again."
+            )
+        if resolved.sha256 != expected_sha:
+            return (
+                f"the pinned {role_name} prompt v{version} has changed on disk "
+                f"({expected_sha[:12]} expected, {resolved.sha256[:12]} found). Prompt "
+                "content must receive a new version; restore the original bytes or "
+                "submit the workbook again."
+            )
+    return None
 
 
 @dataclass(frozen=True)
@@ -286,6 +378,7 @@ class CurationCouncil:
         # not mean attempt one was made under one set of instructions and attempt two
         # under another with nothing in the record to say so.
         self.prompt_versions = load_prompt_versions(db, job_id)
+        self._prompt_migration = _prompt_mismatch(load_prompt_pins(db, job_id))
 
         # A resumed job must run under the settings it *started* with, from its very first
         # step -- not from the step where pinning happens to re-run. Loaded here so a
@@ -329,6 +422,11 @@ class CurationCouncil:
             backoff_ceiling=self.settings.provider_backoff_ceiling_seconds,
         )
         self._source_parse: ParsedWorkbook | None = None
+        # Recovery belongs to the first step of every worker instance, not only to the
+        # INGESTING phase. A replacement worker normally resumes the durable phase it
+        # inherited; forcing recovery to live in one earlier phase meant it never ran for
+        # the mid-repair crashes it exists to repair.
+        self._recovery_checked = False
 
     # -- helpers ----------------------------------------------------------------------
 
@@ -366,27 +464,34 @@ class CurationCouncil:
     def curator_rules(self) -> tuple[str, ...]:
         """Governing instructions from the curator's document.
 
-        Policy, not hypotheses: these reach the Writer and both reviewers, who have to
-        *apply* them, and never the claim machinery, which would ask thirty blocks to
+        Policy, not hypotheses: these reach the Initial Auditor, Writer and both reviewers,
+        who have to *apply* them, and never the claim machinery, which would ask thirty blocks to
         confirm or refute a statement that is true of all of them.
 
-        Capped, because these travel in every repair and review call for the whole job.
-        An uncapped policy section turns a long document into a per-call cost paid
-        hundreds of times.
+        Every accepted rule passage is returned. Instruction ingestion already enforces
+        the document-wide size bound; imposing a smaller hidden cap here caused the API
+        to accept a guide and silently omit most of it from every model call.
         """
-        rules = [
+        return tuple(
             row["text"].strip()
             for row in load_instruction_segments(self.db, self.job_id)
             if row.get("purpose") == SegmentPurpose.RULES and row["text"].strip()
-        ]
-        kept: list[str] = []
-        budget = MAX_CURATOR_RULE_CHARACTERS
-        for rule in rules:
-            if len(rule) > budget:
-                break
-            kept.append(rule)
-            budget -= len(rule)
-        return tuple(kept)
+        )
+
+    @property
+    def curator_notes(self) -> tuple[str, ...]:
+        """Background shown only to the Initial Auditor.
+
+        Notes are evidence that can help interpret a block, but they are neither defect
+        claims to confirm/refute nor policy that authorises a change. The auditor may use
+        them while independently deciding whether a concrete finding exists; downstream
+        agents receive the resulting issue, not the background prose.
+        """
+        return tuple(
+            row["text"].strip()
+            for row in load_instruction_segments(self.db, self.job_id)
+            if row.get("purpose") == SegmentPurpose.NOTES and row["text"].strip()
+        )
 
     def source_workbook(self) -> ParsedWorkbook:
         """The workbook as submitted. Parsed once: the source cannot change."""
@@ -492,7 +597,13 @@ class CurationCouncil:
         budget = self.settings.scan_batch_max_characters
 
         batch: list[ProblemBlock] = []
-        used = 0
+        # These sections occur once per request, not once per block, but they still count
+        # toward the request-size promise. Counting zero here let a long policy or
+        # background document bypass the cap while every per-block calculation looked
+        # correct. Notes are present only in the initial audit; including them during the
+        # independent sweep is a conservative bound, not transmitted data.
+        used = sum(len(rule) for rule in self.curator_rules)
+        used += sum(len(note) for note in self.curator_notes)
         for block in pending[:limit]:
             cost = self._batch_cost(parsed, block)
             if batch and used + cost > budget:
@@ -530,6 +641,9 @@ class CurationCouncil:
         """
         pin_prompt_versions(self.db, self.job_id, current_prompt_versions())
         self.prompt_versions = load_prompt_versions(self.db, self.job_id)
+        self._prompt_migration = _prompt_mismatch(
+            load_prompt_pins(self.db, self.job_id)
+        )
         self.client.prompt_versions = self.prompt_versions
 
         pin_job_settings(self.db, self.job_id, self._behaviour_settings())
@@ -553,6 +667,7 @@ class CurationCouncil:
             },
             "model": self.settings.claude_model,
             "cli_adapter_version": CLI_ADAPTER_VERSION,
+            "pipeline_contract_version": PIPELINE_CONTRACT_VERSION,
         }
 
     def _settings_from_pins(self) -> Settings:
@@ -582,9 +697,10 @@ class CurationCouncil:
         )
 
     def _check_pinned_adapter(self) -> None:
-        """Refuse to continue a job under an adapter it was not pinned to."""
-        if self._settings_migration:
-            raise JobSettingsMigrationRequired(self._settings_migration)
+        """Refuse to continue under changed invocation, context, or prompt bytes."""
+        mismatch = self._settings_migration or self._prompt_migration
+        if mismatch:
+            raise JobSettingsMigrationRequired(mismatch)
 
     def _prompt_version(self, role: AgentRole) -> int | None:
         return self.prompt_versions.get(role.value)
@@ -662,6 +778,19 @@ class CurationCouncil:
         try:
             self._check_pinned_adapter()
             self._check_deadline()
+            if not self._recovery_checked:
+                recovery = recover_job(
+                    self.db,
+                    self.job,
+                    self.copy,
+                    self.machine,
+                    list_issues(self.db, self.job_id),
+                )
+                self._recovery_checked = True
+                if recovery.did_anything:
+                    return StepOutcome(
+                        True, f"recovered interrupted work: {recovery.describe()}", job.state
+                    )
             return self._dispatch(job)
         except JobSettingsMigrationRequired as error:
             # `CONFIG`, and therefore non-resumable: resuming runs the same code against
@@ -816,6 +945,7 @@ class CurationCouncil:
             findings_for=lambda block: self._findings_for_block(parsed, block),
             seed_claims=self.seed_claims,
             curator_rules=self.curator_rules,
+            curator_notes=self.curator_notes,
             job_id=self.job_id,
             taint=self.taint,
             prompt_version=self._prompt_version(AgentRole.INITIAL_AUDITOR),
@@ -851,16 +981,13 @@ class CurationCouncil:
         )
 
     def _independent_review(self) -> StepOutcome:
-        """Sweep every block without a surviving ledger entry, then repair what it finds."""
+        """Sweep every current block from scratch, then repair what it finds."""
         parsed = self.current_workbook()
-        ledger = load_ledger(self.db, self.job_id)
         done = blocks_done(self.db, self.job_id, "swept")
 
         pending = [
             block
-            for block in independent_reviewer.blocks_to_sweep(
-                parsed.blocks, ledger.blocks_with_ledger_entry
-            )
+            for block in independent_reviewer.blocks_to_sweep(parsed.blocks)
             if block.block_id not in done
         ]
 
@@ -1168,12 +1295,8 @@ class CurationCouncil:
             issue.state is IssueState.OPEN
             and issue.attempts_used == 0
             and remaining is None
-            and any(
-                change.block_id == issue.block_id and change.issue_id != issue.issue_id
-                for change in list_changes(self.db, self.job_id)
-            )
         ):
-            return self._review_prior_repair(issue, state)
+            return self._review_unpatched_issue(issue, state)
 
         # Reserved and committed BEFORE the call. Incrementing afterwards would let a
         # crash loop burn unbounded spend against a counter that never moves.
@@ -1401,6 +1524,8 @@ class CurationCouncil:
         insert_patch(self.db, patch)
         progress = advance_issue(issue, IssueState.AWAITING_PATCH)
         progress = advance_issue(progress, IssueState.PATCH_PROPOSED)
+        progress = advance_issue(progress, IssueState.AWAITING_REVIEW)
+        progress = advance_issue(progress, IssueState.PATCH_APPROVED)
         progress = advance_issue(progress, IssueState.APPLYING)
         save_issue(self.db, progress)
         assert_lease_held(
@@ -1414,7 +1539,6 @@ class CurationCouncil:
             block_id=issue.block_id,
         )
         progress = advance_issue(progress, IssueState.PATCH_APPLIED)
-        progress = advance_issue(progress, IssueState.AWAITING_REVIEW)
         progress = advance_issue(progress, IssueState.ACCEPTED)
         save_issue(self.db, progress)
         record_event(
@@ -1444,29 +1568,41 @@ class CurationCouncil:
             self.db, self.job_id, self.worker_id, run_epoch=self.run_epoch
         )
 
-        try:
-            apply_patch(
+        position = self._patch_position(patch)
+        if position == "before":
+            try:
+                apply_patch(
+                    self.db,
+                    self.job.model_copy(update={"run_epoch": self.run_epoch}),
+                    self.copy,
+                    patch,
+                    block_id=issue.block_id,
+                )
+            except EditRejected as error:
+                code = error.rejection.code
+                # A `before` mismatch here means the block changed underneath the patch --
+                # the system's scheduling, not the Writer's mistake -- so no attempt is spent.
+                if code is RejectionCode.BEFORE_MISMATCH:
+                    issue = self.machine.refund_interrupted(issue)
+                save_issue(self.db, advance_issue(issue, IssueState.PATCH_REJECTED))
+                return StepOutcome(True, f"apply rejected: {code.value}", state)
+        else:
+            # Recovery after the atomic file write but before the issue-state commit.
+            # Re-applying would fail its own `before` check and spend a valid attempt.
+            record_event(
                 self.db,
-                self.job.model_copy(update={"run_epoch": self.run_epoch}),
-                self.copy,
-                patch,
-                block_id=issue.block_id,
+                self.job_id,
+                "approved_patch_recovered",
+                f"{patch.patch_id} was already present; application rolled forward",
             )
-        except EditRejected as error:
-            code = error.rejection.code
-            # A `before` mismatch here means the block changed underneath the patch --
-            # the system's scheduling, not the Writer's mistake -- so no attempt is spent.
-            if code is RejectionCode.BEFORE_MISMATCH:
-                issue = self.machine.refund_interrupted(issue)
-            save_issue(self.db, advance_issue(issue, IssueState.PATCH_REJECTED))
-            return StepOutcome(True, f"apply rejected: {code.value}", state)
 
         issue = advance_issue(issue, IssueState.PATCH_APPLIED)
-        save_issue(self.db, advance_issue(issue, IssueState.AWAITING_REVIEW))
+        save_issue(self.db, advance_issue(issue, IssueState.ACCEPTED))
         return StepOutcome(True, f"patch applied for {issue.issue_id}", state)
 
     def _review(self, issue: Issue, state: JobState) -> StepOutcome:
-        if issue.state is IssueState.PATCH_APPLIED:
+        legacy_applied = issue.state is IssueState.PATCH_APPLIED
+        if issue.state in (IssueState.PATCH_PROPOSED, IssueState.PATCH_APPLIED):
             save_issue(self.db, advance_issue(issue, IssueState.AWAITING_REVIEW))
             issue = advance_issue(issue, IssueState.AWAITING_REVIEW)
 
@@ -1475,26 +1611,39 @@ class CurationCouncil:
         # second physical model call to make the same decision.
         patch = _latest_patch(self.db, issue.issue_id)
         review_attempt_no = patch.attempt_no if patch is not None else (issue.attempts_used or 1)
+        position = self._patch_position(patch) if patch is not None else "before"
         verdict = _verdict_for_attempt(self.db, issue.issue_id, review_attempt_no)
         if verdict is None:
-            verdict = self._ask_reviewer(issue, attempt_no=review_attempt_no)
+            verdict = self._ask_reviewer(
+                issue, attempt_no=review_attempt_no, candidate_patch=patch
+            )
         if verdict is None:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, "block vanished; escalating", state)
         _settle_reviewed_attempt(self.db, issue.issue_id, verdict)
 
         if verdict.decision is ReviewDecision.ACCEPT:
-            save_issue(self.db, advance_issue(issue, IssueState.ACCEPTED))
-            return StepOutcome(True, f"{issue.issue_id} accepted", state)
+            next_state = (
+                IssueState.ACCEPTED
+                if legacy_applied or position == "after"
+                else IssueState.PATCH_APPROVED
+            )
+            save_issue(self.db, advance_issue(issue, next_state))
+            message = "accepted" if next_state is IssueState.ACCEPTED else "approved"
+            return StepOutcome(True, f"{issue.issue_id} {message}", state)
 
-        # The reviewer judges a proposed patch, not a permission to keep it. Until this
-        # rollback existed, REVISE and HUMAN_REVIEW left the rejected bytes in the real
-        # working workbook. Later agents then reasoned over an unaccepted edit and the
-        # downloaded file could contain a change the UI simultaneously called unresolved.
-        # Reverse it under the same crash-safe intent protocol before another Writer sees
-        # the block or the file can be finalised.
-        if patch is not None:
+        # New jobs review a simulation, so a rejection has no workbook mutation to undo.
+        # `after` is possible only for an in-flight job created under the former
+        # apply-before-review lifecycle; retain its crash-safe rollback path.
+        if patch is not None and position == "after":
             self._rollback_rejected_patch(issue, patch, verdict.verdict_id)
+        elif patch is not None:
+            record_event(
+                self.db,
+                self.job_id,
+                "candidate_patch_rejected",
+                f"{patch.patch_id} was not applied after verdict {verdict.verdict_id}",
+            )
 
         if verdict.decision is ReviewDecision.HUMAN_REVIEW:
             save_issue(self.db, self.machine.exhausted(issue))
@@ -1507,6 +1656,32 @@ class CurationCouncil:
         )
         save_issue(self.db, advance_issue(issue, next_state))
         return StepOutcome(True, f"{issue.issue_id} revision requested", state)
+
+    def _patch_position(self, patch: Patch) -> str:
+        """Whether every target cell contains the proposal's `before` or `after` value.
+
+        New patches are reviewed while still at `before`. `after` exists for recovery and
+        for jobs created under the former apply-before-review lifecycle. A mixture cannot
+        be produced by the atomic workbook writer and is therefore corruption.
+        """
+        workbook = load_workbook(self.copy.path, data_only=False, read_only=True)
+        try:
+            sheet = workbook.active
+            actual = [
+                render_cell(sheet.cell(row=edit.row, column=edit.column).value)
+                for edit in patch.edits
+            ]
+        finally:
+            workbook.close()
+
+        if all(value == edit.before for value, edit in zip(actual, patch.edits)):
+            return "before"
+        if all(value == edit.after for value, edit in zip(actual, patch.edits)):
+            return "after"
+        raise JobCorrupted(
+            f"working copy is neither before nor after patch {patch.patch_id}",
+            job_id=self.job_id,
+        )
 
     def _rollback_rejected_patch(
         self, issue: Issue, patch: Patch, verdict_id: str
@@ -1566,29 +1741,61 @@ class CurationCouncil:
             f"{patch.patch_id} was removed after verdict {verdict_id}",
         )
 
-    def _review_prior_repair(self, issue: Issue, state: JobState) -> StepOutcome:
-        """Check whether another accepted edit already resolved a semantic duplicate.
+    def _review_unpatched_issue(self, issue: Issue, state: JobState) -> StepOutcome:
+        """Blindly corroborate a model-only claim before permitting any edit.
 
-        This is deliberately a reviewer call, not a cell-overlap heuristic. Two genuine
-        semantic defects can concern the same answer, and silently superseding one merely
-        because that cell changed would lose it. The reviewer sees source versus current
-        and decides whether this particular issue survived the earlier repair.
+        Merely hiding the Writer's candidate was insufficient: the old pre-check still
+        showed the second model the first model's accusation, and the accusation itself
+        anchored the decision.  The second agent now receives the current block and rules
+        only and performs its ordinary from-scratch audit.  The first claim is not placed
+        anywhere in the system prompt, user payload, or response schema.
+
+        Attempt zero is a durable namespace for this blind check. It cannot be mistaken
+        for the verdict on Writer attempt one after a crash. Initial-Auditor findings are
+        checked by the Independent Reviewer; Independent-Reviewer findings are checked by
+        the Initial Auditor, so an agent never certifies its own unsupported claim.
         """
-        verdict = self._ask_reviewer(issue)
+        verdict = _verdict_for_attempt(self.db, issue.issue_id, 0)
+        if verdict is None:
+            verdict = self._ask_blind_corroborator(issue)
         if verdict is None:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, "block vanished; escalating", state)
 
         if verdict.decision is ReviewDecision.ACCEPT:
-            save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
+            changed_targets = {
+                (change.row, change.column)
+                for change in list_changes(self.db, self.job_id)
+                if change.block_id == issue.block_id and change.issue_id != issue.issue_id
+            }
+            resolved_state = (
+                IssueState.SUPERSEDED
+                if changed_targets.intersection(issue.cells)
+                else IssueState.REFUTED
+            )
+            save_issue(self.db, advance_issue(issue, resolved_state))
+            explanation = (
+                "an earlier accepted repair resolved"
+                if resolved_state is IssueState.SUPERSEDED
+                else "a fresh reviewer refuted"
+            )
             record_event(
                 self.db,
                 self.job_id,
-                "issue_superseded",
-                f"{issue.issue_id}: reviewer confirmed an earlier repair resolved "
-                f"the semantic finding in {issue.problem_name}",
+                "issue_superseded" if resolved_state is IssueState.SUPERSEDED else "issue_refuted",
+                f"{issue.issue_id}: {explanation} the unsupported semantic finding in "
+                f"{issue.problem_name}",
             )
-            return StepOutcome(True, f"{issue.issue_id} resolved by another repair", state)
+            return StepOutcome(
+                True,
+                f"{issue.issue_id} "
+                + (
+                    "resolved by another repair"
+                    if resolved_state is IssueState.SUPERSEDED
+                    else "refuted before editing"
+                ),
+                state,
+            )
 
         if verdict.decision is ReviewDecision.HUMAN_REVIEW:
             save_issue(self.db, self.machine.exhausted(issue))
@@ -1600,7 +1807,118 @@ class CurationCouncil:
         save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
         return StepOutcome(True, f"{issue.issue_id} still needs a patch", state)
 
-    def _ask_reviewer(self, issue: Issue, *, attempt_no: int | None = None):
+    def _ask_blind_corroborator(self, issue: Issue) -> ReviewVerdict | None:
+        """Run a claim-blind audit and translate exact agreement into attempt zero.
+
+        This intentionally reuses the two fresh-audit agents rather than introducing a
+        fifth prompt that would drift from them.  It costs the same one physical call as
+        the former issue-framed pre-check, but removes the accusation from the payload.
+        """
+        current = self.current_workbook()
+        block = current.block_by_id(issue.block_id) if issue.block_id else None
+        if block is None:
+            return None
+
+        findings: tuple[ValidationFinding, ...] = ()
+        sound = True
+        inconclusive = ""
+        self._spend()
+        try:
+            if issue.source is IssueSource.INDEPENDENT_REVIEWER:
+                result = initial_auditor.audit_block(
+                    self.client,
+                    block=block,
+                    conventions=current.conventions,
+                    deterministic_findings=self._findings_for_block(current, block),
+                    seed_claims=(),
+                    curator_rules=self.curator_rules,
+                    curator_notes=self.curator_notes,
+                    job_id=self.job_id,
+                    taint=self.taint,
+                    prompt_version=self._prompt_version(AgentRole.INITIAL_AUDITOR),
+                )
+                findings = result.findings
+                self._keep_private(
+                    AgentRole.INITIAL_AUDITOR,
+                    f"blind-auditor.{issue.issue_id}",
+                    result.private,
+                    issue_id=issue.issue_id,
+                )
+                reviewer_role = ReviewerRole.KNOWN_ISSUE_REVIEWER
+            else:
+                result = independent_reviewer.sweep_block(
+                    self.client,
+                    block=block,
+                    conventions=current.conventions,
+                    deterministic_findings=self._findings_for_block(current, block),
+                    curator_rules=self.curator_rules,
+                    job_id=self.job_id,
+                    taint=self.taint,
+                    prompt_version=self._prompt_version(
+                        AgentRole.INDEPENDENT_REVIEWER
+                    ),
+                )
+                findings = result.findings
+                sound = result.block_is_sound
+                reviewer_role = ReviewerRole.INDEPENDENT_REVIEWER
+        except FindingAttributionError as error:
+            # An out-of-block target means the corroborator did not complete a usable
+            # audit.  It is not evidence either for or against the claim.
+            inconclusive = str(error)
+            reviewer_role = (
+                ReviewerRole.KNOWN_ISSUE_REVIEWER
+                if issue.source is IssueSource.INDEPENDENT_REVIEWER
+                else ReviewerRole.INDEPENDENT_REVIEWER
+            )
+
+        match = _corroborating_finding(issue, findings)
+        if match is not None:
+            expected = str(match.detail.get("expected") or "").strip()
+            feedback = (
+                "A claim-blind audit independently found the same defect at "
+                f"{sorted(issue.cells)}: {match.message}"
+                + (f" Required result: {expected}" if expected else "")
+            )
+            decision = ReviewDecision.REVISE
+            event = "blind_claim_corroborated"
+        elif inconclusive or (not sound and not findings):
+            feedback = (
+                "The claim-blind audit was inconclusive"
+                + (f": {inconclusive}" if inconclusive else ".")
+            )
+            decision = ReviewDecision.HUMAN_REVIEW
+            event = "blind_claim_inconclusive"
+        else:
+            feedback = ""
+            decision = ReviewDecision.ACCEPT
+            event = "blind_claim_not_corroborated"
+
+        verdict = ReviewVerdict(
+            verdict_id=uuid4().hex,
+            issue_id=issue.issue_id,
+            reviewer_role=reviewer_role,
+            attempt_no=0,
+            decision=decision,
+            feedback=feedback,
+            rule_codes=(match.code,) if match is not None else (),
+        )
+        insert_verdict(self.db, verdict)
+        record_event(
+            self.db,
+            self.job_id,
+            event,
+            f"{issue.issue_id} in {issue.problem_name or issue.block_id}",
+        )
+        return verdict
+
+    def _ask_reviewer(
+        self,
+        issue: Issue,
+        *,
+        attempt_no: int | None = None,
+        candidate_patch: Patch | None = None,
+        reviewer_role: ReviewerRole | None = None,
+    ):
         source_parse = self.source_workbook()
         current = self.current_workbook()
         original_block = source_parse.block_by_id(issue.block_id)
@@ -1608,26 +1926,48 @@ class CurationCouncil:
         if original_block is None or current_block is None:
             return None
 
+        review_block = current_block
+        review_parse = current
+        candidate_edits = ()
+        if candidate_patch is not None:
+            candidate_edits = candidate_patch.edits
+            if self._patch_position(candidate_patch) == "before":
+                review_block = simulate_block(current_block, candidate_patch.edits)
+                review_parse = current.model_copy(
+                    update={
+                        "blocks": tuple(
+                            review_block if block.block_id == review_block.block_id else block
+                            for block in current.blocks
+                        )
+                    }
+                )
+
         context = known_issue_reviewer.build_context(
             issue=issue,
             original_block=original_block,
-            current_block=current_block,
+            current_block=review_block,
             conventions=current.conventions,
-            deterministic_findings=self._findings_for_block(current, current_block),
+            deterministic_findings=self._findings_for_block(review_parse, review_block),
             curator_rules=self.curator_rules,
+            candidate_edits=candidate_edits,
         )
         self._spend()
+        role = reviewer_role or issue.reviewer_role
         verdict = known_issue_reviewer.review(
             self.client,
             issue=issue,
             context=context,
-            attempt_no=attempt_no or issue.attempts_used or 1,
+            attempt_no=(
+                attempt_no
+                if attempt_no is not None
+                else (issue.attempts_used or 1)
+            ),
             job_id=self.job_id,
             taint=self.taint,
-            role=issue.reviewer_role,
+            role=role,
             prompt_version=self._prompt_version(
                 AgentRole.KNOWN_ISSUE_REVIEWER
-                if issue.reviewer_role is ReviewerRole.KNOWN_ISSUE_REVIEWER
+                if role is ReviewerRole.KNOWN_ISSUE_REVIEWER
                 else AgentRole.INDEPENDENT_REVIEWER
             ),
         )
@@ -1721,7 +2061,17 @@ class CurationCouncil:
         reviewer_role: ReviewerRole = ReviewerRole.KNOWN_ISSUE_REVIEWER,
     ) -> int:
         opened = 0
-        for finding in actionable(tuple(findings)):
+        candidates = sorted(
+            actionable(tuple(findings)),
+            key=lambda finding: (
+                finding.block_id or "",
+                0 if finding.code in _ROOT_FINDING_CODES else 1,
+                finding.row or 0,
+                finding.column or 0,
+                finding.code,
+            ),
+        )
+        for finding in candidates:
             issue = issue_from_finding(
                 finding, job_id=self.job_id, source=source, reviewer_role=reviewer_role
             )

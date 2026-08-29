@@ -293,8 +293,9 @@ CREATE TABLE IF NOT EXISTS instruction_segments (
     document_sha256 TEXT NOT NULL DEFAULT '',
     truncated       INTEGER NOT NULL DEFAULT 0,
     -- rules | errata | notes. What the passage is *for*, which decides who sees it: a
-    -- governing rule goes to the Writer and reviewers as policy, a suspected defect goes
-    -- to the auditor as a claim. Sending a rule to thirty blocks as a claim is how a
+    -- governing rule goes to the auditor, Writer and reviewers as policy; a suspected
+    -- defect goes to the auditor as a claim; background goes only to the auditor as
+    -- context. Sending a rule to thirty blocks as a claim is how a
     -- policy statement ends up marked refuted by twenty-nine of them.
     purpose         TEXT NOT NULL DEFAULT 'errata',
     PRIMARY KEY (job_id, segment_index)
@@ -752,7 +753,7 @@ def next_issue_for_phase(
                     AND busy.block_id IS NOT NULL
                     AND busy.block_id = i.block_id
                     AND busy.issue_id <> i.issue_id
-                    AND busy.state IN ('awaiting_patch','patch_proposed','applying',
+                    AND busy.state IN ('awaiting_patch','patch_proposed','patch_approved','applying',
                                        'patch_applied','awaiting_review')
               )
             ORDER BY i.created_at LIMIT 1""",
@@ -983,6 +984,7 @@ def open_apply_intent(
     patch_id: str | None,
     run_epoch: int,
     edits: Sequence[dict[str, Any]],
+    block_id: str | None = None,
 ) -> str:
     """Commit the intent to write **before** any byte is written.
 
@@ -1004,7 +1006,7 @@ def open_apply_intent(
                 run_epoch,
                 "open",
                 _iso(_now()),
-                json.dumps({"edits": list(edits)}),
+                json.dumps({"edits": list(edits), "block_id": block_id}),
             ),
         )
     return intent_id
@@ -1022,16 +1024,19 @@ def open_apply_intents(db: Database, job_id: str) -> tuple[dict[str, Any], ...]:
     rows = db.connection.execute(
         "SELECT * FROM apply_intents WHERE job_id = ? AND state = 'open'", (job_id,)
     ).fetchall()
-    return tuple(
-        {
+    intents = []
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        intents.append({
             "intent_id": row["intent_id"],
             "issue_id": row["issue_id"],
             "patch_id": row["patch_id"],
             "run_epoch": row["run_epoch"],
-            "edits": json.loads(row["payload_json"])["edits"],
-        }
-        for row in rows
-    )
+            "edits": payload["edits"],
+            # Absent on intents created before this field existed.
+            "block_id": payload.get("block_id"),
+        })
+    return tuple(intents)
 
 
 # --------------------------------------------------------------------------------------
@@ -1517,6 +1522,14 @@ def load_prompt_versions(db: Database, job_id: str) -> dict[str, int]:
         "SELECT role, version FROM job_prompts WHERE job_id = ?", (job_id,)
     ).fetchall()
     return {row["role"]: row["version"] for row in rows}
+
+
+def load_prompt_pins(db: Database, job_id: str) -> dict[str, tuple[int, str]]:
+    """Versions plus composed-text hashes, for enforcing rather than merely recording."""
+    rows = db.connection.execute(
+        "SELECT role, version, sha256 FROM job_prompts WHERE job_id = ?", (job_id,)
+    ).fetchall()
+    return {row["role"]: (row["version"], row["sha256"]) for row in rows}
 
 
 def expired_jobs(db: Database, *, retention_days: float, limit: int = 50) -> tuple[str, ...]:

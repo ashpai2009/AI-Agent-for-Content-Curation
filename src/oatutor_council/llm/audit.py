@@ -17,11 +17,12 @@ of what it claimed to. `RetryingClient` now wraps this, so each attempt passes t
 here on its own.
 
 What is stored: the role, the model, the status, the pinned prompt version, the token
-usage, the prompt hash, and the exact text of both halves of the prompt. The text is what
+usage, the prompt hash, and the exact text of both halves of the prompt. The hash also
+covers the canonical JSON response schema sent to the CLI. The text is what
 makes the isolation guarantee auditable after the fact -- a test asserting that a reviewer
 never saw the Writer's rationale is only worth something if it reads what was transmitted
-rather than what a mock remembers. The **API key is never part of any of that**: it lives
-in settings and reaches the SDK client directly, and nothing here has access to it.
+rather than what a mock remembers. There is no API key in this service; the CLI uses the
+local subscription login through its restricted child environment.
 """
 
 from __future__ import annotations

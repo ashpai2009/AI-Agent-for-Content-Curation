@@ -98,14 +98,22 @@ _ISSUE_FLOW: dict[IssueState, frozenset[IssueState]] = {
         {IssueState.PATCH_PROPOSED, IssueState.PATCH_REJECTED, IssueState.REFUTED}
     ),
     IssueState.PATCH_PROPOSED: frozenset(
+        {IssueState.AWAITING_REVIEW, IssueState.PATCH_REJECTED}
+    ),
+    IssueState.AWAITING_REVIEW: frozenset(
+        {IssueState.PATCH_APPROVED, IssueState.REVISION_REQUESTED}
+    ),
+    IssueState.PATCH_APPROVED: frozenset(
         {IssueState.APPLYING, IssueState.PATCH_REJECTED}
     ),
     IssueState.APPLYING: frozenset(
         {IssueState.PATCH_APPLIED, IssueState.PATCH_REJECTED}
     ),
-    IssueState.PATCH_APPLIED: frozenset({IssueState.AWAITING_REVIEW}),
-    IssueState.AWAITING_REVIEW: frozenset(
-        {IssueState.ACCEPTED, IssueState.REVISION_REQUESTED}
+    # `PATCH_APPLIED -> AWAITING_REVIEW` remains for jobs created before simulated review
+    # was introduced. New jobs reach PATCH_APPLIED only after approval and go directly to
+    # ACCEPTED; old in-flight jobs can still finish or roll back safely.
+    IssueState.PATCH_APPLIED: frozenset(
+        {IssueState.ACCEPTED, IssueState.AWAITING_REVIEW}
     ),
     IssueState.REVISION_REQUESTED: frozenset({IssueState.AWAITING_PATCH}),
     IssueState.PATCH_REJECTED: frozenset({IssueState.AWAITING_PATCH}),

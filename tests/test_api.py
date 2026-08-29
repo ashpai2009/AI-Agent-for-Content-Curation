@@ -311,6 +311,7 @@ def test_an_instruction_document_seeds_the_job(client, workbook_bytes, tmp_path)
     assert response.status_code == 202
     assert response.json()["seed_claims"] > 0
     assert response.json()["instruction_filename"] == "notes.md"
+    assert response.json()["instruction_document_truncated"] is False
 
 
 def test_the_instructions_are_durable_before_the_job_is_queued(
@@ -728,6 +729,15 @@ def test_the_report_accounts_for_the_files_it_produced(client, workbook_bytes):
     assert "corrected_workbook" in kinds
     assert len(kinds["corrected_workbook"]["sha256"]) == 64
     assert not any("/" in str(value) for value in kinds["corrected_workbook"].values())
+
+    # The source workbook too. Its hash was computed when the working copy was made and
+    # then not passed to `record_artifact`, so the one artefact the whole
+    # "check what you downloaded against what you uploaded" claim rests on was rendered
+    # as "not hashed" in every report.
+    import hashlib
+
+    assert "source_workbook" in kinds
+    assert kinds["source_workbook"]["sha256"] == hashlib.sha256(workbook_bytes).hexdigest()
 
 
 def test_the_status_and_report_agree_about_what_the_job_cost(client, workbook_bytes):

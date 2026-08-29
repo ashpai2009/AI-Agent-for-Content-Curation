@@ -56,6 +56,15 @@ _IDENTIFIER_PATTERN = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 _LATEX_MARKERS = ("$$", "\\frac", "\\sqrt", "\\theta", "\\pi", "\\left", "\\right")
 
+#: Positive evidence for the ASCII math convention. Plain numerals and simple equations
+#: such as ``2`` or ``x=3`` are deliberately absent: the curation rules allow those
+#: validator-safe values in a LaTeX workbook too, so treating them as ASCII evidence
+#: makes a valid LaTeX workbook look mixed as soon as it contains enough numeric steps.
+_ASCII_NOTATION = re.compile(
+    r"\*\*|sqrt\(|(?:^|[^\\A-Za-z])(?:theta|alpha|beta|pi)(?:\b|$)|"
+    r"(?:arc(?:sin|cos|tan)|sec|csc|cot)\(|<=|>="
+)
+
 #: The columns that are pure mathematics, and therefore the only reliable evidence of
 #: which notation a workbook is written in. Titles and body text are prose in *both*
 #: conventions: including them drags the one genuinely LaTeX workbook in the corpus down
@@ -63,7 +72,8 @@ _LATEX_MARKERS = ("$$", "\\frac", "\\sqrt", "\\theta", "\\pi", "\\left", "\\righ
 #: cleanly at 0.83 against 0.00 everywhere else.
 _NOTATION_COLUMNS = (ColumnKey.ANSWER, ColumnKey.MC_CHOICES)
 
-#: Share of those cells that must be LaTeX before the whole workbook counts as LaTeX.
+#: Share of cells carrying *positive notation evidence* that must be LaTeX before the
+#: whole workbook counts as LaTeX. Convention-neutral plain values are not denominator.
 _LATEX_MAJORITY = 0.6
 
 
@@ -526,6 +536,7 @@ def detect_conventions(blocks: Iterable[ProblemBlock]) -> WorkbookConventions:
     stems: dict[str, int] = {}
     namespaces: dict[str, int] = {}
     latex_cells = 0
+    ascii_cells = 0
     text_cells = 0
     reset_evidence = 0
     continuous_evidence = 0
@@ -549,6 +560,8 @@ def detect_conventions(blocks: Iterable[ProblemBlock]) -> WorkbookConventions:
                 text_cells += 1
                 if any(marker in text for marker in _LATEX_MARKERS):
                     latex_cells += 1
+                elif _ASCII_NOTATION.search(text):
+                    ascii_cells += 1
 
             identifier = row.get(ColumnKey.HINT_ID).strip()
             id_match = _IDENTIFIER_PATTERN.match(identifier)
@@ -579,13 +592,14 @@ def detect_conventions(blocks: Iterable[ProblemBlock]) -> WorkbookConventions:
     else:
         convention = DependencyConvention.UNDECIDED
 
-    # A workbook is LaTeX when it is overwhelmingly LaTeX, ASCII when it contains none at
-    # all, and MIXED otherwise. MIXED is a *defect state*, not a third valid convention:
-    # both real conventions are internally consistent, so a workbook sitting between them
-    # has cells written in the wrong one, which is what the notation rules then report.
+    # A workbook is LaTeX when its *positive notation evidence* is overwhelmingly LaTeX,
+    # ASCII when it contains no LaTeX at all, and MIXED otherwise. Plain numerals and bare
+    # equations are neutral because both conventions explicitly allow them in graded
+    # cells. Counting every non-empty Answer in the denominator classified a LaTeX book
+    # with many numeric steps as mixed and then raised one warning per correct LaTeX cell.
     if latex_cells == 0:
         notation = Notation.ASCII if text_cells else Notation.UNKNOWN
-    elif latex_cells >= _LATEX_MAJORITY * text_cells:
+    elif latex_cells >= _LATEX_MAJORITY * (latex_cells + ascii_cells):
         notation = Notation.LATEX
     else:
         notation = Notation.MIXED

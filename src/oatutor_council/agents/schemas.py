@@ -45,18 +45,27 @@ ColumnName = Literal[
 # --------------------------------------------------------------------------------------
 
 
+class FindingCell(BaseModel):
+    """One exact spreadsheet cell the repair must change.
+
+    Rows and columns used to be separate lists, which made a two-row, two-column finding
+    authorize their four-cell Cartesian product. Pairing them in the response contract
+    keeps the model's intended scope exact all the way to the patch gate.
+    """
+
+    row: int = Field(gt=0, description="The real 1-based spreadsheet row")
+    column: ColumnName
+
+
 class AuditorFinding(BaseModel):
-    rows: list[int] = Field(description="Spreadsheet rows the defect concerns")
-    #: The repair is authorised against these cells, so naming the column where the defect
-    #: was *noticed* rather than the column that must *change* produces a correction the
-    #: gate refuses and a defect that survives the job. An `answerType` of `numeric` over
-    #: an algebraic answer is a defect in `answerType`, not in `Answer`.
-    columns: list[ColumnName] = Field(
-        default_factory=list,
+    #: The repair is authorised against these exact pairs, so naming the cell where the
+    #: defect was *noticed* rather than the cell that must *change* produces a correction
+    #: the gate refuses and a defect that survives the job.
+    cells: list[FindingCell] = Field(
+        min_length=1,
         description=(
-            "Every column that must change to complete this one repair. Not where the "
-            "problem was noticed. If Answer and answerType must both change, list both; "
-            "if only a correct answer's label is wrong, list answerType only"
+            "Every exact row-and-column cell that must change to complete this one "
+            "repair. Name repair targets, not cells where a symptom was noticed"
         ),
     )
     problem: str = Field(description="What is wrong, in one sentence")
@@ -90,11 +99,10 @@ class RefutedClaim(BaseModel):
 
 
 class AuditorResponse(BaseModel):
-    """The single-block audit response. **Unchanged, and deliberately so.**
+    """The single-block audit response.
 
-    `SCAN_BATCH_SIZE=1` uses this schema and the single-block prompt, byte for byte, which
-    is what makes the default a genuine no-op rather than a lookalike that happens to
-    produce similar results through a different wire contract.
+    `SCAN_BATCH_SIZE=1` uses this schema and the single-block payload directly rather than
+    wrapping one item in the batch schema. That keeps batching disabled at its default.
     """
 
     #: Private. Split off before anything else sees this response.
@@ -190,12 +198,11 @@ class ReviewerResponse(BaseModel):
 
 
 class IndependentFinding(BaseModel):
-    rows: list[int]
-    columns: list[ColumnName] = Field(
-        default_factory=list,
+    cells: list[FindingCell] = Field(
+        min_length=1,
         description=(
-            "Every column that must change to complete this one repair; list all "
-            "coordinated targets, not just where the defect was first noticed"
+            "Every exact row-and-column cell that must change to complete this one "
+            "repair; list all coordinated targets, not just where the symptom appears"
         ),
     )
     problem: str
@@ -205,9 +212,9 @@ class IndependentFinding(BaseModel):
 
 
 class IndependentReviewResponse(BaseModel):
-    """The sweep over blocks nobody flagged. Public: these become issues.
+    """The fresh sweep over every current block. Public: these become issues.
 
-    Unchanged for the same reason as `AuditorResponse`: batch size 1 is the old path.
+    Like `AuditorResponse`, this is used directly when batch size is one.
     """
 
     findings: list[IndependentFinding] = Field(default_factory=list)

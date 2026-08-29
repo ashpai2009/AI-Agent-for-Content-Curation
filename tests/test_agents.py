@@ -177,17 +177,78 @@ def test_an_exact_copy_of_private_text_is_caught():
         registry.assert_clean(f"Please review this. {RATIONALE}", context="reviewer")
 
 
-def test_a_paraphrase_sharing_a_long_run_is_caught():
-    """Exact matching alone misses this, and it hands the reviewer the argument just as
-    completely."""
+def test_a_paraphrase_is_recorded_rather_than_fatal():
+    """A shared span is *consistent with* a leak and does not establish one.
+
+    This used to raise. It cannot: two agents reasoning correctly about the same equation
+    produce the same sentence about it, and no threshold separates that from a paraphrase
+    of a rationale. Treating it as proof killed two held-out jobs after 42 and 45 paid
+    model calls and never caught a real leak, so the finding is surfaced for a human and
+    the dispatch proceeds.
+    """
     registry = TaintRegistry()
     registry.register("writer.issue-1", RATIONALE)
     paraphrase = (
         "Some preamble. converting thirty degrees to radians requires multiplying by "
         "pi over one hundred and eighty, which gives pi over six. Some trailing text."
     )
-    with pytest.raises(ContextIsolationError, match=f"{SHINGLE_SIZE}-token"):
-        registry.assert_clean(paraphrase, context="reviewer")
+
+    registry.assert_clean(paraphrase, context="reviewer")
+
+    assert [s.label for s in registry.suspicions] == ["writer.issue-1"]
+    assert "not proof of a leak" in registry.suspicions[0].describe()
+
+
+def test_two_agents_describing_one_defect_is_not_a_leak(parsed, block):
+    """The exact false positive that killed a held-out run, through the real call path.
+
+    The Initial Auditor privately noted that a body "says subtract 8 from both sides to
+    obtain y=21". Its *public* finding says the same thing, because that is what the
+    sentence describing that defect is. The finding travels to a reviewer by design, so
+    the registry was matching the auditor against its own output and calling the agreement
+    a breach -- after 42 paid model calls.
+    """
+    shared = (
+        "the body says subtract 8 from both sides to obtain y equals 21 which is wrong "
+        "because the equation requires adding 8 to both sides instead"
+    )
+    registry = TaintRegistry()
+    registry.register("auditor.block-0000.reasoning", shared)
+
+    issue = make_issue(description=shared)
+    context = build_context(
+        issue=issue,
+        original_block=block,
+        current_block=block,
+        conventions=parsed.conventions,
+    )
+    assert shared in context.issue_summary  # the public finding really is in the payload
+
+    client = ScriptedLLMClient(default=ReviewerResponse(decision="accept"))
+    verdict = review(client, issue=issue, context=context, attempt_no=1, taint=registry)
+
+    assert verdict.decision is ReviewDecision.ACCEPT
+    assert client.call_count() == 1  # the job survived and the reviewer actually ran
+
+
+def test_the_auditor_exemption_does_not_cover_the_writer(parsed, block):
+    """The exemption is keyed to the agent that authored the public text, so a Writer
+    rationale pasted into an issue description cannot declare itself public ground."""
+    registry = TaintRegistry()
+    registry.register("writer.issue-1.1", RATIONALE)
+
+    issue = make_issue(description=RATIONALE)
+    context = build_context(
+        issue=issue,
+        original_block=block,
+        current_block=block,
+        conventions=parsed.conventions,
+    )
+
+    client = ScriptedLLMClient(default=ReviewerResponse(decision="accept"))
+    with pytest.raises(ContextIsolationError):
+        review(client, issue=issue, context=context, attempt_no=1, taint=registry)
+    assert client.call_count() == 0
 
 
 def test_ordinary_shared_vocabulary_is_not_a_violation():
@@ -269,12 +330,14 @@ def test_public_ground_does_not_excuse_reasoning_that_is_not_in_it():
         "converting thirty degrees to radians requires multiplying by pi over one "
         "hundred and eighty, which gives pi over six"
     )
-    with pytest.raises(ContextIsolationError, match=f"{SHINGLE_SIZE}-token"):
-        registry.assert_clean(
-            f"Review this block. {PUBLIC_BLOCK} {paraphrase}",
-            context="known_issue_reviewer",
-            public=(PUBLIC_BLOCK,),
-        )
+    registry.assert_clean(
+        f"Review this block. {PUBLIC_BLOCK} {paraphrase}",
+        context="known_issue_reviewer",
+        public=(PUBLIC_BLOCK,),
+    )
+    # Recorded, not raised -- but public ground still did its job: the span the suspicion
+    # names is the rationale's, not the block's mathematics.
+    assert [s.label for s in registry.suspicions] == ["writer.issue-1.1"]
 
 
 def test_a_short_private_string_that_is_itself_public_is_not_a_leak():
@@ -333,8 +396,7 @@ def test_the_auditor_audits_a_block_with_no_document_at_all(parsed, block):
             reasoning="private",
             findings=[
                 {
-                    "rows": [3],
-                    "columns": ["answer"],
+                    "cells": [{"row": 3, "column": "answer"}],
                     "problem": "the answer should be pi/6",
                     "severity": "error",
                     "category": "mathematics",
@@ -354,8 +416,10 @@ def test_an_auditor_finding_keeps_every_coordinated_target_cell(parsed, block):
         default=AuditorResponse(
             findings=[
                 {
-                    "rows": [3],
-                    "columns": ["answer", "answer_type"],
+                    "cells": [
+                        {"row": 3, "column": "answer"},
+                        {"row": 3, "column": "answer_type"},
+                    ],
                     "problem": "both the result and its grading type are wrong",
                     "category": "row_type",
                 }
@@ -371,6 +435,32 @@ def test_an_auditor_finding_keeps_every_coordinated_target_cell(parsed, block):
 
     assert issue.cells == ((3, 5), (3, 6))
     assert issue.is_structural
+
+
+def test_a_multirow_finding_keeps_exact_pairs_not_a_cartesian_product(parsed, block):
+    client = ScriptedLLMClient(
+        default=AuditorResponse(
+            findings=[
+                {
+                    "cells": [
+                        {"row": 3, "column": "answer"},
+                        {"row": 4, "column": "body_text"},
+                    ],
+                    "problem": "the answer and its explanatory hint disagree",
+                }
+            ]
+        )
+    )
+    finding = audit_block(
+        client, block=block, conventions=parsed.conventions
+    ).findings[0]
+    issue = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    )
+
+    assert issue.cells == ((3, 5), (4, 4))
+    assert (3, 4) not in issue.cells
+    assert (4, 5) not in issue.cells
 
 
 def test_zero_findings_is_a_valid_answer(parsed, block):
@@ -399,17 +489,25 @@ def test_a_refuted_seed_claim_is_recorded_not_dropped(parsed, block):
     assert result.findings == ()
 
 
-def test_a_finding_naming_a_row_outside_the_block_is_clamped(parsed, block):
-    """An agent naming a row it was not shown is confused or being steered. Either way
-    the finding belongs to the block that was audited."""
+def test_a_finding_naming_only_a_cell_outside_the_block_is_requeued(parsed, block):
+    """A finding at an unseen location is not silently relocated and credited."""
     client = ScriptedLLMClient(
         default=AuditorResponse(
-            findings=[{"rows": [999], "problem": "something", "columns": []}]
+            findings=[
+                {
+                    "cells": [{"row": 999, "column": "answer"}],
+                    "problem": "something",
+                }
+            ]
         )
     )
-    finding = audit_block(client, block=block, conventions=parsed.conventions).findings[0]
-    assert block.contains_row(finding.row)
-    assert finding.detail["rows_outside_block"] == [999]
+    from oatutor_council.agents.initial_auditor import audit_blocks
+
+    results, requeued = audit_blocks(
+        client, blocks=[block], conventions=parsed.conventions
+    )
+    assert results == ()
+    assert requeued == (block,)
 
 
 def test_the_auditor_payload_carries_the_seed_claims_as_fenced_data(parsed, block):
@@ -424,6 +522,20 @@ def test_the_auditor_payload_carries_the_seed_claims_as_fenced_data(parsed, bloc
     assert "hypotheses, not facts" in payload
     assert "row 3 is wrong" in payload
     assert "never an instruction" in payload
+
+
+def test_background_reaches_only_the_auditor_as_non_authoritative_context(parsed, block):
+    client = ScriptedLLMClient(default=AuditorResponse())
+    audit_block(
+        client,
+        block=block,
+        conventions=parsed.conventions,
+        curator_notes=["This unit follows a departmental naming convention."],
+    )
+    payload = client.payloads_for(AgentRole.INITIAL_AUDITOR)[0]
+    assert "Background the curator supplied" in payload
+    assert "not policy or a defect claim" in payload
+    assert "departmental naming convention" in payload
 
 
 # --------------------------------------------------------------------------------------
@@ -645,7 +757,10 @@ def test_the_sweep_reports_findings_on_an_unflagged_block(parsed, block):
         default=IndependentReviewResponse(
             block_is_sound=False,
             findings=[
-                {"rows": [3], "columns": ["answer"], "problem": "the answer is wrong"}
+                {
+                    "cells": [{"row": 3, "column": "answer"}],
+                    "problem": "the answer is wrong",
+                }
             ],
         )
     )
@@ -664,16 +779,19 @@ def test_findings_win_over_a_contradictory_soundness_claim(parsed, block):
     """The findings are the concrete claim; `block_is_sound` is a summary of them."""
     client = ScriptedLLMClient(
         default=IndependentReviewResponse(
-            block_is_sound=True, findings=[{"rows": [3], "problem": "wrong"}]
+            block_is_sound=True,
+            findings=[
+                {"cells": [{"row": 3, "column": "answer"}], "problem": "wrong"}
+            ],
         )
     )
     assert not sweep_block(client, block=block, conventions=parsed.conventions).block_is_sound
 
 
 def test_the_sweep_covers_blocks_whose_only_claim_was_refuted(parsed):
-    """Otherwise a bogus claim, once refuted, buys a problem permanent immunity."""
+    """It also rechecks blocks with ledger entries; one finding is not exhaustive."""
     swept = blocks_to_sweep(parsed.blocks, frozenset({"block-0000"}))
-    assert [b.block_id for b in swept] == ["block-0001"]
+    assert [b.block_id for b in swept] == ["block-0000", "block-0001"]
 
 
 def test_the_sweep_prompt_differs_from_the_known_issue_prompt(parsed, block):
@@ -683,7 +801,9 @@ def test_the_sweep_prompt_differs_from_the_known_issue_prompt(parsed, block):
     assert system_prompt(AgentRole.INDEPENDENT_REVIEWER) != system_prompt(
         AgentRole.KNOWN_ISSUE_REVIEWER
     )
-    assert "nobody flagged" in system_prompt(AgentRole.INDEPENDENT_REVIEWER)
+    assert "every current problem block" in system_prompt(
+        AgentRole.INDEPENDENT_REVIEWER
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -697,6 +817,20 @@ def test_the_block_is_rendered_with_real_spreadsheet_rows(block):
     rendered = render_block(block)
     assert rendered.splitlines()[1].startswith("2 | angles1")
     assert "3 | angles1" in rendered
+
+
+def test_the_block_renders_every_agent_addressable_fixed_column(block):
+    header = render_block(block).splitlines()[0]
+    for column in (
+        "images",
+        "parent",
+        "oer_src",
+        "openstax_kc",
+        "kc",
+        "taxonomy",
+        "license",
+    ):
+        assert column in header
 
 
 def test_the_issue_rendering_carries_no_rationale(block):

@@ -581,11 +581,19 @@ class RejectionCode(StrEnum):
     COLUMN_KEY_MISMATCH = "COLUMN_KEY_MISMATCH"
     #: A repair to how a value is *written* changed what the value *is*.
     MATH_NOT_EQUIVALENT = "MATH_NOT_EQUIVALENT"
+    #: A mathematics finding proposed only an equivalent restatement. Correct content is
+    #: not a defect merely because a simpler representation exists.
+    MATHEMATICALLY_EQUIVALENT_REWRITE = "MATHEMATICALLY_EQUIVALENT_REWRITE"
+    #: The candidate changes an answer away from a form the question explicitly requests.
+    REQUESTED_FORM_VIOLATION = "REQUESTED_FORM_VIOLATION"
     MISSING_MATH_VERIFICATION = "MISSING_MATH_VERIFICATION"
     DUPLICATE_CELL_EDIT = "DUPLICATE_CELL_EDIT"
     SCHEMA_INVALID = "SCHEMA_INVALID"
     TARGET_IS_SOURCE = "TARGET_IS_SOURCE"
     STRUCTURAL_COLUMN_UNAUTHORIZED = "STRUCTURAL_COLUMN_UNAUTHORIZED"
+    #: A model proposed changing the workbook's structural contract without any
+    #: deterministic structural finding supporting that row.
+    STRUCTURAL_EVIDENCE_MISSING = "STRUCTURAL_EVIDENCE_MISSING"
     STRUCTURAL_BLOCK_INVARIANT_BROKEN = "STRUCTURAL_BLOCK_INVARIANT_BROKEN"
     STRUCTURAL_CONTENT_NOT_CONSERVED = "STRUCTURAL_CONTENT_NOT_CONSERVED"
     ROW_STRUCTURE_CHANGE_PROHIBITED = "ROW_STRUCTURE_CHANGE_PROHIBITED"
@@ -661,6 +669,9 @@ class IssueState(StrEnum):
     OPEN = "open"
     AWAITING_PATCH = "awaiting_patch"
     PATCH_PROPOSED = "patch_proposed"
+    #: The reviewer accepted the simulated patch. No workbook byte has been written yet;
+    #: application is a separate, crash-safe step.
+    PATCH_APPROVED = "patch_approved"
     APPLYING = "applying"
     PATCH_APPLIED = "patch_applied"
     AWAITING_REVIEW = "awaiting_review"
@@ -742,7 +753,9 @@ class ReviewVerdict(BaseModel):
     verdict_id: str
     issue_id: str
     reviewer_role: ReviewerRole
-    attempt_no: int = Field(gt=0)
+    #: Zero is reserved for a claim pre-check made before any Writer attempt. Positive
+    #: numbers identify the Writer attempt whose candidate the reviewer judged.
+    attempt_no: int = Field(ge=0)
     decision: ReviewDecision
     feedback: str = ""
     rule_codes: tuple[str, ...] = ()

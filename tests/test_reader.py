@@ -440,6 +440,36 @@ def test_ascii_and_latex_workbooks_are_told_apart(make_workbook):
     assert read_workbook(latex_path).conventions.notation is Notation.LATEX
 
 
+def test_plain_graded_values_are_neutral_inside_a_latex_workbook(make_workbook):
+    """The rules explicitly keep values with no LaTeX command plain.
+
+    Counting those cells as ASCII evidence made a LaTeX workbook flip to MIXED merely
+    because it contained several numeric steps, after which every valid LaTeX expression
+    was reported as a notation defect.
+    """
+    path = make_workbook(
+        [
+            problem("trig1", body=r"Solve $$\sin(\theta)=\frac{1}{2}$$."),
+            step("trig1", answer=r"$$\frac{\pi}{6}$$", answer_type="algebra"),
+            step("trig1", answer="2", answer_type="numeric"),
+            step("trig1", answer="x=3", answer_type="algebra"),
+            step("trig1", answer="4", answer_type="numeric"),
+        ]
+    )
+    assert read_workbook(path).conventions.notation is Notation.LATEX
+
+
+def test_explicit_ascii_notation_still_counts_against_latex(make_workbook):
+    path = make_workbook(
+        [
+            problem("trig1"),
+            step("trig1", answer=r"$$\frac{1}{2}$$", answer_type="algebra"),
+            step("trig1", answer="cos(theta)**2", answer_type="algebra"),
+        ]
+    )
+    assert read_workbook(path).conventions.notation is Notation.MIXED
+
+
 # --------------------------------------------------------------------------------------
 # Row access
 # --------------------------------------------------------------------------------------

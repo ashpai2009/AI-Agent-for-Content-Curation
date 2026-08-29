@@ -36,6 +36,7 @@ from oatutor_council.reporting.ledger import (
     dedupe,
     fingerprint,
     issue_from_finding,
+    unresolved,
 )
 from oatutor_council.reporting.reports import (
     build_reports,
@@ -138,6 +139,19 @@ def test_observations_and_unrepairable_findings_do_not_become_issues():
         make_finding(code="LATEX_BANNED_COMMAND", repairable=False),
     )
     assert [f.code for f in actionable(findings)] == ["STEP_MISSING_ANSWER"]
+
+
+def test_a_repairable_warning_is_work_while_a_house_style_warning_is_not():
+    findings = (
+        make_finding(code="WHITESPACE_PADDING", severity=Severity.WARNING),
+        make_finding(
+            code="SCAFFOLD_NAMESPACE_DEVIATION",
+            severity=Severity.WARNING,
+            repairable=False,
+        ),
+    )
+    assert [f.code for f in actionable(findings)] == ["WHITESPACE_PADDING"]
+    assert [f.code for f in unresolved(findings)] == ["WHITESPACE_PADDING"]
 
 
 # --------------------------------------------------------------------------------------
@@ -345,6 +359,29 @@ def test_markdown_renders_the_outcome_and_the_changes(reports):
     assert "## Needs a person" in text
     assert "`2026-01-02 00:00:00`" in text
     assert "## Changes applied" in text
+    assert "## Remaining work" in text
+
+
+def test_markdown_separates_nonrepairable_warnings_from_work():
+    reports = build_reports(
+        job_id="job-1",
+        state=JobState.SUCCEEDED,
+        ledger=IssueLedger(job_id="job-1", issues=()),
+        changes=(),
+        verdicts=(),
+        attempts=(),
+        findings=(
+            make_finding(
+                code="MC_ANSWER_IS_FIRST_CHOICE",
+                severity=Severity.OBSERVATION,
+                repairable=False,
+            ),
+        ),
+    )
+
+    text = render_markdown(reports)
+    assert "## Observations" in text
+    assert "## Remaining work" not in text
 
 
 # --------------------------------------------------------------------------------------
@@ -425,6 +462,27 @@ def test_the_markdown_report_lists_every_claim_including_the_unread_ones():
     assert "Problem 3 is wrong" in text
     assert "Problem 9 is wrong" in text
     assert "not reached" in text
+
+
+def test_a_truncated_instruction_document_is_said_in_data_and_markdown():
+    supplied = {
+        **claim(0, "Problem 3 is wrong"),
+        "truncated": 1,
+        "purpose": "errata",
+    }
+    reports = build_reports(
+        job_id="job-1",
+        state=JobState.SUCCEEDED,
+        ledger=IssueLedger(job_id="job-1", issues=()),
+        changes=(),
+        verdicts=(),
+        attempts=(),
+        findings=(),
+        claims=[supplied],
+    )
+
+    assert reports.validation_report["instruction_document_truncated"] is True
+    assert "tail was not sent" in render_markdown(reports)
 
 
 def test_only_the_latest_round_of_findings_is_reported(tmp_path):
