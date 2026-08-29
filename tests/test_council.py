@@ -1461,6 +1461,48 @@ def test_a_pinned_prompt_hash_is_enforced_not_merely_recorded(setup):
     )
 
 
+def test_an_isolation_suspicion_outlives_the_worker(setup):
+    """The gap this closes: `TaintRegistry.suspicions` is an in-memory list, so
+    "recorded for a human to read" lasted exactly as long as the process and nothing
+    outside the tests ever read it. A suspicion is a diagnostic about a job, and a
+    diagnostic that dies with the worker is not one.
+
+    Also pins what the event may contain: the private record's *label*, the role, and the
+    length of the overlap -- never the shared words. Writing the suspected text into
+    `job_events` would copy it somewhere more durable and more widely rendered than where
+    it was found.
+    """
+    from oatutor_council.persistence import list_events, rediscovery_counts
+
+    db, _ = setup
+    first = council(setup, quiet_client())
+    shared = (
+        "the scaffold divides by zero when x equals two which makes the whole derivation "
+        "unusable for that value and the answer column cannot be right either"
+    )
+    first.taint.register("auditor.block-0000.reasoning", shared)
+    # A long shared run, not a copy: the suspicion path, which is the non-fatal one.
+    first.taint.assert_clean(
+        "a reviewer that reached the same view: the scaffold divides by zero when x "
+        "equals two which makes the whole derivation unusable, so it must be rewritten",
+        context="known_issue_reviewer",
+    )
+    first._flush_suspicions()
+
+    events = [e for e in list_events(db, "job-1") if e["kind"] == "isolation_suspicion"]
+    assert len(events) == 1
+    detail = events[0]["detail"]
+    assert "auditor.block-0000.reasoning" in detail
+    assert "known_issue_reviewer" in detail
+    # Not one word of the overlap itself.
+    assert "divides by zero" not in detail and "scaffold" not in detail
+
+    # A second worker -- fresh registry, rebuilt from the database -- still sees it.
+    second = council(setup, quiet_client())
+    assert second.taint.suspicions == []
+    assert rediscovery_counts(db, "job-1")["isolation_suspicion"] == 1
+
+
 def test_the_audit_trail_never_contains_a_credential(setup):
     """There is no API key in this application at all now -- the CLI authenticates against
     the user's subscription through its own keychain. The assertion stays because the

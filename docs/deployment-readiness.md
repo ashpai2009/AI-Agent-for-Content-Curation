@@ -53,9 +53,12 @@ The exact model disclosure is in `docs/llm-data-contract.md`.
 
 - **Held-out semantic accuracy.** Historical corrected files contain missed keyed cells
   and unexpected edits. Architecture fixes address several causes, but old files cannot
-  prove the new pipeline's accuracy. Four fresh, unused workbooks now provide 60 problems,
-  38 defect groups, 52 automated checks and 22 clean controls; they have not been sent to a
-  live model, so they are evaluation material rather than an accuracy result.
+  prove the new pipeline's accuracy. The `20260819` suite of four workbooks (60 problems,
+  38 defect groups, 52 automated checks, 22 clean controls) **is no longer unused**: three
+  of the four have been run live and their failures drove architecture changes, so they are
+  regression material now. Only `heldout-04` has never been sent to a live model. See the
+  evaluation section below — there is no held-out accuracy result, and there will not be one
+  until a set is built after the architecture stops moving.
 - **Organization provider choice.** Console API, Bedrock, Vertex AI, or an approved gateway
   is a Berkeley decision involving billing, identity, retention, and procurement.
 - **Multi-user boundaries.** The current SQLite/data-directory design, shared bearer token,

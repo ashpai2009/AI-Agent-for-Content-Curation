@@ -18,7 +18,15 @@ Three mechanisms, in increasing order of paranoia:
 
 3. **`TaintRegistry.assert_clean` runs before every dispatch.** Types catch the leak
    someone declared; this catches the one someone pasted -- an **exact copy** of
-   registered private text, which nothing but a copy produces.
+   registered private text.
+
+   Exact equality is strong evidence of transmission, **not proof of it**. Two agents can
+   independently produce the same short sentence ("the answer should be 6 rather than 5"),
+   and that would fail a job it should not. The trade is deliberate: at five tokens or more
+   an exact match is rare enough to act on, where the 12-token *overlap* it replaced fired
+   on ordinary agreement. When it does misfire, the fix is to give the text a public origin
+   via `public_for`, never a longer threshold -- a threshold moves the coincidence instead
+   of removing it.
 
 **Mechanisms 1 and 2 are the guarantee. 3 is a backstop, and its fuzzy half is only a
 signal.** That ordering was inverted for most of this module's life, and the cost was
@@ -67,6 +75,14 @@ _TOKEN = re.compile(r"[A-Za-z0-9]+")
 #: exists to stop -- a reviewer receiving the Writer's reasoning -- cannot fit in four
 #: tokens.
 MIN_PRIVATE_TOKENS = 5
+
+#: Ceiling on suspicions held in memory for one job. A suspicion is a diagnostic, and a
+#: diagnostic that can grow without bound is a memory leak wearing a lab coat: one auditor
+#: note colliding with thirty blocks would otherwise accumulate thirty entries per sweep,
+#: for the whole life of a long job. Duplicates are dropped at append time and the list
+#: stops growing here; the count of what was dropped is kept so the record still says that
+#: more happened than is listed.
+MAX_SUSPICIONS = 200
 
 
 class ContextIsolationError(Exception):
@@ -264,15 +280,40 @@ class TaintRegistry:
     """
 
     entries: dict[str, str] = None  # label -> text
-    #: Non-fatal shared spans, accumulated across the job for a human to review. Not a
-    #: failure channel: nothing reads this to decide whether the job may continue.
+    #: Non-fatal shared spans, accumulated for a human to review. Not a failure channel:
+    #: nothing reads this to decide whether the job may continue. Deduplicated by
+    #: (label, context) and bounded by `MAX_SUSPICIONS`.
     suspicions: list = None
+    #: How many were dropped as duplicates or past the cap. Kept so a drained record can
+    #: say "and more", rather than implying the listed ones are all that happened.
+    suspicions_suppressed: int = 0
 
     def __post_init__(self) -> None:
         if self.entries is None:
             self.entries = {}
         if self.suspicions is None:
             self.suspicions = []
+
+    def _note_suspicion(self, suspicion: Suspicion) -> None:
+        """Record one, unless it is a repeat or the job has already produced plenty."""
+        key = (suspicion.label, suspicion.context)
+        if any((s.label, s.context) == key for s in self.suspicions):
+            self.suspicions_suppressed += 1
+            return
+        if len(self.suspicions) >= MAX_SUSPICIONS:
+            self.suspicions_suppressed += 1
+            return
+        self.suspicions.append(suspicion)
+
+    def drain_suspicions(self) -> tuple[list, int]:
+        """Hand over what has accumulated and reset, for a caller that will persist it.
+
+        Draining rather than reading, so the same suspicion is not written to the audit
+        trail once per step for the rest of the job.
+        """
+        drained, suppressed = list(self.suspicions), self.suspicions_suppressed
+        self.suspicions, self.suspicions_suppressed = [], 0
+        return drained, suppressed
 
     def register(self, label: str, text: str | PrivateText) -> None:
         value = text.reveal() if isinstance(text, PrivateText) else text
@@ -309,6 +350,8 @@ class TaintRegistry:
         *,
         context: str,
         public: Iterable[str] = (),
+        #: Exact private-record labels mapped to text that is public *for that record
+        #: alone* -- the agent's own published finding about its own block. Never a prefix.
         public_for: dict[str, Iterable[str]] | None = None,
     ) -> None:
         """Refuse to dispatch a payload carrying registered private text.
@@ -356,13 +399,19 @@ class TaintRegistry:
             if len(private_tokens) < MIN_PRIVATE_TOKENS:
                 continue
 
-            # Ground that is public *for this entry's author only*. An agent's own public
-            # output is not a leak of that agent's private notes -- they describe one
-            # finding in one sentence -- but it is emphatically not ground for anybody
-            # else's reasoning, so the exemption is keyed by label rather than global.
+            # Ground that is public *for one exact private record*. An agent's own public
+            # output is not a leak of that agent's own private note about the same block --
+            # they describe one finding in one sentence -- but it is not ground for any
+            # other note, so the key is the originating record, never a prefix.
+            #
+            # Prefix matching was the first version and it was too broad by a long way:
+            # `"auditor."` exempted every block's auditor reasoning for every issue,
+            # including issues raised by a different agent about a different block. The
+            # keys here are exact labels; `label.startswith(key + ".")` only admits the
+            # per-field suffix `register_model` appends (`.reasoning`, `.derivation`).
             own_haystack, own_shingles = public_haystack, public_shingles
-            for prefix, texts in (public_for or {}).items():
-                if label.startswith(prefix):
+            for key, texts in (public_for or {}).items():
+                if label == key or label.startswith(f"{key}."):
                     own_tokens = public_tokens + _tokens("\n".join(texts))
                     own_haystack = f" {' '.join(own_tokens)} "
                     own_shingles = _shingles(own_tokens)
@@ -393,7 +442,7 @@ class TaintRegistry:
                 # conclusion about the same equation, and this check cannot tell them
                 # apart. Killing the job on it destroyed two held-out runs after 42 and
                 # 45 paid model calls, and never once caught a real leak.
-                self.suspicions.append(
+                self._note_suspicion(
                     Suspicion(
                         label=label,
                         context=context,

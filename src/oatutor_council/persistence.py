@@ -1585,7 +1585,11 @@ def rediscovery_counts(db: Database, job_id: str) -> dict[str, int]:
     """How many closed issues had their defect found again, and how many were given up on."""
     return {
         kind: count_events(db, job_id, kind)
-        for kind in ("issue_reopened", "finding_absorbed")
+        # `isolation_suspicion` rides along here because it is the same kind of fact: an
+        # event the final states cannot express. A job can succeed with suspicions
+        # outstanding -- they are not failures -- so unless the report counts them, the
+        # only signal that anything was flagged is a row nobody queries.
+        for kind in ("issue_reopened", "finding_absorbed", "isolation_suspicion")
     }
 
 

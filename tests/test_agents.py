@@ -25,7 +25,11 @@ from oatutor_council.agents.isolation import (
     WriterPrivate,
     assert_no_private_fields,
 )
-from oatutor_council.agents.known_issue_reviewer import build_context, review
+from oatutor_council.agents.known_issue_reviewer import (
+    build_context,
+    origin_private_label,
+    review,
+)
 from oatutor_council.agents.rendering import (
     ReviewerContext,
     render_block,
@@ -177,6 +181,40 @@ def test_an_exact_copy_of_private_text_is_caught():
         registry.assert_clean(f"Please review this. {RATIONALE}", context="reviewer")
 
 
+def test_a_short_identical_sentence_is_a_known_residual_false_positive():
+    """Exact equality is strong evidence of transmission. It is not proof, and this test
+    exists so nobody rediscovers that in production and is surprised.
+
+    Two agents looking at the same wrong cell can independently write the same short
+    sentence -- "the answer should be 6 rather than 5" is the obvious shape. That still
+    fails the job today, and the trade is deliberate: exact equality over five or more
+    tokens is rare enough to be worth acting on, while the 12-token overlap it replaced
+    fired on ordinary agreement and killed two real runs.
+
+    If this ever fires in practice, the fix is provenance -- give the text a public
+    origin, as `public_for` does for the auditor's own finding -- and not a longer
+    threshold, which would only move the coincidence rather than remove it.
+    """
+    convergent = "the answer should be 6 rather than 5"
+    registry = TaintRegistry()
+    registry.register("auditor.block-0000.reasoning", convergent)
+
+    with pytest.raises(ContextIsolationError):
+        registry.assert_clean(
+            f"an independent reviewer concluded: {convergent}", context="reviewer"
+        )
+
+    # And the escape hatch works: declared public origin, no violation.
+    forgiving = TaintRegistry()
+    forgiving.register("auditor.block-0000.reasoning", convergent)
+    forgiving.assert_clean(
+        f"an independent reviewer concluded: {convergent}",
+        context="reviewer",
+        public_for={"auditor.block-0000": (convergent,)},
+    )
+    assert forgiving.suspicions == []
+
+
 def test_a_paraphrase_is_recorded_rather_than_fatal():
     """A shared span is *consistent with* a leak and does not establish one.
 
@@ -229,6 +267,122 @@ def test_two_agents_describing_one_defect_is_not_a_leak(parsed, block):
 
     assert verdict.decision is ReviewDecision.ACCEPT
     assert client.call_count() == 1  # the job survived and the reviewer actually ran
+
+
+def test_the_exemption_does_not_reach_another_block(parsed, block):
+    """The exemption is one private record, not every record an agent ever wrote.
+
+    Keyed on the prefix `"auditor."` this passed, because the auditor's note about block 7
+    was exempted by a finding published about block 9 -- two texts with no relationship at
+    all. The link is the *originating record*, so a note about a different block gets no
+    exemption and the overlap is reported.
+    """
+    other_block_note = (
+        "block nine says subtract 8 from both sides to obtain y equals 21 which is wrong "
+        "because the equation requires adding 8 to both sides instead of subtracting"
+    )
+    registry = TaintRegistry()
+    registry.register("auditor.block-0009.reasoning", other_block_note)
+
+    # The issue under review belongs to block-0000 and shares a long run of that wording
+    # without being a copy of it -- the shingle path, which is what the exemption governs.
+    issue = make_issue(
+        description=(
+            "block nine says subtract 8 from both sides to obtain y equals 21 which is "
+            "wrong for a completely different reason nobody has written down yet"
+        )
+    )
+    context = build_context(
+        issue=issue,
+        original_block=block,
+        current_block=block,
+        conventions=parsed.conventions,
+    )
+
+    client = ScriptedLLMClient(default=ReviewerResponse(decision="accept"))
+    review(client, issue=issue, context=context, attempt_no=1, taint=registry)
+
+    # Not fatal -- overlap never is now -- but it is reported rather than silently exempt.
+    assert [s.label for s in registry.suspicions] == ["auditor.block-0009.reasoning"]
+
+
+def test_an_independent_reviewer_issue_exempts_nothing(parsed, block):
+    """Cross-role. The Independent Reviewer publishes findings and keeps no private
+    record, so an issue it raised cannot make some *auditor* note public ground."""
+    note = (
+        "the auditor privately observed that the third scaffold divides by zero when x "
+        "equals two which makes the whole derivation unusable for that value of x"
+    )
+    registry = TaintRegistry()
+    registry.register("auditor.block-0000.reasoning", note)
+
+    issue = make_issue(
+        source=IssueSource.INDEPENDENT_REVIEWER,
+        description=(
+            "the auditor privately observed that the third scaffold divides by zero when "
+            "x equals two and the reviewer reached that conclusion on its own"
+        ),
+    )
+    context = build_context(
+        issue=issue,
+        original_block=block,
+        current_block=block,
+        conventions=parsed.conventions,
+    )
+
+    client = ScriptedLLMClient(default=ReviewerResponse(decision="accept"))
+    review(client, issue=issue, context=context, attempt_no=1, taint=registry)
+
+    assert origin_private_label(issue) is None
+    assert [s.label for s in registry.suspicions] == ["auditor.block-0000.reasoning"]
+
+
+def test_a_cross_block_exact_copy_is_fatal_again(parsed, block):
+    """What the exact-provenance change bought. Under prefix matching, `"auditor."` made
+    *every* auditor note public ground, so a verbatim copy of block nine's reasoning could
+    ride into a review of block zero unchallenged. It is conclusive evidence again."""
+    note = (
+        "block nine says subtract 8 from both sides to obtain y equals 21 which is wrong "
+        "because the equation requires adding 8 to both sides instead of subtracting"
+    )
+    registry = TaintRegistry()
+    registry.register("auditor.block-0009.reasoning", note)
+
+    issue = make_issue(description=note)  # block-0000
+    context = build_context(
+        issue=issue,
+        original_block=block,
+        current_block=block,
+        conventions=parsed.conventions,
+    )
+
+    client = ScriptedLLMClient(default=ReviewerResponse(decision="accept"))
+    with pytest.raises(ContextIsolationError):
+        review(client, issue=issue, context=context, attempt_no=1, taint=registry)
+    assert client.call_count() == 0
+
+
+def test_suspicions_are_deduplicated_and_bounded():
+    """A diagnostic that grows without bound is a memory leak. One note colliding with
+    every block in a sweep must produce one entry, not one per block."""
+    from oatutor_council.agents.isolation import MAX_SUSPICIONS
+
+    registry = TaintRegistry()
+    registry.register("writer.issue-1", RATIONALE)
+    paraphrase = (
+        "converting thirty degrees to radians requires multiplying by pi over one "
+        "hundred and eighty, which gives pi over six"
+    )
+    for _ in range(50):
+        registry.assert_clean(paraphrase, context="reviewer")
+
+    assert len(registry.suspicions) == 1
+    assert registry.suspicions_suppressed == 49
+    assert len(registry.suspicions) <= MAX_SUSPICIONS
+
+    drained, suppressed = registry.drain_suspicions()
+    assert len(drained) == 1 and suppressed == 49
+    assert registry.suspicions == [] and registry.suspicions_suppressed == 0
 
 
 def test_the_auditor_exemption_does_not_cover_the_writer(parsed, block):

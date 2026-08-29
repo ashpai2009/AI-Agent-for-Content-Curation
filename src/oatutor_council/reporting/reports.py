@@ -317,6 +317,10 @@ def _validation_report(
         # the only place the difference shows, and it is the part a curator most needs.
         "issues_reopened": (rediscoveries or {}).get("issue_reopened", 0),
         "findings_absorbed": (rediscoveries or {}).get("finding_absorbed", 0),
+        # Non-fatal overlaps between private reasoning and an outgoing payload. Zero is
+        # the normal reading; a non-zero count is a prompt to read the events, never a
+        # statement that anything leaked.
+        "isolation_suspicions": (rediscoveries or {}).get("isolation_suspicion", 0),
         "instruction_claims": resolved_claims,
         # One flag on every stored segment records a document-wide event. Surface it in
         # the report so a bounded extraction is never mistaken for complete instructions.

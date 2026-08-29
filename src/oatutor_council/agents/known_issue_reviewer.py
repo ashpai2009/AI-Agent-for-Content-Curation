@@ -21,6 +21,7 @@ from ..llm.context import ContextBundle
 from ..llm.prompts import system_prompt
 from ..models import (
     Issue,
+    IssueSource,
     ProblemBlock,
     ReviewDecision,
     ReviewerRole,
@@ -55,6 +56,30 @@ edit can be right on its own line and still break a row that depends on it.
 Return `accept`, `revise`, or `human_review`. For `revise`, name the cell and the content
 that would resolve it — your feedback is the only thing the Writer receives.
 """
+
+def origin_private_label(issue: Issue) -> str | None:
+    """The one private record whose author also wrote this issue's public finding.
+
+    An issue's summary is a *published* finding. The agent that published it also kept a
+    private note about the same block, in the same call, about the same defect -- so those
+    two texts share sentences by construction, and matching one against the other is an
+    agent being compared with itself rather than a leak being detected.
+
+    The link has to be exact. Keying on the prefix `"auditor."` exempted every block's
+    auditor reasoning for every issue, including issues a different agent raised about a
+    different block, which is a far wider hole than the one it was closing.
+
+    `None` means no exemption at all, which is the right answer for every other source:
+    the Independent Reviewer registers no private text (its findings are published
+    directly), and instruction-document and final-validation findings are curator text and
+    rule-engine output, neither of which is agent reasoning.
+    """
+    if issue.source is IssueSource.INITIAL_AUDITOR and issue.block_id:
+        # Mirrors `initial_auditor`, which registers `auditor.{block_id}` and lets
+        # `register_model` append the field name.
+        return f"auditor.{issue.block_id}"
+    return None
+
 
 _DECISIONS = {
     "accept": ReviewDecision.ACCEPT,
@@ -129,13 +154,14 @@ def review(
                 context.candidate_edits,
                 context.curator_rules,
             ),
-            # The issue summary is the auditor's own *public* finding -- the channel by
-            # which a defect is meant to reach a reviewer. So it is public ground for the
-            # auditor's private notes, which describe the same defect in the same sentence,
-            # and **not** for the Writer's rationale, which has no business being there.
-            # Blanket-exempting it would let a rationale smuggled into a description
-            # declare itself exempt, which is the leak this check exists for.
-            public_for={"auditor.": (context.issue_summary,)},
+            # The issue summary is public ground for exactly one private record: the note
+            # kept by the agent that published this finding, about this block. Not for the
+            # Writer's rationale, and not for another block's auditor note.
+            public_for=(
+                {origin: (context.issue_summary,)}
+                if (origin := origin_private_label(issue))
+                else None
+            ),
         )
 
     agent_role = (

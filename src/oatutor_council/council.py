@@ -836,6 +836,46 @@ class CurationCouncil:
             record_event(self.db, self.job_id, "corruption", str(error))
             self._advance(JobState.FAILED, failure_for(error))
             return StepOutcome(False, str(error), self.job.state)
+        finally:
+            # Drained whatever happened, including on the paths that fail the job: a
+            # suspicion raised by the call that preceded a failure is exactly the one
+            # somebody investigating will want, and it is the one an early return would
+            # discard.
+            self._flush_suspicions()
+
+    def _flush_suspicions(self) -> None:
+        """Write non-fatal isolation overlaps to `job_events`.
+
+        Without this the guarantee was a claim and not a fact: `TaintRegistry.suspicions`
+        is an in-memory list, so "recorded for a human to read" lasted exactly as long as
+        the worker process and nothing outside the tests ever read it.
+
+        **The event carries the label, the role and the length of the overlap, and not one
+        word of the text.** What is being described is a span shared between private
+        reasoning and an outgoing payload; writing the span itself into the audit trail
+        would put the suspected leak in a second, more durable place -- and `job_events`
+        is rendered into reports.
+        """
+        drained, suppressed = self.taint.drain_suspicions()
+        if not drained and not suppressed:
+            return
+        for suspicion in drained:
+            record_event(
+                self.db,
+                self.job_id,
+                "isolation_suspicion",
+                f"{suspicion.context} shares a {suspicion.shared_tokens}-token span with "
+                f"private record {suspicion.label!r}. Not proof of a leak: two agents "
+                "describing one defect produce one sentence. Worth a look.",
+            )
+        if suppressed:
+            record_event(
+                self.db,
+                self.job_id,
+                "isolation_suspicion",
+                f"{suppressed} further overlap(s) matched an already-recorded "
+                "(record, role) pair or passed the per-job cap.",
+            )
 
     def _provider_failed(self, error: Exception) -> StepOutcome:
         """Record one lost model call, and fail the job once too many are lost.
