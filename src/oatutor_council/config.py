@@ -53,6 +53,7 @@ ROLE_EFFORT_ENV = {
     "writer": "COUNCIL_WRITER_EFFORT",
     "known_issue_reviewer": "COUNCIL_KNOWN_ISSUE_REVIEWER_EFFORT",
     "independent_reviewer": "COUNCIL_INDEPENDENT_REVIEWER_EFFORT",
+    "adjudicator": "COUNCIL_ADJUDICATOR_EFFORT",
 }
 
 #: Turns per call. **2, not 1, and measured rather than chosen.** At 1 the live pilot lost

@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from openpyxl import Workbook  # noqa: E402
 
 from oatutor_council.agents.schemas import (  # noqa: E402
+    AdjudicatorResponse,
     AuditorResponse,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -131,6 +132,16 @@ def scripted_client(db: Database) -> ScriptedLLMClient:
 
         if request.role is AgentRole.WRITER:
             return _writer_reply(db, request)
+
+        if request.role is AgentRole.ADJUDICATOR:
+            # Nothing in this workbook reaches adjudication -- every defect here is
+            # deterministic -- but the role has to answer, because a council that
+            # KeyErrors on an agent it can dispatch to is not running offline, it is
+            # running until it happens to need that agent.
+            return AdjudicatorResponse(
+                verdict="undecided",
+                evidence="the demo does not script a disagreement to settle",
+            )
 
         return ReviewerResponse(
             decision="accept", rule_codes=["MC_ANSWER_NOT_IN_CHOICES"]

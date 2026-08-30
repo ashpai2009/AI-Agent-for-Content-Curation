@@ -272,6 +272,14 @@ def _validation_report(
     unresolved = [
         issue for issue in ledger.issues if issue.state is IssueState.NEEDS_HUMAN_REVIEW
     ]
+    # Reported beside the escalations, never merged into them. Both need a person, but
+    # they ask that person for different things: an escalation is a repair the council
+    # tried and could not land, while an unconfirmed issue is a defect one audit saw,
+    # another did not, and an adjudicator could not settle. Presenting the second as the
+    # first would tell a curator three attempts were spent on a cell nothing ever edited.
+    unconfirmed = [
+        issue for issue in ledger.issues if issue.state is IssueState.UNCONFIRMED
+    ]
     resolved_claims = resolve_claims(claims, claim_results)
     return {
         "job_id": job_id,
@@ -296,6 +304,16 @@ def _validation_report(
         ),
         "issues_superseded": len(ledger.by_state(IssueState.SUPERSEDED)),
         "issues_refuted": len(ledger.by_state(IssueState.REFUTED)),
+        "issues_unconfirmed": len(unconfirmed),
+        "unconfirmed_issues": [
+            {
+                "issue_id": issue.issue_id,
+                "problem_name": issue.problem_name,
+                "title": issue.title,
+                "description": issue.description,
+            }
+            for issue in unconfirmed
+        ],
         "issues_needing_a_person": [
             {
                 "issue_id": issue.issue_id,
@@ -380,7 +398,23 @@ def unresolved_summary(
             "detection coverage for this workbook is unknown, so a curator should "
             "review the result before publishing it."
         )
+    unconfirmed = ledger.by_state(IssueState.UNCONFIRMED)
     needing = ledger.by_state(IssueState.NEEDS_HUMAN_REVIEW)
+    if needing and unconfirmed:
+        return (
+            f"{len(needing)} issue(s) could not be repaired automatically, and "
+            f"{len(unconfirmed)} more were reported by one audit, not reproduced by a "
+            "second, and could not be settled either way. The corrected workbook "
+            "contains every change that was accepted; both groups are listed below and "
+            "need a person."
+        )
+    if unconfirmed:
+        return (
+            f"{len(unconfirmed)} issue(s) were reported by one audit, not reproduced by "
+            "an independent one, and could not be settled either way, so nothing was "
+            "edited for them. The corrected workbook contains every change that was "
+            "accepted; the cells listed below still need a person to look at them."
+        )
     if needing:
         return (
             f"{len(needing)} issue(s) could not be resolved automatically and need a "
@@ -419,6 +453,7 @@ def render_markdown(reports: JobReports) -> str:
         f" (repaired {validation['issues_repaired']},"
         f" refuted {validation['issues_refuted']},"
         f" resolved by another repair {validation['issues_superseded']})",
+        f"- Issues left unconfirmed: {validation.get('issues_unconfirmed', 0)}",
         f"- Cells changed: {validation['changes_applied']}",
         f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
     ]
@@ -478,6 +513,21 @@ def render_markdown(reports: JobReports) -> str:
             lines.append(
                 f"- [{claim['provenance']}] {claim['text'][:120]} — {summary}"
                 + (f" ({claim['detail'][:80]})" if claim["detail"] else "")
+            )
+
+    if validation.get("unconfirmed_issues"):
+        lines += [
+            "",
+            "## Reported once, not confirmed",
+            "",
+            "One audit reported these; a second, independent audit of the same block did "
+            "not reproduce them, and adjudication could not establish either reading. "
+            "Nothing was edited. They are neither confirmed defects nor cleared cells.",
+            "",
+        ]
+        for issue in validation["unconfirmed_issues"]:
+            lines.append(
+                f"- **{issue['problem_name'] or 'workbook'}** — {issue['description']}"
             )
 
     if validation["issues_needing_a_person"]:

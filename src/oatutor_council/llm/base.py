@@ -41,6 +41,10 @@ class AgentRole(StrEnum):
     WRITER = "writer"
     KNOWN_ISSUE_REVIEWER = "known_issue_reviewer"
     INDEPENDENT_REVIEWER = "independent_reviewer"
+    #: Settles a disagreement between the two audit roles. Unlike them it is *not*
+    #: claim-blind -- it is shown both findings on purpose, because deciding which of two
+    #: readings of a block is right is not a thing a blind observer can do.
+    ADJUDICATOR = "adjudicator"
 
 
 class ProviderError(Exception):

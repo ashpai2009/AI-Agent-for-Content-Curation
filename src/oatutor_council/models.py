@@ -650,6 +650,9 @@ class IssueSource(StrEnum):
 class ReviewerRole(StrEnum):
     KNOWN_ISSUE_REVIEWER = "known_issue_reviewer"
     INDEPENDENT_REVIEWER = "independent_reviewer"
+    #: Only ever the author of a verdict, never an issue's assigned reviewer. The
+    #: adjudicator settles a disagreement between two audits; it does not own a queue.
+    ADJUDICATOR = "adjudicator"
 
 
 class IssueCategory(StrEnum):
@@ -678,8 +681,22 @@ class IssueState(StrEnum):
     PATCH_REJECTED = "patch_rejected"
     REVISION_REQUESTED = "revision_requested"
     ACCEPTED = "accepted"
+    #: Somebody looked at the alleged defect and showed it is not there. Reachable only
+    #: with evidence -- from a deterministic recheck, or from an adjudicator that analysed
+    #: the cells and said why the content is correct. A second audit merely *not*
+    #: mentioning the cells is `UNCONFIRMED`, which is a different claim.
     REFUTED = "refuted"
     SUPERSEDED = "superseded"
+    #: One audit found a defect, an independent one did not, and nothing established
+    #: which was right. Terminal, and deliberately **not** a success state: the honest
+    #: report is that a person should look, not that the workbook is clean.
+    #:
+    #: This state exists because its absence was measured. Silence from the second audit
+    #: used to be recorded as `REFUTED`, and on two held-out workbooks that discarded
+    #: three defects the first audit had correctly found. "Not independently
+    #: rediscovered" and "shown not to be there" are not the same finding, and collapsing
+    #: them reports the weaker one as the stronger.
+    UNCONFIRMED = "unconfirmed"
     NEEDS_HUMAN_REVIEW = "needs_human_review"
 
 
@@ -690,12 +707,16 @@ TERMINAL_ISSUE_STATES: frozenset[IssueState] = frozenset(
         IssueState.ACCEPTED,
         IssueState.REFUTED,
         IssueState.SUPERSEDED,
+        IssueState.UNCONFIRMED,
         IssueState.NEEDS_HUMAN_REVIEW,
     }
 )
 
 #: The only terminal states compatible with reporting success. A refuted claim is a
 #: correct outcome: the auditor checked and the defect was not there.
+#: `UNCONFIRMED` is deliberately absent. An unsettled disagreement between two audits is
+#: an open question about the workbook, and a job that reports success over one is telling
+#: a curator that a question nobody answered came out in their favour.
 SUCCESSFUL_ISSUE_STATES: frozenset[IssueState] = frozenset(
     {IssueState.ACCEPTED, IssueState.REFUTED, IssueState.SUPERSEDED}
 )
@@ -739,6 +760,16 @@ class ReviewDecision(StrEnum):
     ACCEPT = "accept"
     REVISE = "revise"
     HUMAN_REVIEW = "human_review"
+    #: The check ran and settled nothing. Not available to a reviewer judging a candidate
+    #: patch -- there the artifact is either acceptable or it is not -- and produced only
+    #: by a claim-blind audit that neither reproduced a claim nor disproved it, and by an
+    #: adjudicator that could not establish either reading.
+    #:
+    #: It exists because its absence was expensive. With three decisions available, "the
+    #: second audit did not mention these cells" had to be recorded as `ACCEPT`, which the
+    #: caller read as "refuted", which closed three genuine defects across two held-out
+    #: workbooks. Silence needed somewhere to go that was not agreement.
+    UNRESOLVED = "unresolved"
 
 
 class ReviewVerdict(BaseModel):
@@ -759,6 +790,13 @@ class ReviewVerdict(BaseModel):
     decision: ReviewDecision
     feedback: str = ""
     rule_codes: tuple[str, ...] = ()
+    #: An adjudicator's canonical repair targets, replacing the disputed claim's. Carried
+    #: on the verdict rather than written straight onto the issue because the two writes
+    #: can be torn apart by a crash: a resumed job reads the verdict back and would
+    #: otherwise know a defect was confirmed without knowing which cells to correct.
+    #: Empty on every other kind of verdict, and on every row written before this existed.
+    canonical_cells: tuple[tuple[int, int], ...] = ()
+    canonical_category: IssueCategory | None = None
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @model_validator(mode="after")

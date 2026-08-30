@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from oatutor_council.agents.schemas import (  # noqa: E402
+    AdjudicatorResponse,
     AuditorResponse,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -76,6 +77,12 @@ def observer_client() -> ScriptedLLMClient:
             human_review_reason="shadow run: no repairs are proposed",
         ),
         AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(decision="accept"),
+        # An observer settles nothing either. `undecided` leaves the claim where a shadow
+        # run should leave it: recorded, unedited, and visible in the report.
+        AgentRole.ADJUDICATOR: AdjudicatorResponse(
+            verdict="undecided",
+            evidence="shadow run: no disagreement is adjudicated",
+        ),
     }
     client = ScriptedLLMClient()
     client.default = lambda request: replies[request.role]

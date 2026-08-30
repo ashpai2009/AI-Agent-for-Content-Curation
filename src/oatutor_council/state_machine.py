@@ -93,7 +93,9 @@ _REOPENABLE: frozenset[IssueState] = frozenset(
 #: earlier one at any point, and forcing it through the repair loop first would spend
 #: attempts on a defect that no longer exists independently.
 _ISSUE_FLOW: dict[IssueState, frozenset[IssueState]] = {
-    IssueState.OPEN: frozenset({IssueState.AWAITING_PATCH, IssueState.REFUTED}),
+    IssueState.OPEN: frozenset(
+        {IssueState.AWAITING_PATCH, IssueState.REFUTED, IssueState.UNCONFIRMED}
+    ),
     IssueState.AWAITING_PATCH: frozenset(
         {IssueState.PATCH_PROPOSED, IssueState.PATCH_REJECTED, IssueState.REFUTED}
     ),
@@ -129,6 +131,13 @@ _ISSUE_FLOW: dict[IssueState, frozenset[IssueState]] = {
     IssueState.ACCEPTED: _REOPENABLE,
     IssueState.REFUTED: _REOPENABLE,
     IssueState.SUPERSEDED: _REOPENABLE,
+    # An unsettled disagreement is the state most worth reopening: a later deterministic
+    # rediscovery at the same cells is precisely the independent evidence the second audit
+    # failed to supply, so it belongs back with the Writer rather than left as a question.
+    # It takes the same two exits as every other resolved state and no third one -- an
+    # unconfirmed claim carries no rule code, so nothing can re-derive it against the
+    # final workbook and nothing is in a position to supersede it.
+    IssueState.UNCONFIRMED: _REOPENABLE,
     # A later accepted sibling repair can make an escalated deterministic finding cease
     # to exist. `SUPERSEDED` is the only honest transition then: retaining the stale
     # escalation tells a curator to inspect a defect the final workbook does not have.

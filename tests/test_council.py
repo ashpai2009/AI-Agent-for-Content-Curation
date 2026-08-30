@@ -13,6 +13,7 @@ import pytest
 
 from conftest import problem, scaffold, step
 from oatutor_council.agents.schemas import (
+    AdjudicatorResponse,
     AuditorFinding,
     AuditorResponse,
     IndependentFinding,
@@ -36,10 +37,13 @@ from oatutor_council.models import (
     CurationJob,
     FailureReason,
     FindingScope,
+    Issue,
+    IssueCategory,
     IssueSource,
     IssueState,
     JobState,
     RepairAttempt,
+    ReviewerRole,
     Severity,
     SourcePath,
     ValidationFinding,
@@ -126,6 +130,13 @@ def quiet_client(**overrides) -> ScriptedLLMClient:
             edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
         ),
         AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(decision="accept"),
+        # "Finds nothing" for an adjudicator is a demonstrated refutation, not silence --
+        # silence is exactly what this agent exists to stop reading as a clean bill of
+        # health, so a helper whose premise is "the workbook is fine" has to say why.
+        AgentRole.ADJUDICATOR: AdjudicatorResponse(
+            verdict="content_correct",
+            evidence="Recomputed the cell; it already holds the correct value.",
+        ),
     }
     replies.update(overrides)
 
@@ -455,11 +466,16 @@ def test_a_semantic_duplicate_is_reviewed_before_another_writer_call(setup):
 
 
 def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(setup):
-    """A second agent must verify an unsupported semantic claim against the original.
+    """A false semantic claim is dismissed on evidence, and only on evidence.
 
     The adversarial run let an auditor call an equivalent answer wrong, then asked the
     reviewer only whether the replacement looked plausible. By then the review was
     anchored on the proposed change. Attempt zero is the unbiased claim check.
+
+    Here the blind audit reports nothing about the cell *and* the adjudicator states the
+    recomputation showing the title is already correct. That second half is what makes
+    this a refutation; without it the claim would be `UNCONFIRMED`, which the next test
+    pins down.
     """
     db, _ = setup
     false_claim = AuditorResponse(
@@ -497,6 +513,317 @@ def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(s
     assert independent_payloads
     assert all("already-correct title" not in payload for payload in independent_payloads)
     assert all("different but equivalent" not in payload for payload in independent_payloads)
+    # The adjudicator, by contrast, is shown the claim on purpose. It is the one agent
+    # that cannot do its job blind, and its evidence is what closed the issue.
+    adjudications = client.payloads_for(AgentRole.ADJUDICATOR)
+    assert len(adjudications) == 1
+    assert "already-correct title" in adjudications[0]
+
+
+def test_silence_from_the_second_audit_leaves_a_claim_unconfirmed(setup):
+    """The measured failure this whole path exists to remove.
+
+    A blind audit that does not mention the disputed cells has not examined the claim, and
+    an adjudicator that cannot settle it has not disproved it. Recording that as `REFUTED`
+    discarded three real defects across two held-out workbooks. The honest terminal state
+    says a person should look, and it denies the job success rather than granting it.
+    """
+    db, _ = setup
+    claim = AuditorResponse(
+        findings=[
+            AuditorFinding(
+                cells=[{"row": 2, "column": "title"}],
+                problem="The title asks for the wrong operation.",
+                expected="Convert the angle",
+                category="mathematics",
+            )
+        ]
+    )
+    client = quiet_client(
+        **{
+            AgentRole.INITIAL_AUDITOR: claim,
+            AgentRole.ADJUDICATOR: AdjudicatorResponse(
+                verdict="undecided",
+                evidence="Whether the title is right depends on intent the block does "
+                "not record.",
+            ),
+        }
+    )
+
+    result = council(setup, client).run()
+
+    semantic = next(
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.rule_codes == ("AUDITOR_FINDING",)
+    )
+    assert semantic.state is IssueState.UNCONFIRMED
+    assert semantic.state is not IssueState.REFUTED
+    # Unsettled is not success. A curator is told the question is open, not that the
+    # workbook came out clean.
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    # Nothing was edited for it, so it must not be presented as a repair that failed.
+    assert semantic.attempts_used == 0
+    assert client.call_count(AgentRole.WRITER) == 1
+
+
+def test_an_adjudicator_may_widen_a_claim_to_the_cell_that_must_change(setup):
+    """The `E93`-instead-of-`F93` failure, fixed where it is fixable.
+
+    One audit names the cell where a defect is *visible*; an independent audit names the
+    cell that has to change. Under exact-match corroboration those two disagree, the claim
+    is dropped, and the defect survives the job. They overlap on the row, so the pair is a
+    disagreement about extent, and the adjudicator's cell list replaces the claim's.
+    """
+    db, _ = setup
+    client = ScriptedLLMClient()
+    independent_calls = 0
+
+    def reply(request):
+        nonlocal independent_calls
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(
+                findings=[
+                    AuditorFinding(
+                        cells=[{"row": 3, "column": "answer"}],
+                        problem="The step answer disagrees with its answerType.",
+                        category="mathematics",
+                    )
+                ]
+            )
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            independent_calls += 1
+            if independent_calls == 1:
+                return IndependentReviewResponse(
+                    block_is_sound=False,
+                    findings=[
+                        IndependentFinding(
+                            cells=[{"row": 3, "column": "answer_type"}],
+                            problem="answerType should be numeric here.",
+                            category="row_type",
+                        )
+                    ],
+                )
+            return IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.ADJUDICATOR:
+            return AdjudicatorResponse(
+                verdict="defect_confirmed",
+                evidence="Solved the step: pi/6 is a value, so the type must be numeric.",
+                cells=[{"row": 3, "column": "answer_type"}],
+                category="row_type",
+            )
+        if request.role is AgentRole.WRITER:
+            if "row 3 column 6" in request.user_payload:
+                return WriterResponse(
+                    derivation="",
+                    edits=[
+                        {
+                            "row": 3,
+                            "column": "answer_type",
+                            "before": "algebra",
+                            "after": "numeric",
+                        }
+                    ],
+                )
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client.default = reply
+    council(setup, client).run()
+
+    semantic = next(
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.rule_codes == ("AUDITOR_FINDING",)
+    )
+    # Not refuted for naming a different column, and now authorised at the column that
+    # has to change -- including the structural classification the gate reads.
+    assert semantic.state is not IssueState.REFUTED
+    assert semantic.state is not IssueState.UNCONFIRMED
+    assert semantic.cells == ((3, 6),)
+    assert semantic.category.value == "row_type"
+    assert semantic.is_structural
+
+
+def test_adjudication_does_not_read_an_agent_quoting_itself_as_a_leak(setup):
+    """The adjudicator is shown two published findings, and both have private twins.
+
+    An auditor's note and the finding it published describe one defect, usually in one
+    sentence, so the outgoing payload contains text that is also registered as private.
+    That is an agent being compared with itself. The exemption is keyed on the exact
+    record that authored the claim -- `auditor.{block_id}` for the disputed claim and
+    `blind-auditor.{issue_id}` for the second audit -- and on nothing wider, so a leak
+    from any other record still fails the job.
+    """
+    db, _ = setup
+    shared = (
+        "The title asks the student to convert when the problem requires evaluating "
+        "the expression at the given angle instead."
+    )
+    claim = AuditorResponse(
+        reasoning=shared,
+        findings=[
+            AuditorFinding(
+                cells=[{"row": 2, "column": "title"}],
+                problem=shared,
+                category="mathematics",
+            )
+        ],
+    )
+    client = quiet_client(
+        **{
+            AgentRole.INITIAL_AUDITOR: claim,
+            AgentRole.ADJUDICATOR: AdjudicatorResponse(
+                verdict="undecided", evidence="cannot establish either reading"
+            ),
+        }
+    )
+
+    result = council(setup, client).run()
+
+    assert result.failure_reason is not FailureReason.ISOLATION_VIOLATION
+    adjudications = client.payloads_for(AgentRole.ADJUDICATOR)
+    assert len(adjudications) == 1
+    assert shared in adjudications[0]
+
+
+def test_an_adjudication_is_read_back_rather_than_paid_for_twice(setup):
+    """Attempt zero holds two different checks, told apart by their role.
+
+    Both the claim-blind audit and the adjudication live at attempt zero, and a resumed
+    job that read one as the other would either adjudicate forever or never adjudicate at
+    all. Recovery must find the adjudicator's own verdict, with its canonical cells still
+    on it, and spend nothing.
+    """
+    db, _ = setup
+    claim = AuditorResponse(
+        findings=[
+            AuditorFinding(
+                cells=[{"row": 2, "column": "title"}],
+                problem="The title asks for the wrong operation.",
+                category="mathematics",
+            )
+        ]
+    )
+    client = quiet_client(
+        **{
+            AgentRole.INITIAL_AUDITOR: claim,
+            AgentRole.ADJUDICATOR: AdjudicatorResponse(
+                verdict="undecided", evidence="cannot establish either reading"
+            ),
+        }
+    )
+    council(setup, client).run()
+
+    verdicts = [
+        verdict
+        for verdict in list_verdicts(db, "job-1")
+        if verdict.reviewer_role is ReviewerRole.ADJUDICATOR
+    ]
+    assert len(verdicts) == 1
+    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+
+    # A second council over the same rows re-reads the verdict instead of re-asking.
+    from oatutor_council.council import _verdict_for_attempt
+
+    recovered = _verdict_for_attempt(
+        db, verdicts[0].issue_id, 0, reviewer_role=ReviewerRole.ADJUDICATOR
+    )
+    assert recovered is not None
+    assert recovered.verdict_id == verdicts[0].verdict_id
+    blind = _verdict_for_attempt(
+        db, verdicts[0].issue_id, 0, reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER
+    )
+    assert blind is not None
+    assert blind.verdict_id != verdicts[0].verdict_id
+
+
+def _claim(cells, category="mathematics"):
+    return ValidationFinding(
+        code="AUDITOR_FINDING",
+        message="something is wrong",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        row=cells[0][0],
+        column=cells[0][1],
+        detail={"cells": [list(cell) for cell in cells], "category": category},
+    )
+
+
+def test_agreement_on_the_row_is_a_disagreement_about_extent_not_a_refutation():
+    """The classifier's whole job, stated three ways.
+
+    Exact agreement goes to the Writer. Anything touching the same row is a dispute worth
+    settling -- that is where the `Answer`-versus-`answerType` miss lives, one row and no
+    cell in common. Only a second audit that said nothing about these rows is silence, and
+    silence has never been evidence.
+    """
+    from oatutor_council.council import Corroboration, _classify_corroboration
+
+    issue = Issue(
+        issue_id="i",
+        job_id="job-1",
+        block_id="b",
+        source=IssueSource.INITIAL_AUDITOR,
+        category=IssueCategory.MATHEMATICS,
+        severity=Severity.ERROR,
+        title="t",
+        description="d",
+        cells=((3, 5),),
+    )
+
+    exact, _ = _classify_corroboration(issue, [_claim([(3, 5)])])
+    assert exact is Corroboration.EXACT
+
+    # Same row, the column that must actually change, and a different category. Every one
+    # of those differences used to be read as "the second audit disagreed".
+    related, matches = _classify_corroboration(
+        issue, [_claim([(3, 6)], category="row_type")]
+    )
+    assert related is Corroboration.RELATED
+    assert len(matches) == 1
+
+    # A wider target set that includes the disputed cell is agreement about the defect and
+    # disagreement about how much of it needs correcting.
+    wider, _ = _classify_corroboration(issue, [_claim([(3, 5), (3, 6)])])
+    assert wider is Corroboration.RELATED
+
+    # Same cells, different category: still a question, still not a refutation.
+    recategorised, _ = _classify_corroboration(
+        issue, [_claim([(3, 5)], category="notation")]
+    )
+    assert recategorised is Corroboration.RELATED
+
+    silent, matches = _classify_corroboration(issue, [_claim([(9, 5)])])
+    assert silent is Corroboration.SILENT
+    assert matches == ()
+
+    assert _classify_corroboration(issue, [])[0] is Corroboration.SILENT
+
+
+def test_an_exact_match_wins_over_a_related_one_in_the_same_audit():
+    """Order in the response must not decide whether a claim is corroborated."""
+    from oatutor_council.council import Corroboration, _classify_corroboration
+
+    issue = Issue(
+        issue_id="i",
+        job_id="job-1",
+        block_id="b",
+        source=IssueSource.INITIAL_AUDITOR,
+        category=IssueCategory.MATHEMATICS,
+        severity=Severity.ERROR,
+        title="t",
+        description="d",
+        cells=((3, 5),),
+    )
+    outcome, matches = _classify_corroboration(
+        issue, [_claim([(3, 6)], category="row_type"), _claim([(3, 5)])]
+    )
+    assert outcome is Corroboration.EXACT
+    assert matches[0].detail["cells"] == [[3, 5]]
 
 
 def test_a_blind_second_agent_can_corroborate_a_real_model_only_claim(setup):
@@ -639,6 +966,13 @@ def test_the_council_terminates_against_an_adversary_that_never_accepts(setup):
                         "problem": "still wrong",
                     }
                 ],
+            ),
+            # An adversary that also refuses to let a claim be settled against it, so
+            # adjudication cannot end the loop on this council's behalf.
+            AgentRole.ADJUDICATOR: AdjudicatorResponse(
+                verdict="defect_confirmed",
+                evidence="still wrong on recomputation",
+                cells=[{"row": 3, "column": "answer"}],
             ),
         }
     )

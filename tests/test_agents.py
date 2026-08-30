@@ -31,12 +31,15 @@ from oatutor_council.agents.known_issue_reviewer import (
     review,
 )
 from oatutor_council.agents.rendering import (
+    AdjudicationContext,
     ReviewerContext,
     render_block,
     render_block_diff,
     render_issue,
 )
+from oatutor_council.agents.adjudicator import adjudicate
 from oatutor_council.agents.schemas import (
+    AdjudicatorResponse,
     AuditorResponse,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -124,6 +127,96 @@ def test_the_reviewer_context_cannot_reference_private_reasoning():
     """Enforced at import time, so a field added later that reintroduces the leak fails
     to import rather than shipping."""
     assert assert_no_private_fields(ReviewerContext) is ReviewerContext
+
+
+def test_the_adjudication_context_cannot_reference_private_reasoning():
+    """The adjudicator is shown two agents' conclusions, so this matters more here.
+
+    It is the only context in the council built from another agent's output, which makes
+    it the one place where "public finding" and "private note" are easiest to confuse. The
+    type closure settles it at import: both claims it carries are `str`, and no private
+    model can be added to this dataclass without failing the module's import.
+    """
+    assert assert_no_private_fields(AdjudicationContext) is AdjudicationContext
+
+
+def test_the_adjudicator_asks_for_both_readings_and_the_block():
+    """Both claims, the block, and nothing that argues for either one."""
+    context = AdjudicationContext(
+        disputed_claim="cells: row 3 column 5\nsays: the answer is wrong",
+        second_audit="cells: row 3 column 6\nsays: the type is wrong",
+        block="row | answer",
+        conventions="notation: ascii",
+        deterministic_findings="none",
+    )
+    labels = [section.label for section in context.sections()]
+    assert "The disputed claim, from the first audit" in labels
+    assert "What a second, independent audit of the same block reported" in labels
+    assert "The block as it stands now" in labels
+
+
+def _adjudication_context() -> AdjudicationContext:
+    return AdjudicationContext(
+        disputed_claim="cells: row 3 column 5",
+        second_audit="nothing about these cells",
+        block="row | answer",
+        conventions="notation: ascii",
+        deterministic_findings="none",
+    )
+
+
+def test_a_confirmation_without_a_check_settles_nothing():
+    """`content_correct` and `defect_confirmed` both rest entirely on the evidence.
+
+    An adjudicator that returns a verdict and no working has not adjudicated; it has
+    guessed. Downgrading to `undecided` is the conservative direction in both: neither a
+    repair nor a refutation happens on an assertion nobody can inspect.
+    """
+    client = ScriptedLLMClient(
+        default=AdjudicatorResponse(verdict="content_correct", evidence="   ")
+    )
+    result = adjudicate(client, context=_adjudication_context(), block_rows=[2, 3, 4])
+    assert result.verdict == "undecided"
+    assert "without stating the check" in result.evidence
+
+
+def test_a_confirmation_outside_the_disputed_block_authorises_nothing():
+    """A target the block does not contain is an answer to a different question.
+
+    Relocating it would invent a third claim nobody made, and treating it as a refutation
+    would close a claim nobody examined. Neither, so it is undecided and a person reads
+    it.
+    """
+    client = ScriptedLLMClient(
+        default=AdjudicatorResponse(
+            verdict="defect_confirmed",
+            evidence="Recomputed row 99 and it is wrong.",
+            cells=[{"row": 99, "column": "answer"}],
+        )
+    )
+    result = adjudicate(client, context=_adjudication_context(), block_rows=[2, 3, 4])
+    assert result.verdict == "undecided"
+    assert result.cells == ()
+
+
+def test_a_confirmation_keeps_every_named_cell_inside_the_block():
+    client = ScriptedLLMClient(
+        default=AdjudicatorResponse(
+            verdict="defect_confirmed",
+            evidence="The answer is an equation, so the type must be algebra.",
+            cells=[
+                {"row": 3, "column": "answer"},
+                {"row": 3, "column": "answer_type"},
+                {"row": 3, "column": "answer"},
+            ],
+            category="row_type",
+        )
+    )
+    result = adjudicate(client, context=_adjudication_context(), block_rows=[2, 3, 4])
+    assert result.verdict == "defect_confirmed"
+    # Column names resolved to indices, order preserved, the repeat dropped.
+    assert result.cells == ((3, 5), (3, 6))
+    assert result.is_structural
 
 
 def test_a_context_with_a_private_field_is_refused():

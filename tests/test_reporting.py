@@ -192,6 +192,52 @@ def test_success_requires_every_issue_resolved_and_a_refutation_counts():
     assert not needing.all_resolved
 
 
+def test_an_unconfirmed_issue_denies_success_and_is_not_an_escalation():
+    """The distinction the whole `UNCONFIRMED` state exists to carry.
+
+    A refuted claim was looked for and was not there, and a job may succeed over it. An
+    unconfirmed one was reported by one audit, not reproduced by another, and settled by
+    nobody -- so the job may not succeed over it, and it must not be counted as a repair
+    the council tried three times and could not land.
+    """
+    ledger = IssueLedger(
+        job_id="job-1",
+        issues=(
+            make_issue(issue_id="a", state=IssueState.ACCEPTED),
+            make_issue(
+                issue_id="b",
+                state=IssueState.UNCONFIRMED,
+                problem_name="unitcirc2",
+                description="The larger solution was requested.",
+            ),
+        ),
+    )
+    assert not ledger.all_resolved
+
+    reports = build_reports(
+        job_id="job-1",
+        state=JobState.NEEDS_HUMAN_ATTENTION,
+        ledger=ledger,
+        changes=(),
+        verdicts=(),
+        attempts=(),
+        findings=(),
+    )
+    report = reports.validation_report
+    assert report["issues_unconfirmed"] == 1
+    assert report["issues_refuted"] == 0
+    # Kept out of the escalation list: nothing was attempted for it, and reporting it as
+    # a failed repair would describe attempts nobody made.
+    assert report["issues_needing_a_person"] == []
+    assert report["unconfirmed_issues"][0]["problem_name"] == "unitcirc2"
+    assert "not reproduced" in report["unresolved_summary"]
+
+    markdown = render_markdown(reports)
+    assert "Reported once, not confirmed" in markdown
+    assert "unitcirc2" in markdown
+    assert "Issues left unconfirmed: 1" in markdown
+
+
 # --------------------------------------------------------------------------------------
 # Reports
 # --------------------------------------------------------------------------------------

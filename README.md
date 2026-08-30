@@ -13,8 +13,9 @@ policy.
 ```
 XLSX (required) + optional instruction document (.pdf/.docx/.txt/.md)
   → Initial Auditor          scans every problem block
-  → Claim Reviewer           verifies unsupported findings before any edit
-  → Writer                   corrects identified issues
+  → Claim Reviewer           audits the block again, blind to the claim
+  → Adjudicator              settles what that audit neither reproduced nor disproved
+  → Writer                   corrects confirmed issues
   → Known-Issue Reviewer     checks simulated corrections before they are written
   → repair loop              bounded at three attempts per issue
   → Independent Reviewer     rechecks every current problem from scratch
@@ -182,7 +183,8 @@ src/oatutor_council/
   workbook/        reader · writer · diff · styles
   validation/      rules/ (61 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
-                   independent_reviewer · isolation · rendering · schemas · batching
+                   independent_reviewer · adjudicator ·
+                   isolation · rendering · schemas · batching
   llm/             base · claude_cli · mock · context · prompts · audit
   ingestion/       instruction_documents
   reporting/       ledger · reports

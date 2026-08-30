@@ -25,14 +25,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
 from openpyxl import load_workbook
 
-from .agents import independent_reviewer, initial_auditor, known_issue_reviewer, writer
+from .agents import (
+    adjudicator,
+    independent_reviewer,
+    initial_auditor,
+    known_issue_reviewer,
+    writer,
+)
 from .agents.batching import FindingAttributionError
+from .agents.rendering import (
+    render_block,
+    render_claim,
+    render_claims,
+    render_conventions,
+    render_findings,
+)
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
 from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
@@ -49,11 +63,13 @@ from .llm.base import (
 )
 from .llm.prompts import current_prompt_versions, resolve_prompt
 from .models import (
+    FIXED_COLUMNS,
+    STRUCTURAL_COLUMNS,
     ArtifactKind,
-    CellEdit,
-    ColumnKey,
-    ClaimOutcome,
     AttemptOutcome,
+    CellEdit,
+    ClaimOutcome,
+    ColumnKey,
     CurationJob,
     FailureReason,
     Issue,
@@ -171,6 +187,55 @@ _ROOT_FINDING_CODES = frozenset(
 #: The durable event kind counted against `provider_failure_budget`.
 PROVIDER_FAILURE_EVENT = "provider_failure"
 
+#: How an adjudication maps onto the verdict vocabulary. `undecided` is `UNRESOLVED` and
+#: not `HUMAN_REVIEW`: nobody failed at anything, and no repair was attempted -- two
+#: audits read one block differently and the question is still open.
+_ADJUDICATIONS = {
+    "defect_confirmed": ReviewDecision.REVISE,
+    "content_correct": ReviewDecision.ACCEPT,
+    "undecided": ReviewDecision.UNRESOLVED,
+}
+
+#: Categories that authorise an edit to a structural column.
+_STRUCTURAL_CATEGORIES = frozenset(
+    {IssueCategory.STRUCTURE, IssueCategory.ROW_TYPE, IssueCategory.DEPENDENCY}
+)
+
+_COLUMN_BY_INDEX = {index: key for key, index in FIXED_COLUMNS.items()}
+
+
+def _targets_are_structural(
+    cells: Sequence[tuple[int, int]], category: IssueCategory
+) -> bool:
+    """Whether an issue over these cells may edit a structural column.
+
+    Mirrors `ledger._is_structural`, on already-resolved coordinates rather than a
+    finding. The column test comes first and the declared category second, for the reason
+    the auditor prompt was rewritten: a defect *in* `answerType` is structural whatever
+    the agent chose to call it, and an agent that classifies its own finding as structural
+    is telling the gate something it cannot derive from the coordinates alone.
+    """
+    if category in _STRUCTURAL_CATEGORIES:
+        return True
+    return any(
+        _COLUMN_BY_INDEX.get(column) in STRUCTURAL_COLUMNS for _, column in cells
+    )
+
+
+def _blind_reviewer_role(issue: Issue) -> ReviewerRole:
+    """Which role's verdict a claim-blind audit of this issue is recorded under.
+
+    The opposite audit role, so an agent never certifies its own unsupported claim:
+    Initial-Auditor findings are checked by the Independent Reviewer and vice versa. It is
+    also the key that separates the blind verdict from the adjudicator's, both of which
+    live at attempt zero.
+    """
+    return (
+        ReviewerRole.KNOWN_ISSUE_REVIEWER
+        if issue.source is IssueSource.INDEPENDENT_REVIEWER
+        else ReviewerRole.INDEPENDENT_REVIEWER
+    )
+
 
 def _finding_targets(finding: ValidationFinding) -> frozenset[tuple[int, int]]:
     """The exact cells a model finding says must change."""
@@ -182,29 +247,69 @@ def _finding_targets(finding: ValidationFinding) -> frozenset[tuple[int, int]]:
     return frozenset()
 
 
-def _corroborating_finding(
+class Corroboration(StrEnum):
+    """How a claim-blind audit's findings stand in relation to the claim under test."""
+
+    #: The same repair targets under the same category. Independent agreement, and the
+    #: only outcome that reaches the Writer without anyone looking at both claims.
+    EXACT = "exact"
+    #: Both audits point at the same row of the same block and describe it differently --
+    #: different columns, a wider or narrower target set, a different category. That is
+    #: agreement that something is wrong and disagreement about what, which is a question
+    #: with an answer rather than a reason to drop the claim.
+    RELATED = "related"
+    #: The second audit reported nothing touching these rows.
+    SILENT = "silent"
+
+
+def _classify_corroboration(
     issue: Issue, findings: Sequence[ValidationFinding]
-) -> ValidationFinding | None:
-    """Return a genuinely independent finding for the same claim, if one exists.
+) -> tuple[Corroboration, tuple[ValidationFinding, ...]]:
+    """Say how a from-scratch audit relates to a model-only claim. Never decide.
 
     Prose similarity is deliberately irrelevant: asking another model whether an
-    accusation *sounds like* the first accusation is another form of anchoring.  A blind
-    audit corroborates a model-only issue only when it independently names the same exact
-    repair targets and category.  Disagreement preserves the workbook; the later full
-    sweep can rediscover a real defect, while an unsupported edit cannot be undone after
-    it has already overwritten correct source content.
+    accusation *sounds like* the first accusation is another form of anchoring. So the
+    comparison is over exact repair targets, and it now has three answers instead of two.
+
+    **The two-answer version was wrong in a way that cost real defects.** Anything short
+    of an exact match was recorded as a refutation, and on two held-out workbooks that
+    discarded three defects the first audit had correctly found -- among them an Answer
+    and its `answerType` on one row, which the second audit reported as one finding over
+    both cells where the first had named only the Answer. Two audits agreeing that row 16
+    is broken is not evidence that row 16 is fine.
+
+    Row overlap, not cell overlap, is the `RELATED` test, and deliberately so. The most
+    expensive detection failure on the first real workbook was a finding that cited the
+    cell where a mismatch was *visible* (`Answer`) instead of the cell that had to change
+    (`answerType`) -- one row, two columns, no cell in common. A category filter on top
+    would rebuild exactly the brittleness being removed, since disagreeing about the
+    category *is* one of the things two audits disagree about.
     """
     wanted = frozenset(issue.cells)
-    if not wanted:
-        return None
+    wanted_rows = {row for row, _ in wanted}
+    exact: list[ValidationFinding] = []
+    related: list[ValidationFinding] = []
+
     for finding in findings:
-        try:
-            category = IssueCategory(str(finding.detail.get("category", "")))
-        except ValueError:
+        targets = _finding_targets(finding)
+        if not targets:
             continue
-        if category is issue.category and _finding_targets(finding) == wanted:
-            return finding
-    return None
+        try:
+            category: IssueCategory | None = IssueCategory(
+                str(finding.detail.get("category", ""))
+            )
+        except ValueError:
+            category = None
+        if wanted and category is issue.category and targets == wanted:
+            exact.append(finding)
+        elif wanted_rows & {row for row, _ in targets}:
+            related.append(finding)
+
+    if exact:
+        return Corroboration.EXACT, tuple(exact)
+    if related:
+        return Corroboration.RELATED, tuple(related)
+    return Corroboration.SILENT, ()
 
 #: The round number the final gate's findings are stored under. Deliberately above any
 #: repair round: it is what the workbook looked like when it was handed over, which is the
@@ -235,7 +340,12 @@ CLI_ADAPTER_VERSION = 2
 #: Version of orchestration and user-payload construction that changes what agents see or
 #: when workbook bytes are committed. Prompt files are pinned separately; this covers the
 #: Python-side instructions, context sections, review coverage and patch lifecycle.
-PIPELINE_CONTRACT_VERSION = 3
+#: 4 (2026-08-29): a claim-blind audit that does not reproduce a claim no longer refutes
+#: it. The outcome is classified rather than decided, an adjudicator settles what is left,
+#: and an unsettled claim ends `UNCONFIRMED` instead of `REFUTED`. That is a fifth agent,
+#: a second call on some issues, and a different terminal state -- a job cannot run half
+#: under each reading and still be described as one run.
+PIPELINE_CONTRACT_VERSION = 4
 
 
 class BudgetExhausted(Exception):
@@ -1782,77 +1892,228 @@ class CurationCouncil:
         )
 
     def _review_unpatched_issue(self, issue: Issue, state: JobState) -> StepOutcome:
-        """Blindly corroborate a model-only claim before permitting any edit.
+        """Establish whether a model-only claim is real before permitting any edit.
 
-        Merely hiding the Writer's candidate was insufficient: the old pre-check still
-        showed the second model the first model's accusation, and the accusation itself
-        anchored the decision.  The second agent now receives the current block and rules
-        only and performs its ordinary from-scratch audit.  The first claim is not placed
-        anywhere in the system prompt, user payload, or response schema.
+        Two checks, in two steps, because `step()` makes at most one model call.
 
-        Attempt zero is a durable namespace for this blind check. It cannot be mistaken
-        for the verdict on Writer attempt one after a crash. Initial-Auditor findings are
-        checked by the Independent Reviewer; Independent-Reviewer findings are checked by
-        the Initial Auditor, so an agent never certifies its own unsupported claim.
+        **First**, a claim-blind audit by the opposite audit role. The second agent
+        receives the current block and the rules only; the accusation appears nowhere in
+        its system prompt, payload, or response schema, so its findings are its own.
+        Attempt zero is a durable namespace for both checks and cannot be mistaken for a
+        verdict on Writer attempt one after a crash.
+
+        **Second**, when that audit neither reproduced the claim nor contradicted it, an
+        adjudicator that is shown both readings and decides between them.
+
+        The second check is the correction. This method used to read "the blind audit did
+        not report the same cells" as "the claim is refuted", and closed the issue. Those
+        are different findings: one says nobody corroborated it, the other says somebody
+        checked and it is not there. On two held-out workbooks the conflation discarded
+        three defects that were really present. Refutation now needs evidence, and the
+        state for an unsettled disagreement is `UNCONFIRMED`, which denies the job success
+        rather than granting it.
         """
-        verdict = _verdict_for_attempt(self.db, issue.issue_id, 0)
-        if verdict is None:
-            verdict = self._ask_blind_corroborator(issue)
+        blind_role = _blind_reviewer_role(issue)
+        cached = _verdict_for_attempt(
+            self.db, issue.issue_id, 0, reviewer_role=blind_role
+        )
+        verdict = cached or self._ask_blind_corroborator(issue)
         if verdict is None:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, "block vanished; escalating", state)
 
-        if verdict.decision is ReviewDecision.ACCEPT:
-            changed_targets = {
-                (change.row, change.column)
-                for change in list_changes(self.db, self.job_id)
-                if change.block_id == issue.block_id and change.issue_id != issue.issue_id
-            }
-            resolved_state = (
-                IssueState.SUPERSEDED
-                if changed_targets.intersection(issue.cells)
-                else IssueState.REFUTED
-            )
-            save_issue(self.db, advance_issue(issue, resolved_state))
-            explanation = (
-                "an earlier accepted repair resolved"
-                if resolved_state is IssueState.SUPERSEDED
-                else "a fresh reviewer refuted"
-            )
-            record_event(
-                self.db,
-                self.job_id,
-                "issue_superseded" if resolved_state is IssueState.SUPERSEDED else "issue_refuted",
-                f"{issue.issue_id}: {explanation} the unsupported semantic finding in "
-                f"{issue.problem_name}",
-            )
-            return StepOutcome(
-                True,
-                f"{issue.issue_id} "
-                + (
-                    "resolved by another repair"
-                    if resolved_state is IssueState.SUPERSEDED
-                    else "refuted before editing"
-                ),
-                state,
-            )
+        if verdict.decision is ReviewDecision.REVISE:
+            # Independently corroborated. Unchanged behaviour, and the only path from a
+            # model-only claim to a Writer call that costs no adjudication.
+            save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
+            return StepOutcome(True, f"{issue.issue_id} corroborated", state)
 
         if verdict.decision is ReviewDecision.HUMAN_REVIEW:
             save_issue(self.db, self.machine.exhausted(issue))
             return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
 
-        # OPEN cannot transition directly to REVISION_REQUESTED. AWAITING_PATCH means
-        # exactly what is true now: the reviewer has supplied actionable feedback and
-        # the next phase step should ask the Writer for the first patch.
-        save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
-        return StepOutcome(True, f"{issue.issue_id} still needs a patch", state)
+        # Unsettled. Before spending an adjudication call, the one case a model cannot
+        # improve on: a sibling repair has already edited these exact cells, and a fresh
+        # audit of the result reports nothing wrong with them. That is supersession, and
+        # it is decidable from the change ledger.
+        changed_targets = {
+            (change.row, change.column)
+            for change in list_changes(self.db, self.job_id)
+            if change.block_id == issue.block_id and change.issue_id != issue.issue_id
+        }
+        if changed_targets.intersection(issue.cells):
+            save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
+            record_event(
+                self.db,
+                self.job_id,
+                "issue_superseded",
+                f"{issue.issue_id}: an earlier accepted repair resolved the unsupported "
+                f"semantic finding in {issue.problem_name}",
+            )
+            return StepOutcome(
+                True, f"{issue.issue_id} resolved by another repair", state
+            )
+
+        if cached is None:
+            # The blind audit was this step's one model call. The issue stays OPEN, the
+            # same queue predicate re-selects it, and the next step adjudicates against a
+            # verdict that is now durable.
+            return StepOutcome(True, f"{issue.issue_id} awaiting adjudication", state)
+
+        return self._adjudicate(issue, verdict, state)
+
+    def _adjudicate(
+        self, issue: Issue, blind_verdict: ReviewVerdict, state: JobState
+    ) -> StepOutcome:
+        """Settle a disagreement between two audits, on evidence.
+
+        The adjudicator is the one agent shown another agent's conclusion, which is a
+        deliberate trade and not an oversight: choosing between two readings of a block is
+        not something a blind observer can do, and the blind observer has already been
+        asked and could not settle it. What pays for the anchoring risk is that the
+        adjudicator must state the check it ran, and that `undecided` is a real answer --
+        an adjudicator with only two available answers learns to pick the confident one.
+
+        Its canonical cell list *replaces* the disputed claim's, which is how a claim that
+        named the cell where a defect was visible becomes a repair authorised at the cell
+        that has to change. The cells travel on the verdict rather than being written
+        straight onto the issue: verdict and issue are two writes, a crash can land
+        between them, and a resumed job that knew a defect was confirmed but not where
+        would have to give the confirmation back.
+        """
+        existing = _verdict_for_attempt(
+            self.db, issue.issue_id, 0, reviewer_role=ReviewerRole.ADJUDICATOR
+        )
+        verdict = existing or self._ask_adjudicator(issue, blind_verdict)
+        if verdict is None:
+            save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, "block vanished; escalating", state)
+
+        if verdict.decision is ReviewDecision.REVISE:
+            updated = issue
+            if verdict.canonical_cells:
+                category = verdict.canonical_category or issue.category
+                updated = issue.model_copy(
+                    update={
+                        "cells": tuple(verdict.canonical_cells),
+                        "category": category,
+                        "is_structural": _targets_are_structural(
+                            verdict.canonical_cells, category
+                        ),
+                    }
+                )
+            save_issue(self.db, advance_issue(updated, IssueState.AWAITING_PATCH))
+            record_event(
+                self.db,
+                self.job_id,
+                "adjudication_confirmed",
+                f"{issue.issue_id} in {issue.problem_name or issue.block_id}: "
+                f"repair authorised at {sorted(updated.cells)}",
+            )
+            return StepOutcome(True, f"{issue.issue_id} confirmed on evidence", state)
+
+        if verdict.decision is ReviewDecision.ACCEPT:
+            save_issue(self.db, advance_issue(issue, IssueState.REFUTED))
+            record_event(
+                self.db,
+                self.job_id,
+                "issue_refuted",
+                f"{issue.issue_id}: an adjudicator showed the content in "
+                f"{issue.problem_name} is correct",
+            )
+            return StepOutcome(True, f"{issue.issue_id} refuted on evidence", state)
+
+        # Undecided, and that is where it stops. Not refuted -- nothing was shown -- and
+        # not escalated as a failed repair either, because no repair was attempted. The
+        # curator is told two audits disagreed and the question is open.
+        save_issue(self.db, advance_issue(issue, IssueState.UNCONFIRMED))
+        record_event(
+            self.db,
+            self.job_id,
+            "issue_unconfirmed",
+            f"{issue.issue_id}: two independent audits of {issue.problem_name} "
+            "disagreed and adjudication settled nothing",
+        )
+        return StepOutcome(True, f"{issue.issue_id} left unconfirmed", state)
+
+    def _ask_adjudicator(
+        self, issue: Issue, blind_verdict: ReviewVerdict
+    ) -> ReviewVerdict | None:
+        """One adjudication call, recorded as attempt zero under the adjudicator role."""
+        current = self.current_workbook()
+        block = current.block_by_id(issue.block_id) if issue.block_id else None
+        if block is None:
+            return None
+
+        context = adjudicator.AdjudicationContext(
+            disputed_claim=render_claim(
+                cells=issue.cells,
+                category=issue.category.value,
+                problem=issue.description,
+                expected=issue.expected,
+            ),
+            # Written down by the blind audit precisely so it survives a crash: the second
+            # audit's findings are not re-derivable without paying for the call again.
+            second_audit=blind_verdict.feedback,
+            block=render_block(block),
+            conventions=render_conventions(current.conventions),
+            deterministic_findings=render_findings(
+                self._findings_for_block(current, block)
+            ),
+            curator_rules="\n".join(f"- {rule}" for rule in self.curator_rules),
+        )
+
+        # Both claims shown here are *published* findings, but each was produced by a call
+        # that also kept a private note about the same block. An agent's own note and its
+        # own finding describe one defect in one sentence, so those two records -- and no
+        # others -- are public ground for the text they wrote.
+        public_for: dict[str, Sequence[str]] = {}
+        origin = known_issue_reviewer.origin_private_label(issue)
+        if origin:
+            public_for[origin] = (context.disputed_claim,)
+        public_for[f"blind-auditor.{issue.issue_id}"] = (context.second_audit,)
+
+        self._spend()
+        result = adjudicator.adjudicate(
+            self.client,
+            context=context,
+            block_rows=[row.row for row in block.rows],
+            job_id=self.job_id,
+            issue_id=issue.issue_id,
+            taint=self.taint,
+            public_for=public_for,
+            prompt_version=self._prompt_version(AgentRole.ADJUDICATOR),
+        )
+
+        decision = _ADJUDICATIONS[result.verdict]
+        feedback = result.evidence
+        if decision is ReviewDecision.REVISE and result.expected:
+            feedback = f"{feedback}\n\nRequired result: {result.expected}"
+        verdict = ReviewVerdict(
+            verdict_id=uuid4().hex,
+            issue_id=issue.issue_id,
+            reviewer_role=ReviewerRole.ADJUDICATOR,
+            attempt_no=0,
+            decision=decision,
+            feedback=feedback,
+            canonical_cells=result.cells,
+            canonical_category=result.category,
+        )
+        insert_verdict(self.db, verdict)
+        return verdict
 
     def _ask_blind_corroborator(self, issue: Issue) -> ReviewVerdict | None:
-        """Run a claim-blind audit and translate exact agreement into attempt zero.
+        """Run a claim-blind audit and record how it relates to the claim.
 
         This intentionally reuses the two fresh-audit agents rather than introducing a
-        fifth prompt that would drift from them.  It costs the same one physical call as
-        the former issue-framed pre-check, but removes the accusation from the payload.
+        prompt that would drift from them.  It costs the same one physical call as the
+        former issue-framed pre-check, but removes the accusation from the payload.
+
+        It **classifies and does not conclude**. Exact agreement is corroboration; nothing
+        else here is a refutation, because a from-scratch audit that did not mention a
+        cell has not examined the claim about it. Whatever it did report is written into
+        the verdict's feedback, since that text is what the adjudicator is shown next and
+        re-deriving it would mean paying for this call twice.
         """
         current = self.current_workbook()
         block = current.block_by_id(issue.block_id) if issue.block_id else None
@@ -1862,6 +2123,7 @@ class CurationCouncil:
         findings: tuple[ValidationFinding, ...] = ()
         sound = True
         inconclusive = ""
+        reviewer_role = _blind_reviewer_role(issue)
         self._spend()
         try:
             if issue.source is IssueSource.INDEPENDENT_REVIEWER:
@@ -1884,7 +2146,6 @@ class CurationCouncil:
                     result.private,
                     issue_id=issue.issue_id,
                 )
-                reviewer_role = ReviewerRole.KNOWN_ISSUE_REVIEWER
             else:
                 result = independent_reviewer.sweep_block(
                     self.client,
@@ -1900,19 +2161,20 @@ class CurationCouncil:
                 )
                 findings = result.findings
                 sound = result.block_is_sound
-                reviewer_role = ReviewerRole.INDEPENDENT_REVIEWER
         except FindingAttributionError as error:
             # An out-of-block target means the corroborator did not complete a usable
             # audit.  It is not evidence either for or against the claim.
             inconclusive = str(error)
-            reviewer_role = (
-                ReviewerRole.KNOWN_ISSUE_REVIEWER
-                if issue.source is IssueSource.INDEPENDENT_REVIEWER
-                else ReviewerRole.INDEPENDENT_REVIEWER
-            )
 
-        match = _corroborating_finding(issue, findings)
-        if match is not None:
+        outcome, matches = _classify_corroboration(issue, findings)
+
+        if inconclusive:
+            decision = ReviewDecision.HUMAN_REVIEW
+            feedback = f"The claim-blind audit was inconclusive: {inconclusive}"
+            event = "blind_claim_inconclusive"
+            rule_codes: tuple[str, ...] = ()
+        elif outcome is Corroboration.EXACT:
+            match = matches[0]
             expected = str(match.detail.get("expected") or "").strip()
             feedback = (
                 "A claim-blind audit independently found the same defect at "
@@ -1921,17 +2183,28 @@ class CurationCouncil:
             )
             decision = ReviewDecision.REVISE
             event = "blind_claim_corroborated"
-        elif inconclusive or (not sound and not findings):
-            feedback = (
-                "The claim-blind audit was inconclusive"
-                + (f": {inconclusive}" if inconclusive else ".")
-            )
-            decision = ReviewDecision.HUMAN_REVIEW
-            event = "blind_claim_inconclusive"
+            rule_codes = (match.code,)
         else:
-            feedback = ""
-            decision = ReviewDecision.ACCEPT
-            event = "blind_claim_not_corroborated"
+            decision = ReviewDecision.UNRESOLVED
+            event = "blind_claim_unresolved"
+            rule_codes = ()
+            reports = [
+                render_claim(
+                    cells=sorted(_finding_targets(finding)),
+                    category=str(finding.detail.get("category", "")) or finding.code,
+                    problem=finding.message,
+                    expected=str(finding.detail.get("expected") or "").strip(),
+                )
+                for finding in matches
+            ]
+            feedback = render_claims(reports)
+            if outcome is Corroboration.SILENT and not sound:
+                # It called the block unsound and named nothing. That is not a refutation
+                # of anything; it is one more reason the question needs settling.
+                feedback = (
+                    f"{feedback}, but reported the block as not sound without naming a "
+                    "defect."
+                )
 
         verdict = ReviewVerdict(
             verdict_id=uuid4().hex,
@@ -1940,7 +2213,7 @@ class CurationCouncil:
             attempt_no=0,
             decision=decision,
             feedback=feedback,
-            rule_codes=(match.code,) if match is not None else (),
+            rule_codes=rule_codes,
         )
         insert_verdict(self.db, verdict)
         record_event(
@@ -2244,14 +2517,29 @@ def _latest_feedback(db: Database, issue_id: str) -> str:
     return feedback
 
 
-def _verdict_for_attempt(db: Database, issue_id: str, attempt_no: int):
-    """A verdict already committed for this exact Writer attempt, if recovery needs it."""
+def _verdict_for_attempt(
+    db: Database,
+    issue_id: str,
+    attempt_no: int,
+    *,
+    reviewer_role: ReviewerRole | None = None,
+):
+    """A verdict already committed for this exact attempt, if recovery needs it.
+
+    `reviewer_role` matters only at attempt zero, where two different checks now live: the
+    claim-blind audit under whichever audit role ran it, and the adjudication under
+    `ADJUDICATOR`. Without the filter a resumed job would read the adjudicator's verdict
+    as the blind audit's -- and, finding it settled, would never adjudicate at all.
+    """
     from .models import ReviewVerdict
 
+    query = "SELECT payload_json FROM review_verdicts WHERE issue_id = ? AND attempt_no = ?"
+    parameters: tuple[object, ...] = (issue_id, attempt_no)
+    if reviewer_role is not None:
+        query += " AND reviewer_role = ?"
+        parameters += (reviewer_role.value,)
     row = db.connection.execute(
-        "SELECT payload_json FROM review_verdicts WHERE issue_id = ? AND attempt_no = ? "
-        "ORDER BY decided_at DESC LIMIT 1",
-        (issue_id, attempt_no),
+        f"{query} ORDER BY decided_at DESC LIMIT 1", parameters
     ).fetchone()
     return ReviewVerdict.model_validate_json(row["payload_json"]) if row else None
 

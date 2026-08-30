@@ -1,4 +1,4 @@
-"""Structured response schemas for the four agents.
+"""Structured response schemas for the five agents.
 
 Every model call is schema-constrained, and each schema is validated against here rather
 than parsed out of prose. The split between public artefact and private reasoning happens
@@ -195,6 +195,55 @@ class ReviewerResponse(BaseModel):
     decision: Literal["accept", "revise", "human_review"]
     feedback: str = ""
     rule_codes: list[str] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------------------
+# Adjudicator
+# --------------------------------------------------------------------------------------
+
+
+class AdjudicatorResponse(BaseModel):
+    """The settlement of a disagreement between two independent audits.
+
+    Entirely public, like a reviewer's response: an adjudication that had to withhold its
+    reasoning could not be acted on by the Writer, and its whole value is the evidence.
+
+    `undecided` is a first-class answer and not a failure. The reason this agent exists is
+    that the pipeline previously had no way to say "two audits disagreed and neither was
+    shown wrong", so it said `refuted` instead and discarded real defects. Restoring that
+    by pressuring this response into a binary would reintroduce the same loss one layer
+    further in.
+    """
+
+    verdict: Literal["defect_confirmed", "content_correct", "undecided"]
+    evidence: str = Field(
+        default="",
+        description=(
+            "The check you actually performed -- the arithmetic, the substitution, the "
+            "exact-match comparison. Required for every verdict, and most of all for "
+            "content_correct: a claim is only dismissed on evidence that it is wrong, "
+            "never on the absence of evidence that it is right"
+        ),
+    )
+    cells: list[FindingCell] = Field(
+        default_factory=list,
+        description=(
+            "For defect_confirmed: every exact cell that must change to complete the "
+            "repair, including cells neither audit named. This replaces the disputed "
+            "claim's targets, so an incomplete list leaves the defect half-repaired"
+        ),
+    )
+    category: IssueCategory = Field(
+        default=IssueCategory.MATHEMATICS,
+        description=(
+            "The canonical classification of the confirmed defect. Use structure, "
+            "row_type or dependency whenever a named cell is in Problem Name, Row Type, "
+            "answerType, HintID/Scaffold ID or Dependency"
+        ),
+    )
+    expected: str = Field(
+        default="", description="What the content should be, when you can state it"
+    )
 
 
 class IndependentFinding(BaseModel):

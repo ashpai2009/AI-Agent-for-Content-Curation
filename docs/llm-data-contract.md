@@ -117,10 +117,33 @@ deterministic findings and curator policy, but it does **not** receive the first
 issue description, target cells, explanation, proposed replacement or private reasoning.
 It audits the block from scratch using the opposite audit role. A claim is corroborated
 only when the second agent independently reports the same exact target cells and the same
-issue category. No prose-similarity or approximate-cell matching is used. A different or
-empty result refutes the unsupported claim without editing; an unusable or contradictory
-result escalates to human review. This prevents one plausible accusation from anchoring the
-agent that is supposed to verify it.
+issue category. No prose-similarity matching is used. An unusable result escalates to human
+review. This prevents one plausible accusation from anchoring the agent that is supposed to
+verify it.
+
+**A result that is neither exact agreement nor an unusable audit refutes nothing.** If the
+second audit named any cell on a disputed row it is a disagreement about extent; if it said
+nothing about those rows it is silence. Both go to the **Adjudicator**, a fifth role.
+
+### Adjudicator
+
+The Adjudicator is the only agent in this system that is shown another agent's conclusion.
+It receives both published findings, the current block, derived conventions, deterministic
+findings and curator policy. It does **not** receive any agent's private reasoning: its
+context type cannot name a private model, checked at import, and the taint registry checks
+the rendered bytes on top of that.
+
+It returns one of three verdicts with the check it ran:
+
+- `defect_confirmed` — the repair proceeds, and its cell list, category and structural
+  classification replace the disputed claim's.
+- `content_correct` — the claim is refuted. This is the only route from a model-only claim
+  to a refutation, and it requires stated evidence.
+- `undecided` — the issue ends `unconfirmed`. Nothing is edited, no attempt is spent, and
+  the job cannot report success.
+
+A verdict returned with no evidence, and a confirmation naming no cell inside the disputed
+block, are both downgraded to `undecided` before anything acts on them.
 
 When an already-accepted sibling repair may have resolved a second issue, the normal
 simulated-candidate review path is used. A changed target is then marked superseded rather

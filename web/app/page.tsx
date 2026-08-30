@@ -37,6 +37,8 @@ type Report = {
   remaining_findings: Finding[];
   integrity_findings: Finding[];
   issues_needing_a_person: { problem_name: string; title: string }[];
+  issues_unconfirmed?: number;
+  unconfirmed_issues?: { problem_name: string; title: string; description: string }[];
   instruction_claims_confirmed: number;
   instruction_claims_refuted: number;
   instruction_claims_unresolved: number;
@@ -532,6 +534,10 @@ function Result({
             <dd>{report.changes_applied}</dd>
           </div>
           <div>
+            <dt>Unconfirmed</dt>
+            <dd>{report.issues_unconfirmed ?? 0}</dd>
+          </div>
+          <div>
             <dt>Open issues</dt>
             <dd>{openIssues.length}</dd>
           </div>
@@ -572,6 +578,29 @@ function Result({
           </button>
         </div>
       </section>
+
+      {(report.unconfirmed_issues?.length ?? 0) > 0 && (
+        <section className="card">
+          <h2>Reported once, not confirmed</h2>
+          <p className="hint">
+            One audit reported these; a second, independent audit of the same block did
+            not reproduce them, and adjudication could not establish either reading.
+            Nothing was edited. They are neither confirmed defects nor cleared cells.
+          </p>
+          <table className="findings">
+            <tbody>
+              {report.unconfirmed_issues?.map((issue, index) => (
+                <tr key={index}>
+                  <td style={{ width: "30%" }}>
+                    <code>{issue.problem_name}</code>
+                  </td>
+                  <td>{issue.description || issue.title}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
 
       {report.issues_needing_a_person.length > 0 && (
         <section className="card">

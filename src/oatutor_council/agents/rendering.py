@@ -191,3 +191,85 @@ class ReviewerContext:
 
 
 assert_no_private_fields(ReviewerContext)
+
+
+# --------------------------------------------------------------------------------------
+# Adjudication context
+# --------------------------------------------------------------------------------------
+
+
+def render_claim(
+    *,
+    cells: Sequence[tuple[int, int]],
+    category: str,
+    problem: str,
+    expected: str = "",
+) -> str:
+    """One audit's published finding, in the form both sides of a dispute are shown in.
+
+    Rendered identically for both claims on purpose. The adjudicator is told which audit
+    raised which, but nothing about the layout should suggest that one of them is the
+    accusation and the other the check -- the question is which reading of the block is
+    right, not whether the second agent agrees with the first.
+    """
+    located = ", ".join(f"row {row} column {column}" for row, column in cells)
+    lines = [
+        f"cells: {located or 'not specified'}",
+        f"category: {category}",
+        f"says: {problem}",
+    ]
+    if expected:
+        lines.append(f"expected: {expected}")
+    return "\n".join(lines)
+
+
+def render_claims(claims: Sequence[str]) -> str:
+    if not claims:
+        return "nothing about these cells"
+    return "\n\n".join(f"[{index + 1}] {claim}" for index, claim in enumerate(claims))
+
+
+@dataclass(frozen=True)
+class AdjudicationContext:
+    """Everything the adjudicator is given, and nothing else.
+
+    Deliberately **not** claim-blind, which is the one place this pipeline shows an agent
+    another agent's conclusion. That is the whole job: deciding between two readings of a
+    block is not something a blind observer can do, and the blind check that came before
+    it has already been made and has already failed to settle the question.
+
+    The anchoring risk is real and is paid for elsewhere -- the prompt requires the
+    adjudicator to re-derive the mathematics itself and to state the check it ran, and
+    `undecided` is an available answer precisely so that agreeing with whichever claim
+    sounds more confident is never the cheapest route to a decision.
+
+    Both claims here are *published findings*. No private reasoning can reach this type:
+    `assert_no_private_fields` checks that at import, exactly as it does for reviewers.
+    """
+
+    disputed_claim: str
+    second_audit: str
+    block: str
+    conventions: str
+    deterministic_findings: str
+    curator_rules: str = ""
+
+    def sections(self) -> tuple[DataSection, ...]:
+        sections = [
+            DataSection("The disputed claim, from the first audit", self.disputed_claim),
+            DataSection(
+                "What a second, independent audit of the same block reported",
+                self.second_audit,
+            ),
+            DataSection("The block as it stands now", self.block),
+            DataSection("Conventions this workbook follows", self.conventions),
+            DataSection("Deterministic findings still open", self.deterministic_findings),
+        ]
+        if self.curator_rules.strip():
+            sections.append(
+                DataSection("Curation rules the curator supplied", self.curator_rules)
+            )
+        return tuple(sections)
+
+
+assert_no_private_fields(AdjudicationContext)
