@@ -1168,6 +1168,39 @@ class CurationCouncil:
             JobState.AUDITING,
         )
 
+    def _verification_defects(self, block: ProblemBlock, result) -> list[str]:
+        """Reasons this verification cannot stand as a certification of the block.
+
+        Three, and each was a way through the gate before it was checked here:
+
+        * **Graded rows unaccounted for.** The row was not examined; an empty findings
+          list says nothing about it.
+        * **Unsound with nothing named.** An agent that reports the block is not sound and
+          then names no defect has told us something is wrong and refused to say what.
+          Only coverage was checked before this, so the block was marked verified on the
+          strength of an answer that explicitly denied it was.
+        * **A record that refutes itself.** A row claiming the answer is correct while its
+          own computed and submitted values differ cannot be read either way. It was
+          flagged as an event and otherwise ignored, which meant the job could still report
+          success over a certification that disagreed with itself.
+        """
+        reasons: list[str] = []
+        if result.coverage_gaps:
+            listed = ", ".join(str(row) for row in result.coverage_gaps)
+            reasons.append(f"graded row(s) {listed} were not accounted for")
+        if not result.block_is_sound and not result.findings:
+            reasons.append(
+                "the block was reported as not sound without naming a single defect"
+            )
+        contradictions = self_contradicting(result.coverage)
+        if contradictions:
+            listed = ", ".join(str(row) for row in contradictions)
+            reasons.append(
+                f"row(s) {listed} are reported correct while their own computed and "
+                "submitted answers differ"
+            )
+        return reasons
+
     def _persist_coverage(
         self, block_id: str, phase: str, call_id: str, records
     ) -> None:
@@ -1347,17 +1380,45 @@ class CurationCouncil:
         )
 
     def _verify_block(self, parsed: ParsedWorkbook, block: ProblemBlock) -> StepOutcome:
-        """One block, one call, one marker -- or no marker and a recorded reason."""
+        """One block, one call, one marker -- or no marker and a recorded reason.
+
+        **The marker is the assertion, so everything that undermines it withholds it.** A
+        verification that did not account for every graded row, that called the block
+        unsound without saying what is wrong, that contradicted itself, or that named a
+        row outside the block has not established anything about this block, and marking it
+        would launder a non-answer into a certification. Each case leaves the block on the
+        queue and each is bounded by the same round budget, so none of them can loop.
+        """
         self._spend()
-        result = final_verifier.verify_block(
-            self.client,
-            block=block,
-            conventions=parsed.conventions,
-            curator_rules=self.curator_rules,
-            job_id=self.job_id,
-            taint=self.taint,
-            prompt_version=self._prompt_version(AgentRole.FINAL_VERIFIER),
-        )
+        try:
+            result = final_verifier.verify_block(
+                self.client,
+                block=block,
+                conventions=parsed.conventions,
+                curator_rules=self.curator_rules,
+                job_id=self.job_id,
+                taint=self.taint,
+                prompt_version=self._prompt_version(AgentRole.FINAL_VERIFIER),
+            )
+        except FindingAttributionError as error:
+            # The round is counted first. A rejected answer that did not count would let
+            # a model naming a foreign row every time hold the phase open indefinitely.
+            record_event(
+                self.db, self.job_id, "final_verification", f"{block.block_id} rejected"
+            )
+            record_event(
+                self.db,
+                self.job_id,
+                "final_verification_rejected",
+                f"{block.block_id} {error}; the whole result was discarded rather than "
+                "pruned to its in-block part",
+            )
+            return StepOutcome(
+                True,
+                f"{block.block_id} verification rejected; will verify again",
+                JobState.FINAL_SEMANTIC,
+            )
+
         self._persist_coverage(
             block.block_id, FINAL_SEMANTIC_PHASE, result.call_id, result.coverage
         )
@@ -1380,16 +1441,15 @@ class CurationCouncil:
         )
         opened = found.opened + found.reopened
 
-        if result.coverage_gaps:
-            # Not marked. The same rule the scan phases use, with a harder consequence:
-            # there is no later phase to catch what this one did not look at.
-            listed = ", ".join(str(row) for row in result.coverage_gaps)
+        withheld = self._verification_defects(block, result)
+        if withheld:
+            # Not marked. The same rule the scan phases use for coverage, with a harder
+            # consequence: there is no later phase to catch what this one did not do.
             record_event(
                 self.db,
                 self.job_id,
                 "final_verification_short",
-                f"{block.block_id} final verification did not account for graded "
-                f"row(s) {listed}",
+                f"{block.block_id} final verification withheld: {'; '.join(withheld)}",
             )
             return StepOutcome(
                 True,

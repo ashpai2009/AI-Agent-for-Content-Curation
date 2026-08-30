@@ -1643,6 +1643,11 @@ def rediscovery_counts(db: Database, job_id: str) -> dict[str, int]:
             # Blocks whose last independent check predates their last edit. Distinct from
             # `rows_never_verified`, which is about rows nobody examined at all.
             "final_verification_incomplete",
+            # A scan whose own record disagrees with itself. Counted for every phase, not
+            # only the final one: an initial audit that reported a row correct while its
+            # computed and submitted answers differed is a reason to look at that row, and
+            # the phase it happened in does not change that.
+            "coverage_self_contradicting",
         )
     }
 

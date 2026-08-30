@@ -351,6 +351,12 @@ def _validation_report(
         "final_verification_incomplete": bool(
             (rediscoveries or {}).get("final_verification_incomplete", 0)
         ),
+        # Scans that reported a row correct while their own computed and submitted answers
+        # for it differed. Not a defect count -- the row may be fine and the record merely
+        # sloppy -- but the record cannot be read either way, so it is a row to look at.
+        "contradictory_coverage_records": (rediscoveries or {}).get(
+            "coverage_self_contradicting", 0
+        ),
         "instruction_claims": resolved_claims,
         # One flag on every stored segment records a document-wide event. Surface it in
         # the report so a bounded extraction is never mistaken for complete instructions.
@@ -393,6 +399,13 @@ def _coverage_sentence(report: dict[str, Any]) -> str:
         sentences.append(
             f" {count} block(s) contain graded rows that no scan ever accounted for; "
             "those rows were not examined, and nothing here says whether they are correct."
+        )
+    contradictions = report.get("contradictory_coverage_records", 0)
+    if contradictions:
+        sentences.append(
+            f" {contradictions} scan(s) reported a row correct while their own derived "
+            "and recorded answers for it differed; those rows cannot be read either way "
+            "and should be checked."
         )
     if report.get("final_verification_incomplete"):
         sentences.append(
@@ -492,6 +505,8 @@ def render_markdown(reports: JobReports) -> str:
         f"{validation.get('blocks_with_unverified_rows', 0)}",
         "- Checked after the last correction: "
         + ("no" if validation.get("final_verification_incomplete") else "yes"),
+        f"- Self-contradicting coverage records: "
+        f"{validation.get('contradictory_coverage_records', 0)}",
         f"- Cells changed: {validation['changes_applied']}",
         f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
     ]

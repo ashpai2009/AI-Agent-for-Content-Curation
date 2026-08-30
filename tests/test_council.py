@@ -51,7 +51,9 @@ from oatutor_council.models import (
 )
 from oatutor_council.persistence import (
     Database,
+    blocks_done,
     create_job,
+    get_job,
     insert_attempt,
     insert_issue,
     list_changes,
@@ -782,6 +784,189 @@ def test_a_final_verification_finding_cannot_edit_without_corroboration(setup):
     assert verifier_issue.attempts_used == 0
     assert client.call_count(AgentRole.ADJUDICATOR) == 1
     assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+
+
+def _verifier_only(response_for_verifier):
+    """A council where everything is clean except what the verifier is scripted to say."""
+
+    def reply(request):
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return response_for_verifier(request)
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            if "The issue under review" in request.user_payload:
+                return ReviewerResponse(decision="accept")
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    return client
+
+
+def test_unsound_with_nothing_named_is_not_a_verification(setup):
+    """"Something is wrong and I will not say what" must not certify a block.
+
+    Complete coverage, `block_is_sound=false`, zero findings. Only coverage was checked
+    before, so the block was marked verified on the strength of an answer that explicitly
+    denied it was sound -- the one response in the schema that says "do not trust this".
+    """
+    db, _ = setup
+    client = _verifier_only(
+        lambda request: FinalVerificationResponse(
+            block_is_sound=False, coverage=full_coverage(request.user_payload)
+        )
+    )
+
+    result = council(setup, client).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    kinds = [event["kind"] for event in list_events(db, "job-1")]
+    assert "final_verification_short" in kinds
+    assert "final_verification_incomplete" in kinds
+    verified = blocks_done(db, "job-1", "final_semantic")
+    assert verified == frozenset()
+
+
+def test_a_finding_reaching_outside_the_block_rejects_the_whole_result(setup):
+    """One valid target and one foreign one is not a repair with a stray coordinate.
+
+    Keeping the in-block half would authorise an edit the verifier never proposed: a
+    finding naming an answer here and a cell elsewhere describes *one* repair, and half of
+    it is an incomplete repair that then passes review because the reviewer only sees the
+    half that survived. It is also evidence the agent was not reading this block.
+    """
+    db, _ = setup
+    client = _verifier_only(
+        lambda request: FinalVerificationResponse(
+            block_is_sound=False,
+            coverage=full_coverage(request.user_payload),
+            findings=[
+                IndependentFinding(
+                    cells=[
+                        {"row": 3, "column": "answer"},
+                        {"row": 900, "column": "answer"},
+                    ],
+                    problem="The answer and something two blocks away disagree.",
+                    category="mathematics",
+                )
+            ],
+        )
+    )
+
+    result = council(setup, client).run()
+
+    kinds = [event["kind"] for event in list_events(db, "job-1")]
+    assert "final_verification_rejected" in kinds
+    # Nothing was salvaged from it: no issue was opened at the valid half.
+    assert not [
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.source is IssueSource.FINAL_VERIFICATION
+    ]
+    assert blocks_done(db, "job-1", "final_semantic") == frozenset()
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    # Bounded: a model that names a foreign row every time cannot hold the phase open.
+    assert client.call_count(AgentRole.FINAL_VERIFIER) == 2
+
+
+def test_contradictory_final_coverage_withholds_the_marker(setup):
+    """A record that reports a row correct while its own two answers differ.
+
+    It was flagged as an event and otherwise ignored, so the job could report success over
+    a certification that disagreed with itself. It cannot be read either way, so it does
+    not certify anything, and at the round limit the job needs a person.
+    """
+    db, _ = setup
+
+    def verifier(request):
+        records = full_coverage(request.user_payload)
+        records[0] = records[0].model_copy(
+            update={"computed_answer": "6", "submitted_answer": "5"}
+        )
+        return FinalVerificationResponse(block_is_sound=True, coverage=records)
+
+    client = _verifier_only(verifier)
+    result = council(setup, client).run()
+
+    assert blocks_done(db, "job-1", "final_semantic") == frozenset()
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    kinds = [event["kind"] for event in list_events(db, "job-1")]
+    assert "coverage_self_contradicting" in kinds
+    assert "final_verification_incomplete" in kinds
+
+
+def test_a_contradictory_audit_record_reaches_the_report(setup):
+    """An earlier phase's contradiction is a row to look at, and must be visible.
+
+    The final phase withholds its marker for one of these. The audit and sweep phases
+    cannot -- a contradiction there is not grounds to refuse the workbook -- so the only
+    thing that makes them useful is that a curator can see them, which means the report
+    rather than a table nobody queries.
+    """
+    db, _ = setup
+
+    def reply(request):
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            records = full_coverage(request.user_payload)
+            records[0] = records[0].model_copy(
+                update={"computed_answer": "6", "submitted_answer": "5"}
+            )
+            return AuditorResponse(coverage=records)
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            if "The issue under review" in request.user_payload:
+                return ReviewerResponse(decision="accept")
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    council(setup, client).run()
+
+    from oatutor_council.persistence import latest_findings, rediscovery_counts
+    from oatutor_council.reporting.reports import build_reports, render_markdown
+
+    reports = build_reports(
+        job_id="job-1",
+        state=get_job(db, "job-1").state,
+        ledger=load_ledger(db, "job-1"),
+        changes=list_changes(db, "job-1"),
+        verdicts=list_verdicts(db, "job-1"),
+        attempts=list_attempts(db, "job-1"),
+        findings=latest_findings(db, "job-1", kind="content"),
+        rediscoveries=rediscovery_counts(db, "job-1"),
+    )
+    assert reports.validation_report["contradictory_coverage_records"] >= 1
+    assert "differed" in reports.validation_report["unresolved_summary"]
+    assert "Self-contradicting coverage records: 1" in render_markdown(reports)
+
+
+def test_one_verifier_call_per_unchanged_block(setup):
+    """The cost promise. A sound, complete, self-consistent answer is accepted at once."""
+    client = quiet_client()
+    result = council(setup, client).run()
+
+    assert client.call_count(AgentRole.FINAL_VERIFIER) == 1
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
 
 
 def test_a_repair_invalidates_the_verification_that_preceded_it(setup):

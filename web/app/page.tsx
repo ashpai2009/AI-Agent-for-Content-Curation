@@ -40,6 +40,7 @@ type Report = {
   issues_unconfirmed?: number;
   blocks_with_unverified_rows?: number;
   final_verification_incomplete?: boolean;
+  contradictory_coverage_records?: number;
   unconfirmed_issues?: { problem_name: string; title: string; description: string }[];
   instruction_claims_confirmed: number;
   instruction_claims_refuted: number;
@@ -563,6 +564,17 @@ function Result({
               The integrity check did not pass. Something in the output file cannot be
               traced to an approved edit, so do not use it until the findings below are
               understood.
+            </p>
+          </div>
+        )}
+
+        {(report.contradictory_coverage_records ?? 0) > 0 && (
+          <div className="notice" style={{ marginTop: 16 }}>
+            <p>
+              {report.contradictory_coverage_records} check(s) reported a row correct
+              while the answer they derived and the answer recorded in the workbook
+              differed. Those records cannot be read either way — look at the rows they
+              name before publishing.
             </p>
           </div>
         )}

@@ -41,6 +41,7 @@ from ..models import (
     ValidationFinding,
     WorkbookConventions,
 )
+from .batching import FindingAttributionError
 from .coverage import coverage_gaps
 from .isolation import TaintRegistry
 from .rendering import FinalVerificationContext, render_block, render_conventions
@@ -121,11 +122,29 @@ def verify_block(
         FinalVerificationResponse,
     )
 
-    findings = tuple(
-        _to_finding(item, block)
+    # **Any target outside the block rejects the whole result**, rather than the in-block
+    # part of it being kept. Pruning looks conservative and is not: a finding naming an
+    # answer here and its choice list two blocks away describes one repair, and keeping
+    # half of it authorises an edit the verifier never proposed -- an incomplete repair
+    # that then passes review because the reviewer is shown the half that survived. It is
+    # also evidence the agent was not reading this block, which is not a thing to salvage
+    # a partial answer from. Same rule the batch reader applies, and the same exception.
+    stray = [
+        (item, cell)
         for item in response.findings
-        if any(block.contains_row(cell.row) for cell in item.cells)
-    )
+        for cell in item.cells
+        if not block.contains_row(cell.row)
+    ]
+    if stray:
+        named = ", ".join(
+            f"row {cell.row}" for _, cell in stray[:3]
+        ) + ("…" if len(stray) > 3 else "")
+        raise FindingAttributionError(
+            f"final verification of {block.block_id} named {named}, outside rows "
+            f"{block.start_row}-{block.end_row}"
+        )
+
+    findings = tuple(_to_finding(item, block) for item in response.findings)
     return VerificationResult(
         block_id=block.block_id,
         findings=findings,
@@ -140,13 +159,13 @@ def verify_block(
 
 
 def _to_finding(item, block: ProblemBlock) -> ValidationFinding:
-    """One published finding, with every target cell it named inside this block.
+    """One published finding. Every cell is already known to be inside this block.
 
-    Cells outside the block are dropped rather than relocated, and a finding left with no
-    cell at all is discarded by the caller. Relocating a stray coordinate would invent a
-    claim about a row nobody examined.
+    The caller rejects the entire response if any target was outside, so there is nothing
+    to filter here -- and deliberately no filtering, because a silent filter is how a
+    partial repair gets authorised.
     """
-    cells = [cell for cell in item.cells if block.contains_row(cell.row)]
+    cells = list(item.cells)
     primary = cells[0]
     column = FIXED_COLUMNS[column_key(primary.column)]
     return ValidationFinding(
