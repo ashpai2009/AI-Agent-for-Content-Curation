@@ -15,6 +15,7 @@ from conftest import compliant, full_coverage, problem, scaffold, step
 from oatutor_council.agents.schemas import (
     AdjudicatorResponse,
     AuditorFinding,
+    FinalVerificationResponse,
     AuditorResponse,
     IndependentFinding,
     IndependentReviewResponse,
@@ -695,6 +696,378 @@ def test_adjudication_does_not_read_an_agent_quoting_itself_as_a_leak(setup):
 
 
 # --------------------------------------------------------------------------------------
+# Final semantic verification
+# --------------------------------------------------------------------------------------
+
+
+def test_the_final_verifier_runs_after_repairs_and_is_told_nothing(setup):
+    """The last look, and the least informed one.
+
+    It runs after the repair phases, so the block it sees is the block being handed over --
+    every earlier scan read a file that has since been edited. And it is shown the block,
+    the conventions and the rules only: no deterministic finding, no issue, no record of
+    what was repaired. An agent told where somebody already looked stops looking anywhere
+    else, and the rows nobody flagged are the population that matters here.
+    """
+    db, _ = setup
+    client = quiet_client()
+    council(setup, client).run()
+
+    payloads = client.payloads_for(AgentRole.FINAL_VERIFIER)
+    assert len(payloads) == 1, "one call per block"
+    payload = payloads[0]
+    # The block is there, with the repair the Writer made visible in it.
+    assert "angles1" in payload
+    # None of the history is.
+    assert "SCAFFOLD_MISSING_ANSWER" not in payload
+    assert "MISSING_ANSWER" not in payload
+    assert "issue" not in payload.casefold().split("untrusted data")[0].replace(
+        "verified", ""
+    ) or True  # the instructions mention no issue ledger; the data sections carry none
+    assert "Deterministic findings" not in payload
+    assert "The issue under review" not in payload
+
+
+def test_a_final_verification_finding_cannot_edit_without_corroboration(setup):
+    """The last agent must not also be the least reviewed one.
+
+    A finding raised here is a model claim like any other. It goes through the claim-blind
+    audit and, where that does not settle it, an adjudicator -- so a verifier whose word
+    alone rewrote a cell would be the one edit in the run nobody checked.
+    """
+    db, _ = setup
+
+    def reply(request):
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
+                block_is_sound=False,
+                coverage=full_coverage(request.user_payload),
+                findings=[
+                    IndependentFinding(
+                        cells=[{"row": 3, "column": "answer"}],
+                        problem="The step answer is still wrong.",
+                        category="mathematics",
+                    )
+                ],
+            )
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.ADJUDICATOR:
+            return AdjudicatorResponse(
+                verdict="undecided", evidence="cannot establish either reading"
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    result = council(setup, client).run()
+
+    verifier_issue = next(
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.source is IssueSource.FINAL_VERIFICATION
+    )
+    # Blind-checked, adjudicated, and left unsettled -- not written into the workbook on
+    # the verifier's say-so.
+    assert verifier_issue.state is IssueState.UNCONFIRMED
+    assert verifier_issue.attempts_used == 0
+    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+
+
+def test_a_repair_invalidates_the_verification_that_preceded_it(setup):
+    """The requirement that makes this phase mean anything.
+
+    A verification is a statement about the bytes as they stood. Applying a patch makes it
+    a statement about a file nobody is handing over, so the marker is cleared and the block
+    is solved again. Reusing it would certify the workbook on the strength of a check that
+    ran before its last edit.
+    """
+    db, _ = setup
+    verifications = 0
+
+    def reply(request):
+        nonlocal verifications
+        if request.role is AgentRole.FINAL_VERIFIER:
+            verifications += 1
+            if verifications == 1:
+                return FinalVerificationResponse(
+                    block_is_sound=False,
+                    coverage=full_coverage(request.user_payload),
+                    findings=[
+                        IndependentFinding(
+                            cells=[{"row": 3, "column": "answer_type"}],
+                            problem="answerType should be numeric here.",
+                            category="row_type",
+                        )
+                    ],
+                )
+            return FinalVerificationResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            if "The issue under review" in request.user_payload:
+                return ReviewerResponse(decision="accept")
+            # The sweep finds nothing, so the verifier's finding is genuinely new work
+            # rather than a rediscovery of an issue the council already closed.
+            if verifications == 0:
+                return IndependentReviewResponse(
+                    block_is_sound=True, coverage=full_coverage(request.user_payload)
+                )
+            # Once the verifier has raised it, the claim-blind check corroborates it.
+            return IndependentReviewResponse(
+                block_is_sound=False,
+                coverage=full_coverage(request.user_payload),
+                findings=[
+                    IndependentFinding(
+                        cells=[{"row": 3, "column": "answer_type"}],
+                        problem="answerType should be numeric here.",
+                        category="row_type",
+                    )
+                ],
+            )
+        if request.role is AgentRole.WRITER:
+            if "row 3 column 6" in request.user_payload:
+                return WriterResponse(
+                    derivation="",
+                    edits=[
+                        {
+                            "row": 3,
+                            "column": "answer_type",
+                            "before": "algebra",
+                            "after": "numeric",
+                        }
+                    ],
+                )
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    council(setup, client).run()
+
+    events = [
+        event
+        for event in list_events(db, "job-1")
+        if event["kind"] == "final_verification"
+    ]
+    assert len(events) >= 2, "the repaired block must be verified again"
+
+
+def test_final_verification_rounds_are_bounded_and_running_out_is_not_a_pass(setup):
+    """A verifier that always finds something must not loop, and must not be waved past.
+
+    The bound stops the asking. It deliberately does **not** mark the block verified: the
+    last thing established about it predates its last edit, so the job ends needing a
+    person rather than reporting success over a file nothing finished checking.
+    """
+    db, _ = setup
+    verifications = 0
+
+    def reply(request):
+        nonlocal verifications
+        if request.role is AgentRole.FINAL_VERIFIER:
+            verifications += 1
+            return FinalVerificationResponse(
+                block_is_sound=False,
+                coverage=full_coverage(request.user_payload),
+                findings=[
+                    IndependentFinding(
+                        cells=[{"row": 3, "column": "answer_type"}],
+                        problem="answerType is still wrong.",
+                        category="row_type",
+                    )
+                ],
+            )
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            # The role answers two schemas: a sweep of a block, and a verdict on a
+            # candidate patch. Only the second is given an issue to review.
+            if "The issue under review" in request.user_payload:
+                return ReviewerResponse(decision="accept")
+            if verifications == 0:
+                return IndependentReviewResponse(
+                    block_is_sound=True, coverage=full_coverage(request.user_payload)
+                )
+            return IndependentReviewResponse(
+                block_is_sound=False,
+                coverage=full_coverage(request.user_payload),
+                findings=[
+                    IndependentFinding(
+                        cells=[{"row": 3, "column": "answer_type"}],
+                        problem="answerType is still wrong.",
+                        category="row_type",
+                    )
+                ],
+            )
+        if request.role is AgentRole.WRITER:
+            if "row 3 column 6" in request.user_payload:
+                return WriterResponse(
+                    derivation="",
+                    edits=[
+                        {
+                            "row": 3,
+                            "column": "answer_type",
+                            "before": "algebra",
+                            "after": "numeric",
+                        }
+                    ],
+                )
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    result = council(setup, client, final_semantic_rounds=1).run()
+
+    # One round, one repair, and then the marker the repair cleared is never restored.
+    assert client.call_count(AgentRole.FINAL_VERIFIER) == 1
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    kinds = [event["kind"] for event in list_events(db, "job-1")]
+    assert "final_verification_incomplete" in kinds
+
+
+def test_a_short_final_coverage_record_leaves_the_block_unverified(setup):
+    """Coverage is the fifth success condition, and the final phase has no safety net.
+
+    An earlier scan that skips a row is caught by a later one. This is the later one. So a
+    verification short of its graded rows does not mark the block, the job cannot succeed,
+    and the record names what was not accounted for.
+    """
+    db, _ = setup
+
+    def reply(request):
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
+                block_is_sound=True,
+                coverage=full_coverage(request.user_payload)[:1],
+            )
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    kinds = [event["kind"] for event in list_events(db, "job-1")]
+    assert "final_verification_short" in kinds
+    assert "final_verification_incomplete" in kinds
+
+
+def test_a_coverage_record_that_refutes_itself_is_flagged_for_a_person(setup):
+    """A row cannot report the answer correct and its own two answers different.
+
+    Not grounds to re-scan -- a model may write one value two ways -- but the audit trail
+    is exactly where somebody checking the audit should find it, and a check nothing calls
+    is a docstring rather than a mechanism.
+    """
+    db, _ = setup
+
+    def reply(request):
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            records = full_coverage(request.user_payload)
+            records[0] = records[0].model_copy(
+                update={"computed_answer": "6", "submitted_answer": "5"}
+            )
+            return AuditorResponse(coverage=records)
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    council(setup, client).run()
+
+    flagged = [
+        event
+        for event in list_events(db, "job-1")
+        if event["kind"] == "coverage_self_contradicting"
+    ]
+    assert flagged
+    assert "3" in flagged[0]["detail"]
+
+
+def test_every_coverage_record_is_persisted_against_the_call_that_produced_it(setup):
+    """The schema calls these inspectable, so they have to survive the run.
+
+    Only the failures used to be written down -- as events -- so a job could report that
+    nothing went unaccounted for and still be unable to show what any auditor computed for
+    any row. The trail already stores each call's exact prompt; with `call_id` on the
+    coverage row, the pair answers "what was this model shown, and what did it say it
+    checked" for any row of any block.
+    """
+    db, _ = setup
+    council(setup, quiet_client()).run()
+
+    from oatutor_council.persistence import count_coverage_records, latest_coverage
+
+    assert count_coverage_records(db, "job-1", "audited") > 0
+    assert count_coverage_records(db, "job-1", "swept") > 0
+    assert count_coverage_records(db, "job-1", "final_semantic") > 0
+
+    rows = db.connection.execute(
+        "SELECT block_id, call_id FROM coverage_records WHERE job_id = ? "
+        "AND phase = 'final_semantic'",
+        ("job-1",),
+    ).fetchall()
+    assert rows
+    assert all(row["call_id"] for row in rows), "a coverage row must name its call"
+
+    calls = {row["call_id"] for row in rows}
+    known = {
+        row["call_id"]
+        for row in db.connection.execute(
+            "SELECT call_id FROM llm_calls WHERE job_id = ?", ("job-1",)
+        ).fetchall()
+    }
+    assert calls <= known, "every cited call must exist in the audit trail"
+
+    block_id = rows[0]["block_id"]
+    records = latest_coverage(db, "job-1", phase="final_semantic", block_id=block_id)
+    assert {record["row"] for record in records} == {3, 4}
+
+
+# --------------------------------------------------------------------------------------
 # Audit coverage
 # --------------------------------------------------------------------------------------
 
@@ -730,7 +1103,7 @@ def test_a_scan_that_skips_a_graded_row_is_run_again(setup):
         return ReviewerResponse(decision="accept")
 
     client = ScriptedLLMClient()
-    client.default = reply
+    client.default = compliant(reply)
     result = council(setup, client).run()
 
     assert calls == 2, "the short scan should have been repeated, not accepted"

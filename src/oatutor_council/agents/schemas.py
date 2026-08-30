@@ -367,5 +367,29 @@ class BatchedIndependentReviewResponse(BaseModel):
     results: list[IndependentBlockResult] = Field(default_factory=list)
 
 
+# --------------------------------------------------------------------------------------
+# Final Semantic Verifier
+# --------------------------------------------------------------------------------------
+
+
+class FinalVerificationResponse(BaseModel):
+    """The last word on the corrected workbook, from an agent shown nothing else.
+
+    Structurally close to `IndependentReviewResponse` and deliberately a separate type.
+    The two answer different questions -- one sweeps a workbook mid-repair, the other
+    certifies the file about to be handed over -- and sharing a model would mean a field
+    added for one silently changed the contract of the other.
+
+    There is no private field and no reasoning field. This agent publishes everything it
+    concludes, because a certification whose grounds are withheld cannot be checked.
+    """
+
+    findings: list[IndependentFinding] = Field(default_factory=list)
+    #: Mandatory, and the reason this phase can mean anything. `findings` says what is
+    #: wrong; only coverage says which rows were solved to find out.
+    coverage: list[RowCoverage] = Field(default_factory=list)
+    block_is_sound: bool = True
+
+
 def column_key(name: str) -> ColumnKey:
     return ColumnKey(name)

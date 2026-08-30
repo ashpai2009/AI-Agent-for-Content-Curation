@@ -345,6 +345,12 @@ def _validation_report(
         "blocks_with_unverified_rows": (rediscoveries or {}).get(
             "rows_never_verified", 0
         ),
+        # Whether the workbook as handed over was semantically checked after its last
+        # accepted repair. Zero is the only reassuring value; anything else means the most
+        # recent independent look at some block predates its most recent change.
+        "final_verification_incomplete": bool(
+            (rediscoveries or {}).get("final_verification_incomplete", 0)
+        ),
         "instruction_claims": resolved_claims,
         # One flag on every stored segment records a document-wide event. Surface it in
         # the report so a bounded extraction is never mistaken for complete instructions.
@@ -381,13 +387,20 @@ def _count_claims(resolved: Sequence[dict[str, Any]], outcome: ClaimOutcome) -> 
 
 
 def _coverage_sentence(report: dict[str, Any]) -> str:
+    sentences = []
     count = report.get("blocks_with_unverified_rows", 0)
-    if not count:
-        return ""
-    return (
-        f" {count} block(s) contain graded rows that no scan ever accounted for; those "
-        "rows were not examined, and nothing here says whether they are correct."
-    )
+    if count:
+        sentences.append(
+            f" {count} block(s) contain graded rows that no scan ever accounted for; "
+            "those rows were not examined, and nothing here says whether they are correct."
+        )
+    if report.get("final_verification_incomplete"):
+        sentences.append(
+            " Part of this workbook was not re-checked after its last accepted "
+            "correction, so the most recent independent look at it predates its most "
+            "recent change."
+        )
+    return "".join(sentences)
 
 
 def unresolved_summary(
@@ -477,6 +490,8 @@ def render_markdown(reports: JobReports) -> str:
         f"- Issues left unconfirmed: {validation.get('issues_unconfirmed', 0)}",
         f"- Blocks with rows nothing examined: "
         f"{validation.get('blocks_with_unverified_rows', 0)}",
+        "- Checked after the last correction: "
+        + ("no" if validation.get("final_verification_incomplete") else "yes"),
         f"- Cells changed: {validation['changes_applied']}",
         f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
     ]

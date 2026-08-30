@@ -28,6 +28,7 @@ local subscription login through its restricted child environment.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
 from ..persistence import Database, record_llm_call
@@ -92,8 +93,13 @@ class RecordingClient:
         except Exception as error:
             self._record(request, started, status=_status_of(error), error=error)
             raise
-        self._record(request, started, status=response.status, response=response)
-        return response
+        call_id = self._record(
+            request, started, status=response.status, response=response
+        )
+        # Returned on the response so a derived record -- a coverage row -- can cite the
+        # physical invocation it came from. `LLMResponse` is a frozen-in-practice value
+        # object built by the inner client, so this is the one place that knows both.
+        return replace(response, call_id=call_id)
 
     def _record(
         self,
@@ -103,7 +109,7 @@ class RecordingClient:
         status: str,
         response: LLMResponse | None = None,
         error: Exception | None = None,
-    ) -> None:
+    ) -> str:
         system_prompt, system_clipped = _clip(request.system_prompt)
         payload, payload_clipped = _clip(request.user_payload)
         detail: dict[str, Any] = {
@@ -121,7 +127,7 @@ class RecordingClient:
             detail["error"] = sanitize_provider_message(str(error))
             detail["error_type"] = type(error).__name__
 
-        record_llm_call(
+        return record_llm_call(
             self._db,
             self._job_id,
             role=request.role.value,

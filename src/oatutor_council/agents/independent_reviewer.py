@@ -18,7 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from ..llm.base import AgentRole, LLMClient, LLMRequest, call_structured
+from ..llm.base import (
+    AgentRole,
+    LLMClient,
+    LLMRequest,
+    call_structured_recorded,
+)
 from ..llm.context import ContextBundle, DataSection
 from ..llm.prompts import system_prompt
 from ..models import (
@@ -63,6 +68,7 @@ class SweepResult:
     #: about rows it did not say it looked at.
     coverage: tuple[RowCoverage, ...] = ()
     coverage_gaps: tuple[int, ...] = ()
+    call_id: str = ""
 
 
 def sweep_block(
@@ -105,7 +111,7 @@ def sweep_block(
             public=(block_text, conventions_text, findings_text, rules_text),
         )
 
-    response = call_structured(
+    response, call_id = call_structured_recorded(
         client,
         LLMRequest(
             role=AgentRole.INDEPENDENT_REVIEWER,
@@ -127,6 +133,7 @@ def sweep_block(
         block_is_sound=response.block_is_sound and not findings,
         coverage=tuple(response.coverage),
         coverage_gaps=coverage_gaps(block, response.coverage),
+        call_id=call_id,
     )
 
 
@@ -282,7 +289,7 @@ def sweep_blocks(
             public=tuple(section.content for section in sections),
         )
 
-    response = call_structured(
+    response, call_id = call_structured_recorded(
         client,
         LLMRequest(
             role=AgentRole.INDEPENDENT_REVIEWER,
@@ -328,6 +335,7 @@ def sweep_blocks(
                 block_is_sound=result.block_is_sound and not findings,
                 coverage=tuple(result.coverage),
                 coverage_gaps=coverage_gaps(item.block, result.coverage),
+                call_id=call_id,
             )
         )
 

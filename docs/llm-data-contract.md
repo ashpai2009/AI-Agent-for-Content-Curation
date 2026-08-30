@@ -132,6 +132,18 @@ were checked. A response short of its graded rows is scanned again rather than a
 row nothing ever accounts for is recorded and denies the job success. No workbook content
 leaves the service to make this happen: it is a field on the same response.
 
+### Final Semantic Verifier
+
+Runs after every repair and before deterministic validation. It receives the problem block
+as the workbook now stands, the derived conventions, and the curator's policy rules — and
+nothing else. No deterministic findings, no issue ledger, no repair history, no earlier
+finding, no answer key, and no agent's private reasoning.
+
+It returns findings with exact cells and the same mandatory per-graded-row coverage
+records. It never edits: its findings go through claim-blind corroboration and adjudication
+like any other model claim. A block's verification is discarded whenever a repair is
+applied to it, and the block is verified again.
+
 ### Adjudicator
 
 The Adjudicator is the only agent in this system that is shown another agent's conclusion.

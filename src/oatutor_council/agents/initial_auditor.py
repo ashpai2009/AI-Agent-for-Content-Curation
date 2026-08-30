@@ -19,7 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from ..llm.base import AgentRole, LLMRequest, LLMClient, call_structured
+from ..llm.base import (
+    AgentRole,
+    LLMClient,
+    LLMRequest,
+    call_structured_recorded,
+)
 from ..llm.context import ContextBundle, DataSection
 from ..llm.prompts import system_prompt
 from ..models import (
@@ -93,6 +98,9 @@ class AuditResult:
     #: rows those were.
     coverage: tuple[RowCoverage, ...] = ()
     coverage_gaps: tuple[int, ...] = ()
+    #: The `llm_calls` row this result was parsed from, so a persisted coverage record can
+    #: name the invocation it came from instead of being an unsourced assertion.
+    call_id: str = ""
 
 
 INSTRUCTIONS = """\
@@ -184,7 +192,7 @@ def audit_block(
             public=tuple(section.content for section in sections),
         )
 
-    response = call_structured(
+    response, call_id = call_structured_recorded(
         client,
         LLMRequest(
             role=AgentRole.INITIAL_AUDITOR,
@@ -216,6 +224,7 @@ def audit_block(
         private=private,
         coverage=tuple(response.coverage),
         coverage_gaps=coverage_gaps(block, response.coverage),
+        call_id=call_id,
     )
 
 
@@ -416,7 +425,7 @@ def audit_blocks(
             public=tuple(section.content for section in sections),
         )
 
-    response = call_structured(
+    response, call_id = call_structured_recorded(
         client,
         LLMRequest(
             role=AgentRole.INITIAL_AUDITOR,
@@ -474,6 +483,7 @@ def audit_blocks(
                 private=private,
                 coverage=tuple(result.coverage),
                 coverage_gaps=coverage_gaps(item.block, result.coverage),
+                call_id=call_id,
             )
         )
 

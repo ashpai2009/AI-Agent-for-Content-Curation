@@ -36,13 +36,24 @@ _JOB_FLOW: dict[JobState, frozenset[JobState]] = {
     JobState.INGESTING: frozenset({JobState.AUDITING}),
     JobState.AUDITING: frozenset({JobState.REPAIRING_KNOWN}),
     JobState.REPAIRING_KNOWN: frozenset({JobState.INDEPENDENT_REVIEW}),
-    JobState.INDEPENDENT_REVIEW: frozenset({JobState.FINAL_VALIDATION}),
+    JobState.INDEPENDENT_REVIEW: frozenset({JobState.FINAL_SEMANTIC}),
+    # Final semantic verification runs its own repair loop in place rather than handing
+    # off to a repair state, because a repair *invalidates the verification that preceded
+    # it*: the block has to be solved again against the file as it now stands. A separate
+    # repair state would have to hand control back, and the edge that does that is the one
+    # somebody eventually removes as redundant.
+    JobState.FINAL_SEMANTIC: frozenset({JobState.FINAL_VALIDATION}),
+    # The second cycle in the job machine, and bounded twice over: `max_validation_rounds`
+    # limits how often the gate may send work back, and `final_semantic_rounds` limits how
+    # often any one block may be verified.
     # The only cyclic edge in the machine, and the reason `max_validation_rounds`
     # exists. Everything else moves strictly forward.
     JobState.FINAL_VALIDATION: frozenset(
         {JobState.REPAIRING_VALIDATION, JobState.FINALIZING}
     ),
-    JobState.REPAIRING_VALIDATION: frozenset({JobState.FINAL_VALIDATION}),
+    # Back to semantic verification, not straight to the gate: these repairs cleared the
+    # markers of the blocks they touched, so the verifier re-checks those and no others.
+    JobState.REPAIRING_VALIDATION: frozenset({JobState.FINAL_SEMANTIC}),
     JobState.FINALIZING: frozenset(
         {JobState.SUCCEEDED, JobState.NEEDS_HUMAN_ATTENTION}
     ),

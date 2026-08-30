@@ -328,15 +328,37 @@ def with_coverage(response: Any, payload: str) -> Any:
 
 
 def compliant(reply: Any) -> Any:
-    """Wrap a scripted reply so its scan responses carry the coverage a real one would.
+    """Wrap a scripted reply so it answers like a model that meets the current contract.
+
+    Two things, both of which a real model does and a fixed test double does not:
+
+    * scan responses carry a coverage record for every graded row they were shown;
+    * the Final Semantic Verifier answers in its own schema.
 
     Applied at the double, not inside `ScriptedLLMClient`: the production mock must not
     fabricate a field the model is required to produce, or the one test that checks the
     requirement would be the only place the requirement existed.
+
+    A double that *does* script the verifier keeps its own answer, so a test about the
+    final phase still says what it meant to.
     """
+    from oatutor_council.agents.schemas import FinalVerificationResponse
+    from oatutor_council.llm.base import AgentRole
 
     def wrapped(request: Any) -> Any:
-        value = reply(request) if callable(reply) else reply
+        try:
+            value = reply(request) if callable(reply) else reply
+        except KeyError:
+            # A double built from a role->response mapping that predates this agent. The
+            # substitution below is the whole point; letting the lookup raise first would
+            # mean every such double had to be edited to say "and nothing here either".
+            if request.role is not AgentRole.FINAL_VERIFIER:
+                raise
+            value = None
+        if request.role is AgentRole.FINAL_VERIFIER and not isinstance(
+            value, FinalVerificationResponse
+        ):
+            value = FinalVerificationResponse(block_is_sound=True)
         return with_coverage(value, request.user_payload)
 
     return wrapped

@@ -112,23 +112,49 @@ def test_every_non_terminal_job_state_can_fail_or_be_cancelled():
         assert JobState.CANCELLED in targets
 
 
-def test_the_only_cycle_is_the_validation_repair_edge():
+def test_the_only_cycle_is_the_validation_repair_loop():
     """Every other edge moves strictly forward, which is why `max_validation_rounds` is
-    the only budget guarding a loop in the job machine."""
-    cycles = [
-        (source, target)
-        for source, targets in LEGAL_JOB_TRANSITIONS.items()
-        for target in targets
-        if source in LEGAL_JOB_TRANSITIONS.get(target, frozenset())
-        and target not in TERMINAL_JOB_STATES
-        # `FAILED -> INGESTING` closes a loop on paper only. Nothing takes it
-        # automatically: `claimable_jobs` excludes failed jobs, so a failed job re-enters
-        # the pipeline when a person asks it to and at no other time.
-        and source is not JobState.FAILED
-    ]
-    assert set(cycles) == {
-        (JobState.FINAL_VALIDATION, JobState.REPAIRING_VALIDATION),
-        (JobState.REPAIRING_VALIDATION, JobState.FINAL_VALIDATION),
+    the only budget guarding a loop in the job machine.
+
+    Searched for cycles of any length rather than mutual pairs. The loop stopped being two
+    states when final semantic verification joined it -- validation repairs now return
+    through the verifier, so the blocks those repairs changed are re-solved rather than
+    being the only edits of the run that nothing re-checked. A pair test would have called
+    that three-state cycle "no cycle at all" and quietly stopped guarding anything.
+    """
+    graph = {
+        state: {
+            target
+            for target in targets
+            if target not in TERMINAL_JOB_STATES
+            # `FAILED -> INGESTING` closes a loop on paper only. Nothing takes it
+            # automatically: `claimable_jobs` excludes failed jobs, so a failed job
+            # re-enters the pipeline when a person asks it to and at no other time.
+        }
+        for state, targets in LEGAL_JOB_TRANSITIONS.items()
+        if state is not JobState.FAILED
+    }
+
+    cycles: set[frozenset] = set()
+
+    def walk(node, path):
+        for target in graph.get(node, ()):
+            if target in path:
+                cycles.add(frozenset(path[path.index(target) :]))
+            elif len(path) < len(graph):
+                walk(target, path + [target])
+
+    for start in graph:
+        walk(start, [start])
+
+    assert cycles == {
+        frozenset(
+            {
+                JobState.FINAL_VALIDATION,
+                JobState.REPAIRING_VALIDATION,
+                JobState.FINAL_SEMANTIC,
+            }
+        )
     }
 
 
@@ -155,6 +181,7 @@ def test_the_happy_path_is_legal():
         JobState.AUDITING,
         JobState.REPAIRING_KNOWN,
         JobState.INDEPENDENT_REVIEW,
+        JobState.FINAL_SEMANTIC,
         JobState.FINAL_VALIDATION,
         JobState.FINALIZING,
         JobState.SUCCEEDED,

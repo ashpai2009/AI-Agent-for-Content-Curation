@@ -203,6 +203,7 @@ def test_a_finished_job_is_never_offered(db, job):
         JobState.AUDITING,
         JobState.REPAIRING_KNOWN,
         JobState.INDEPENDENT_REVIEW,
+        JobState.FINAL_SEMANTIC,
         JobState.FINAL_VALIDATION,
         JobState.FINALIZING,
         JobState.SUCCEEDED,

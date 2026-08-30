@@ -39,6 +39,7 @@ type Report = {
   issues_needing_a_person: { problem_name: string; title: string }[];
   issues_unconfirmed?: number;
   blocks_with_unverified_rows?: number;
+  final_verification_incomplete?: boolean;
   unconfirmed_issues?: { problem_name: string; title: string; description: string }[];
   instruction_claims_confirmed: number;
   instruction_claims_refuted: number;
@@ -65,6 +66,10 @@ const PHASES: { states: string[]; label: string }[] = [
   { states: ["auditing"], label: "Auditing every problem block" },
   { states: ["repairing_known"], label: "Repairing what the audit found" },
   { states: ["independent_review"], label: "Independent review of every current problem" },
+  {
+    states: ["final_semantic"],
+    label: "Re-solving every graded row of the corrected workbook",
+  },
   {
     states: ["final_validation", "repairing_validation"],
     label: "Final validation",
@@ -558,6 +563,16 @@ function Result({
               The integrity check did not pass. Something in the output file cannot be
               traced to an approved edit, so do not use it until the findings below are
               understood.
+            </p>
+          </div>
+        )}
+
+        {report.final_verification_incomplete && (
+          <div className="notice" style={{ marginTop: 16 }}>
+            <p>
+              Part of this workbook was not re-checked after its last accepted correction.
+              The most recent independent look at those problems predates their most
+              recent change, so review them before publishing.
             </p>
           </div>
         )}

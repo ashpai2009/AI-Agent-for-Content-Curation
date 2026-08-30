@@ -225,6 +225,34 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     payload_json TEXT NOT NULL DEFAULT '{}'
 );
 
+-- What each scan claimed to have checked, row by row. Written for every graded row of
+-- every scanned block, not only for the rows that failed.
+--
+-- **The failures were events long before the successes were rows, and that was the wrong
+-- way round.** A job could report that nothing went unaccounted for and still be unable to
+-- show what any auditor computed for any row -- so the schema described these records as
+-- inspectable while the only inspectable ones were the missing ones.
+--
+-- `call_id` is the point. A coverage row that cannot name the physical invocation behind
+-- it is an assertion with no provenance, and the trail already stores the exact prompt of
+-- every call, so the two together answer "what was this model shown, and what did it say
+-- it checked" for any row of any block.
+CREATE TABLE IF NOT EXISTS coverage_records (
+    record_id   TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    -- Nullable: an offline client records no call, and a coverage row is still worth
+    -- keeping without one.
+    call_id     TEXT,
+    block_id    TEXT NOT NULL,
+    phase       TEXT NOT NULL,
+    row_no      INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS coverage_lookup
+    ON coverage_records(job_id, phase, block_id);
+
 -- Agent reasoning, stored apart from anything a reviewer prompt is built from. The
 -- separation is structural: no reviewer context type has a field that could reference
 -- this table.
@@ -1260,6 +1288,21 @@ def mark_block_done(db: Database, job_id: str, block_id: str, phase: str) -> Non
         )
 
 
+def clear_block_done(db: Database, job_id: str, block_id: str, phase: str) -> None:
+    """Un-finish a block, because something happened that its completion predates.
+
+    Only final semantic verification uses this, and the reason is the whole point of that
+    phase: a verification is a statement about the file as it stood, and an accepted repair
+    makes it a statement about a file nobody is handing over. Re-using the old marker would
+    let a block be certified on the strength of a check that ran before its last edit.
+    """
+    with db.write() as connection:
+        connection.execute(
+            "DELETE FROM block_progress WHERE job_id = ? AND block_id = ? AND phase = ?",
+            (job_id, block_id, phase),
+        )
+
+
 def blocks_done(db: Database, job_id: str, phase: str) -> frozenset[str]:
     rows = db.connection.execute(
         "SELECT block_id FROM block_progress WHERE job_id = ? AND phase = ?",
@@ -1597,6 +1640,9 @@ def rediscovery_counts(db: Database, job_id: str) -> dict[str, int]:
             # denies the job success outright, and the only place a curator can learn
             # that part of the workbook was never examined at all.
             "rows_never_verified",
+            # Blocks whose last independent check predates their last edit. Distinct from
+            # `rows_never_verified`, which is about rows nobody examined at all.
+            "final_verification_incomplete",
         )
     }
 
@@ -1614,6 +1660,87 @@ def count_events(db: Database, job_id: str, kind: str) -> int:
         "SELECT COUNT(*) AS n FROM job_events WHERE job_id = ? AND kind = ?",
         (job_id, kind),
     ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def record_coverage(
+    db: Database,
+    job_id: str,
+    *,
+    block_id: str,
+    phase: str,
+    call_id: str,
+    records: Sequence[Any],
+) -> int:
+    """Write down what one scan said it checked, row by row.
+
+    Appended rather than replacing an earlier scan of the same block: a re-scan is a
+    different call with a different answer, and overwriting would destroy the more
+    interesting of the two -- the one that was short. Readers that want the current
+    picture ask for the latest call (`latest_coverage`).
+    """
+    if not records:
+        return 0
+    at = _iso(_now())
+    with db.write() as connection:
+        for record in records:
+            connection.execute(
+                """INSERT INTO coverage_records
+                   (record_id, job_id, call_id, block_id, phase, row_no, recorded_at,
+                    payload_json) VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    uuid4().hex,
+                    job_id,
+                    call_id or None,
+                    block_id,
+                    phase,
+                    int(record.row),
+                    at,
+                    record.model_dump_json(),
+                ),
+            )
+    return len(records)
+
+
+def latest_coverage(
+    db: Database, job_id: str, *, phase: str, block_id: str
+) -> tuple[dict[str, Any], ...]:
+    """The most recent scan's coverage for one block in one phase.
+
+    Scoped to a single `call_id` rather than to the newest row per line number. Mixing two
+    calls would manufacture a complete record out of two incomplete ones and report
+    coverage no single scan ever had.
+    """
+    row = db.connection.execute(
+        "SELECT call_id, recorded_at FROM coverage_records "
+        "WHERE job_id = ? AND phase = ? AND block_id = ? "
+        "ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
+        (job_id, phase, block_id),
+    ).fetchone()
+    if row is None:
+        return ()
+    if row["call_id"] is None:
+        rows = db.connection.execute(
+            "SELECT payload_json FROM coverage_records WHERE job_id = ? AND phase = ? "
+            "AND block_id = ? AND call_id IS NULL AND recorded_at = ? ORDER BY row_no",
+            (job_id, phase, block_id, row["recorded_at"]),
+        ).fetchall()
+    else:
+        rows = db.connection.execute(
+            "SELECT payload_json FROM coverage_records WHERE job_id = ? AND phase = ? "
+            "AND block_id = ? AND call_id = ? ORDER BY row_no",
+            (job_id, phase, block_id, row["call_id"]),
+        ).fetchall()
+    return tuple(json.loads(item["payload_json"]) for item in rows)
+
+
+def count_coverage_records(db: Database, job_id: str, phase: str | None = None) -> int:
+    query = "SELECT COUNT(*) AS n FROM coverage_records WHERE job_id = ?"
+    parameters: tuple[Any, ...] = (job_id,)
+    if phase is not None:
+        query += " AND phase = ?"
+        parameters += (phase,)
+    row = db.connection.execute(query, parameters).fetchone()
     return int(row["n"]) if row else 0
 
 

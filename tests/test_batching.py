@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import full_coverage, problem, scaffold, step
+from conftest import compliant, full_coverage, problem, scaffold, step
 from oatutor_council.agents import independent_reviewer, initial_auditor
 from oatutor_council.agents.batching import (
     BatchItem,
@@ -136,7 +136,7 @@ def batched_client(**overrides) -> ScriptedLLMClient:
         return ReviewerResponse(decision="accept")
 
     client = ScriptedLLMClient()
-    client.default = overrides.get("reply", reply)
+    client.default = compliant(overrides.get("reply", reply))
     return client
 
 

@@ -20,6 +20,7 @@ XLSX (required) + optional instruction document (.pdf/.docx/.txt/.md)
   → repair loop              bounded at three attempts per issue
   → Independent Reviewer     rechecks every current problem from scratch
   → repair loop
+  → Final Semantic Verifier   re-solves every graded row of the corrected workbook
   → final deterministic validation
   → corrected XLSX + reports
 ```
@@ -183,8 +184,8 @@ src/oatutor_council/
   workbook/        reader · writer · diff · styles
   validation/      rules/ (61 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
-                   independent_reviewer · adjudicator ·
-                   isolation · rendering · schemas · batching
+                   independent_reviewer · adjudicator · final_verifier ·
+                   coverage · isolation · rendering · schemas · batching
   llm/             base · claude_cli · mock · context · prompts · audit
   ingestion/       instruction_documents
   reporting/       ledger · reports

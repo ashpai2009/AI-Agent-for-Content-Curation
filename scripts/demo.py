@@ -27,6 +27,7 @@ from openpyxl import Workbook  # noqa: E402
 from oatutor_council.agents.schemas import (  # noqa: E402
     AdjudicatorResponse,
     AuditorResponse,
+    FinalVerificationResponse,
     RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -173,6 +174,11 @@ def scripted_client(db: Database) -> ScriptedLLMClient:
 
         if request.role is AgentRole.WRITER:
             return _writer_reply(db, request)
+
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
+                block_is_sound=True, coverage=_coverage(request.user_payload)
+            )
 
         if request.role is AgentRole.ADJUDICATOR:
             # Nothing in this workbook reaches adjudication -- every defect here is

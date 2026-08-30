@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from oatutor_council.agents.schemas import (  # noqa: E402
     AdjudicatorResponse,
     AuditorResponse,
+    FinalVerificationResponse,
     RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -127,6 +128,10 @@ def observer_client() -> ScriptedLLMClient:
             return AuditorResponse(coverage=_coverage(request.user_payload))
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
             return IndependentReviewResponse(
+                block_is_sound=True, coverage=_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
                 block_is_sound=True, coverage=_coverage(request.user_payload)
             )
         return replies[request.role]

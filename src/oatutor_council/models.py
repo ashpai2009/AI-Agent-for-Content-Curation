@@ -663,6 +663,10 @@ class IssueSource(StrEnum):
     INSTRUCTION_DOCUMENT = "instruction_document"
     INITIAL_AUDITOR = "initial_auditor"
     INDEPENDENT_REVIEWER = "independent_reviewer"
+    #: The Final Semantic Verifier, which is a model finding like the two audit roles' and
+    #: goes through the same corroboration and adjudication before anything is edited.
+    #: Distinct from `FINAL_VALIDATION`, which is the deterministic rule engine.
+    FINAL_VERIFICATION = "final_verification"
     FINAL_VALIDATION = "final_validation"
 
 
@@ -923,6 +927,12 @@ class JobState(StrEnum):
     AUDITING = "auditing"
     REPAIRING_KNOWN = "repairing_known"
     INDEPENDENT_REVIEW = "independent_review"
+    #: The Final Semantic Verifier: every graded row of the corrected workbook solved
+    #: again, by an agent shown no finding, ledger, repair or answer. It sits *after* the
+    #: repair phases and before deterministic validation, because every earlier scan
+    #: examined a workbook that has since been edited -- and a verification that predates
+    #: the last accepted repair is a statement about a file nobody is handing over.
+    FINAL_SEMANTIC = "final_semantic"
     FINAL_VALIDATION = "final_validation"
     REPAIRING_VALIDATION = "repairing_validation"
     FINALIZING = "finalizing"

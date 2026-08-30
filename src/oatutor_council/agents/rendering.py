@@ -273,3 +273,44 @@ class AdjudicationContext:
 
 
 assert_no_private_fields(AdjudicationContext)
+
+
+# --------------------------------------------------------------------------------------
+# Final verification context
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FinalVerificationContext:
+    """The narrowest context in the council, and narrow on purpose.
+
+    The block as it now stands, the workbook's own conventions, and the curation rules.
+    **No deterministic findings, no issue ledger, no repair history, no earlier finding,
+    no answer.** Every one of those would tell this agent where somebody already looked,
+    and the whole value of a final pass is that it does not know.
+
+    That is a stricter diet than the Independent Reviewer's, which does see the
+    deterministic findings so it can avoid re-reporting what the rule engine already
+    owns. Here the duplication is worth paying for: a rule-engine finding is a hint about
+    which rows are interesting, and a verifier that has been given hints is no longer
+    checking the rows nobody flagged -- which is exactly the population the eight missed
+    defects were in.
+    """
+
+    block: str
+    conventions: str
+    curator_rules: str = ""
+
+    def sections(self) -> tuple[DataSection, ...]:
+        sections = [
+            DataSection("The problem block, as the workbook now stands", self.block),
+            DataSection("Conventions this workbook follows", self.conventions),
+        ]
+        if self.curator_rules.strip():
+            sections.append(
+                DataSection("Curation rules the curator supplied", self.curator_rules)
+            )
+        return tuple(sections)
+
+
+assert_no_private_fields(FinalVerificationContext)

@@ -34,6 +34,7 @@ from openpyxl import load_workbook
 
 from .agents import (
     adjudicator,
+    final_verifier,
     independent_reviewer,
     initial_auditor,
     known_issue_reviewer,
@@ -47,6 +48,7 @@ from .agents.rendering import (
     render_conventions,
     render_findings,
 )
+from .agents.coverage import self_contradicting
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
 from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
@@ -94,6 +96,7 @@ from .persistence import (
     Database,
     assert_lease_held,
     blocks_done,
+    clear_block_done,
     count_block_events,
     count_events,
     describe_artifacts,
@@ -119,6 +122,7 @@ from .persistence import (
     mark_block_done,
     next_attempt_number,
     record_artifact,
+    record_coverage,
     record_claim_result,
     record_event,
     record_findings,
@@ -187,6 +191,13 @@ _ROOT_FINDING_CODES = frozenset(
 
 #: The durable event kind counted against `provider_failure_budget`.
 PROVIDER_FAILURE_EVENT = "provider_failure"
+
+#: `block_progress` phase for final semantic verification. Unlike `audited` and `swept`,
+#: this marker is **deleted** whenever the block is repaired -- see
+#: `_invalidate_final_verification`. That is the difference between "this block was
+#: verified at some point" and "this block was verified after its last accepted change",
+#: and only the second means anything on a file about to be handed over.
+FINAL_SEMANTIC_PHASE = "final_semantic"
 
 #: How an adjudication maps onto the verdict vocabulary. `undecided` is `UNRESOLVED` and
 #: not `HUMAN_REVIEW`: nobody failed at anything, and no repair was attempted -- two
@@ -350,7 +361,11 @@ CLI_ADAPTER_VERSION = 2
 #: coverage is short is scanned again rather than accepted, and a row nothing ever
 #: accounted for denies the job success. Half a job under each rule would mean half its
 #: blocks were required to prove coverage and half were taken at their word.
-PIPELINE_CONTRACT_VERSION = 5
+#: 6 (2026-08-29): a Final Semantic Verifier phase between the repair loop and the
+#: deterministic gate, a sixth agent, a new job state, and a success condition about the
+#: file as handed over rather than as scanned. A job that ran half under each would have
+#: verified half its blocks after their last edit and half not at all.
+PIPELINE_CONTRACT_VERSION = 6
 
 
 class BudgetExhausted(Exception):
@@ -1048,6 +1063,9 @@ class CurationCouncil:
         if job.state is JobState.INDEPENDENT_REVIEW:
             return self._independent_review()
 
+        if job.state is JobState.FINAL_SEMANTIC:
+            return self._final_semantic()
+
         if job.state is JobState.FINAL_VALIDATION:
             return self._validate()
 
@@ -1121,6 +1139,13 @@ class CurationCouncil:
             opened += self._open_issues(
                 result.findings, source=IssueSource.INITIAL_AUDITOR
             )
+            # Written down before the completeness decision, and whether or not it is
+            # complete. A short record is the more interesting one to be able to read
+            # afterwards, and a trail that keeps only the passes cannot show what was
+            # missing.
+            self._persist_coverage(
+                block.block_id, "audited", result.call_id, result.coverage
+            )
             # Findings are kept either way. A response can be short on coverage and still
             # be right about what it did report, and throwing that away to punish an
             # incomplete answer would lose detection to make a point.
@@ -1142,6 +1167,40 @@ class CurationCouncil:
             + (f", {rescanning} re-scanned for coverage" if rescanning else ""),
             JobState.AUDITING,
         )
+
+    def _persist_coverage(
+        self, block_id: str, phase: str, call_id: str, records
+    ) -> None:
+        """Write down what a scan said it checked, and flag a record that refutes itself.
+
+        Persisted whether or not the coverage is complete: a short record is the more
+        interesting one to be able to read afterwards, and a trail that keeps only the
+        passes cannot show what was missing.
+
+        A row reporting a computed answer that differs from the submitted one while also
+        reporting the answer correct has contradicted itself in a single record. That is
+        not grounds to re-scan -- the model may have written one value two ways -- but it
+        is exactly what somebody auditing the audit needs pointed at, and without this it
+        would sit in a table nobody queries.
+        """
+        record_coverage(
+            self.db,
+            self.job_id,
+            block_id=block_id,
+            phase=phase,
+            call_id=call_id,
+            records=records,
+        )
+        contradictions = self_contradicting(records)
+        if contradictions:
+            record_event(
+                self.db,
+                self.job_id,
+                "coverage_self_contradicting",
+                f"{block_id} {phase} coverage reports row(s) "
+                f"{', '.join(str(row) for row in contradictions)} correct while its own "
+                "computed and submitted answers differ",
+            )
 
     def _coverage_incomplete(
         self, block: ProblemBlock, gaps: Sequence[int], phase: str
@@ -1214,6 +1273,9 @@ class CurationCouncil:
                     source=IssueSource.INDEPENDENT_REVIEWER,
                     reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
                 )
+                self._persist_coverage(
+                    result.block_id, "swept", result.call_id, result.coverage
+                )
                 block = by_id.get(result.block_id)
                 if block is not None and self._coverage_incomplete(
                     block, result.coverage_gaps, "swept"
@@ -1239,8 +1301,111 @@ class CurationCouncil:
             return self._advance_issue(issue, JobState.INDEPENDENT_REVIEW)
 
         self._spend()
+        self._advance(JobState.FINAL_SEMANTIC)
+        return StepOutcome(True, "independent review complete", JobState.FINAL_SEMANTIC)
+
+    def _final_semantic(self) -> StepOutcome:
+        """Verify the corrected workbook, repair what that finds, and verify it again.
+
+        The phase is a queue predicate like every other, but its predicate is the
+        interesting part: a block is pending when it carries no `final_semantic` marker,
+        and **the marker is deleted by any accepted repair to that block**. So a repair
+        this phase asks for puts its own block back on the queue, and the phase does not
+        end until every block has been verified against the file as it finally stands.
+
+        Bounded by `final_semantic_rounds` per block. Reaching the bound does *not* mark
+        the block verified: it stops asking, and the block stays unmarked, which denies
+        the job success at finalisation. That is the honest outcome -- the last thing
+        anybody established about that block predates its last edit -- and it is why the
+        bound cannot quietly become a pass.
+        """
+        parsed = self.current_workbook()
+        done = blocks_done(self.db, self.job_id, FINAL_SEMANTIC_PHASE)
+        pending = [
+            block
+            for block in parsed.blocks
+            if block.block_id not in done
+            and count_block_events(
+                self.db, self.job_id, "final_verification", block.block_id
+            )
+            < self.settings.final_semantic_rounds
+        ]
+
+        if pending:
+            return self._verify_block(parsed, pending[0])
+
+        # Repairs the verifier asked for. They run here rather than in a repair state so
+        # that an accepted one re-enters the loop above against the block it changed.
+        issue = self._next_live_issue(None)
+        if issue is not None:
+            return self._advance_issue(issue, JobState.FINAL_SEMANTIC)
+
+        self._spend()
         self._advance(JobState.FINAL_VALIDATION)
-        return StepOutcome(True, "independent review complete", JobState.FINAL_VALIDATION)
+        return StepOutcome(
+            True, "final semantic verification complete", JobState.FINAL_VALIDATION
+        )
+
+    def _verify_block(self, parsed: ParsedWorkbook, block: ProblemBlock) -> StepOutcome:
+        """One block, one call, one marker -- or no marker and a recorded reason."""
+        self._spend()
+        result = final_verifier.verify_block(
+            self.client,
+            block=block,
+            conventions=parsed.conventions,
+            curator_rules=self.curator_rules,
+            job_id=self.job_id,
+            taint=self.taint,
+            prompt_version=self._prompt_version(AgentRole.FINAL_VERIFIER),
+        )
+        self._persist_coverage(
+            block.block_id, FINAL_SEMANTIC_PHASE, result.call_id, result.coverage
+        )
+        record_event(
+            self.db,
+            self.job_id,
+            "final_verification",
+            f"{block.block_id} verified: {len(result.findings)} finding(s), "
+            f"{len(result.coverage)} row(s) accounted for",
+        )
+
+        # Routed through the rediscovery path, not straight into new issues. A defect the
+        # verifier finds at the cells of an issue the council already closed is not a new
+        # claim -- it is evidence that the accepted repair did not work, and opening a
+        # fresh issue with a fresh budget would let the same defect be "fixed" twice and
+        # reported as resolved both times. `_open_validation_issues` reopens it while
+        # attempts remain and escalates it once they are spent.
+        found = self._open_validation_issues(
+            result.findings, source=IssueSource.FINAL_VERIFICATION
+        )
+        opened = found.opened + found.reopened
+
+        if result.coverage_gaps:
+            # Not marked. The same rule the scan phases use, with a harder consequence:
+            # there is no later phase to catch what this one did not look at.
+            listed = ", ".join(str(row) for row in result.coverage_gaps)
+            record_event(
+                self.db,
+                self.job_id,
+                "final_verification_short",
+                f"{block.block_id} final verification did not account for graded "
+                f"row(s) {listed}",
+            )
+            return StepOutcome(
+                True,
+                f"{block.block_id} verification incomplete; will verify again",
+                JobState.FINAL_SEMANTIC,
+            )
+
+        # Marked even when findings were opened. The marker records that *this* version of
+        # the block was verified; if a repair follows, applying it clears the marker again,
+        # which is the mechanism rather than a gap in it.
+        mark_block_done(self.db, self.job_id, block.block_id, FINAL_SEMANTIC_PHASE)
+        return StepOutcome(
+            True,
+            f"{block.block_id} verified: {opened} issue(s) opened",
+            JobState.FINAL_SEMANTIC,
+        )
 
     def _repair(self, state: JobState) -> StepOutcome:
         role = (
@@ -1253,10 +1418,15 @@ class CurationCouncil:
             return self._advance_issue(issue, state)
 
         self._spend()
+        # A validation round's repairs go back through final semantic verification, not
+        # straight to the gate. Each one cleared its block's marker, so the phase re-checks
+        # exactly the blocks that changed and nothing else -- typically one call. Skipping
+        # it would leave the last edits of the run as the only ones nothing ever re-solved,
+        # which is the situation this whole phase exists to prevent.
         target = (
             JobState.INDEPENDENT_REVIEW
             if state is JobState.REPAIRING_KNOWN
-            else JobState.FINAL_VALIDATION
+            else JobState.FINAL_SEMANTIC
         )
         self._advance(target)
         return StepOutcome(True, f"{state.value} drained", target)
@@ -1381,9 +1551,35 @@ class CurationCouncil:
         # coverage of a row has not established that the row is correct, and saying
         # `SUCCEEDED` over it is the same false reassurance as the other three guard.
         unverified = count_events(self.db, self.job_id, "rows_never_verified")
+        # **A fifth condition, and the only one about the file as handed over.** Every
+        # other check -- including the coverage one above -- is satisfied by work done to
+        # a workbook that has since been edited. A block carries this marker only when the
+        # Final Semantic Verifier solved every graded row of it *and* nothing has been
+        # applied to it since, because applying a patch deletes the marker. So a block
+        # missing from this set is one whose last independent check predates its last
+        # change, and there is no honest way to call that finished.
+        verified = blocks_done(self.db, self.job_id, FINAL_SEMANTIC_PHASE)
+        unverified_blocks = [
+            block.block_id
+            for block in self.current_workbook().blocks
+            if block.block_id not in verified
+        ]
         succeeded = (
-            gate.passed and ledger.all_resolved and not remaining and not unverified
+            gate.passed
+            and ledger.all_resolved
+            and not remaining
+            and not unverified
+            and not unverified_blocks
         )
+        if unverified_blocks:
+            record_event(
+                self.db,
+                self.job_id,
+                "final_verification_incomplete",
+                f"{len(unverified_blocks)} block(s) were not semantically verified "
+                "against the workbook as it now stands: "
+                + ", ".join(sorted(unverified_blocks)),
+            )
         final_state = (
             JobState.SUCCEEDED if succeeded else JobState.NEEDS_HUMAN_ATTENTION
         )
@@ -1762,6 +1958,7 @@ class CurationCouncil:
         progress = advance_issue(progress, IssueState.PATCH_APPLIED)
         progress = advance_issue(progress, IssueState.ACCEPTED)
         save_issue(self.db, progress)
+        self._invalidate_final_verification(issue.block_id)
         record_event(
             self.db,
             self.job_id,
@@ -1819,7 +2016,17 @@ class CurationCouncil:
 
         issue = advance_issue(issue, IssueState.PATCH_APPLIED)
         save_issue(self.db, advance_issue(issue, IssueState.ACCEPTED))
+        # The bytes just changed, so whatever the Final Semantic Verifier concluded about
+        # this block was about a different file. Cleared here, at the one place a workbook
+        # mutation is committed, rather than in the phase that reads the marker -- a phase
+        # that has to remember to ask "has anything been edited since?" is a phase that
+        # will eventually forget, and the failure is silent.
+        self._invalidate_final_verification(issue.block_id)
         return StepOutcome(True, f"patch applied for {issue.issue_id}", state)
+
+    def _invalidate_final_verification(self, block_id: str | None) -> None:
+        if block_id:
+            clear_block_done(self.db, self.job_id, block_id, FINAL_SEMANTIC_PHASE)
 
     def _review(self, issue: Issue, state: JobState) -> StepOutcome:
         legacy_applied = issue.state is IssueState.PATCH_APPLIED
@@ -2500,7 +2707,10 @@ class CurationCouncil:
         return opened
 
     def _open_validation_issues(
-        self, findings: Sequence[ValidationFinding]
+        self,
+        findings: Sequence[ValidationFinding],
+        *,
+        source: IssueSource = IssueSource.FINAL_VALIDATION,
     ) -> Rediscovery:
         """Route by origin, and decide what a rediscovered defect means.
 
@@ -2553,7 +2763,7 @@ class CurationCouncil:
             issue = issue_from_finding(
                 finding,
                 job_id=self.job_id,
-                source=IssueSource.FINAL_VALIDATION,
+                source=source,
                 reviewer_role=role,
             )
             if insert_issue(self.db, issue) is not None:

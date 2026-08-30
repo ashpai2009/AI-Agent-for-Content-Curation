@@ -45,6 +45,9 @@ class AgentRole(StrEnum):
     #: claim-blind -- it is shown both findings on purpose, because deciding which of two
     #: readings of a block is right is not a thing a blind observer can do.
     ADJUDICATOR = "adjudicator"
+    #: Solves every graded row of the corrected workbook again, shown no finding, ledger,
+    #: repair or answer from anything that ran before it.
+    FINAL_VERIFIER = "final_verifier"
 
 
 class ProviderError(Exception):
@@ -272,6 +275,13 @@ class LLMResponse:
     model: str = ""
     status: str = "completed"
     usage: dict[str, Any] = field(default_factory=dict)
+    #: The `llm_calls` row this response was recorded under, when it passed through
+    #: `RecordingClient`. Empty for an unrecorded client, which is every offline test
+    #: double and the demo. It exists so a derived record -- a coverage row, say -- can
+    #: name the physical invocation that produced it rather than being an assertion with
+    #: no provenance, and it is set by the recorder because that is the only layer that
+    #: knows the row id.
+    call_id: str = ""
 
 
 class LLMClient(Protocol):
@@ -383,19 +393,24 @@ class RetryingClient:
         setattr(self._inner, "behaviour", value)
 
 
-def call_structured(
+def call_structured_recorded(
     client: LLMClient,
     request: LLMRequest,
     response_model: type[T],
     *,
     retries: int = 1,
-) -> T:
-    """Make the call and validate the result against `response_model`.
+) -> tuple[T, str]:
+    """Make the call, validate the result, and say which recorded call produced it.
 
     Retried **once** on malformed output and no further. Repeated schema failure is a
     prompt or schema problem, and looping on it burns a curator's budget discovering the
     same thing several times. A provider error is not retried here at all: it is
     infrastructure, and the attempt-refund path upstream is the right place to handle it.
+
+    The returned call id is the **last** attempt's, which is the one whose text was
+    parsed. A retry writes its own `llm_calls` row, so the discarded attempt is still in
+    the trail; what a derived record must not do is claim provenance from a response
+    nobody used.
     """
     last: Exception | None = None
     for _ in range(retries + 1):
@@ -406,10 +421,24 @@ def call_structured(
                 status=response.status,
             )
         try:
-            return response_model.model_validate_json(response.text)
+            return response_model.model_validate_json(response.text), response.call_id
         except ValidationError as error:
             last = error
     raise MalformedResponse(
         f"{request.role} returned output that does not satisfy "
         f"{response_model.__name__} after {retries + 1} attempt(s): {last}"
     )
+
+
+def call_structured(
+    client: LLMClient,
+    request: LLMRequest,
+    response_model: type[T],
+    *,
+    retries: int = 1,
+) -> T:
+    """`call_structured_recorded` for the callers that do not need the provenance."""
+    value, _ = call_structured_recorded(
+        client, request, response_model, retries=retries
+    )
+    return value

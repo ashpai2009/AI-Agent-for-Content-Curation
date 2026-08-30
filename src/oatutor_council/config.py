@@ -54,6 +54,7 @@ ROLE_EFFORT_ENV = {
     "known_issue_reviewer": "COUNCIL_KNOWN_ISSUE_REVIEWER_EFFORT",
     "independent_reviewer": "COUNCIL_INDEPENDENT_REVIEWER_EFFORT",
     "adjudicator": "COUNCIL_ADJUDICATOR_EFFORT",
+    "final_verifier": "COUNCIL_FINAL_VERIFIER_EFFORT",
 }
 
 #: Turns per call. **2, not 1, and measured rather than chosen.** At 1 the live pilot lost
@@ -80,6 +81,15 @@ DEFAULT_SCAN_BATCH_SIZE = 1
 #: a curator exactly which rows nothing looked at, rather than pretending either that the
 #: rows are fine or that the workbook cannot be handed over.
 DEFAULT_COVERAGE_RESCANS = 1
+
+#: How many times one block may be sent to the Final Semantic Verifier. Every accepted
+#: repair invalidates that block's verification, so without a bound a block whose repairs
+#: keep uncovering more work would be verified forever. **Two**: one pass over the block as
+#: the repair phases left it, and one more after a repair the verifier itself asked for.
+#: When the bound is reached the block is left *unverified* rather than waved through --
+#: the job then cannot report success, which is the honest answer, because the last thing
+#: anyone established about that block predates its last edit.
+DEFAULT_FINAL_SEMANTIC_ROUNDS = 2
 MAX_SCAN_BATCH_SIZE = 16
 #: A five-row block and a hundred-row block must not consume the same allowance, so the
 #: batch is bounded by rendered size as well as by count.
@@ -180,6 +190,8 @@ class Settings:
     scan_batch_max_characters: int = DEFAULT_SCAN_BATCH_MAX_CHARACTERS
     #: Re-scans allowed for a block whose audit did not account for every graded row.
     coverage_rescans: int = DEFAULT_COVERAGE_RESCANS
+    #: Final semantic verifications allowed per block.
+    final_semantic_rounds: int = DEFAULT_FINAL_SEMANTIC_ROUNDS
 
     def __post_init__(self) -> None:
         if not 1 <= self.scan_batch_size <= MAX_SCAN_BATCH_SIZE:
@@ -190,6 +202,11 @@ class Settings:
         if self.scan_batch_max_characters < 1:
             raise ConfigurationError(
                 "SCAN_BATCH_MAX_CHARACTERS must be positive; it bounds one call's context"
+            )
+        if self.final_semantic_rounds < 1:
+            raise ConfigurationError(
+                "FINAL_SEMANTIC_ROUNDS must be at least 1; zero would mean the corrected "
+                "workbook is never verified"
             )
         if self.coverage_rescans < 0:
             raise ConfigurationError(
@@ -348,6 +365,9 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         role_effort=role_effort or None,
         scan_batch_size=_int("SCAN_BATCH_SIZE", DEFAULT_SCAN_BATCH_SIZE),
         coverage_rescans=_int("COVERAGE_RESCANS", DEFAULT_COVERAGE_RESCANS),
+        final_semantic_rounds=_int(
+            "FINAL_SEMANTIC_ROUNDS", DEFAULT_FINAL_SEMANTIC_ROUNDS
+        ),
         scan_batch_max_characters=_int(
             "SCAN_BATCH_MAX_CHARACTERS", DEFAULT_SCAN_BATCH_MAX_CHARACTERS
         ),
