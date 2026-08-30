@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import problem, scaffold, step
+from conftest import full_coverage, problem, scaffold, step
 from oatutor_council.agents import independent_reviewer, initial_auditor
 from oatutor_council.agents.batching import (
     BatchItem,
@@ -147,22 +147,50 @@ def _batch_ids(payload: str) -> list[str]:
     return re.findall(r"batch_item=([0-9a-f]+)", payload)
 
 
+def _coverage_by_item(payload: str) -> dict[str, list]:
+    """Each batch item's graded rows, taken from its own slice of the payload.
+
+    A batched response owes coverage per block, not per call, for the same reason it owes
+    a `batch_item_id`: a pooled answer cannot say which block it examined. Slicing the
+    payload at the item labels is how a compliant model would read it too.
+    """
+    import re
+
+    marks = list(re.finditer(r"batch_item=([0-9a-f]+)", payload))
+    slices = {}
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(payload)
+        slices[mark.group(1)] = full_coverage(payload[mark.end() : end])
+    return slices
+
+
 def _auditor_reply(request):
     ids = _batch_ids(request.user_payload)
     if not ids:
-        return AuditorResponse()
+        return AuditorResponse(coverage=full_coverage(request.user_payload))
+    coverage = _coverage_by_item(request.user_payload)
     return BatchedAuditorResponse(
-        results=[AuditorBlockResult(batch_item_id=item) for item in ids]
+        results=[
+            AuditorBlockResult(batch_item_id=item, coverage=coverage.get(item, []))
+            for item in ids
+        ]
     )
 
 
 def _sweep_reply(request):
     ids = _batch_ids(request.user_payload)
     if not ids:
-        return IndependentReviewResponse(block_is_sound=True)
+        return IndependentReviewResponse(
+            block_is_sound=True, coverage=full_coverage(request.user_payload)
+        )
+    coverage = _coverage_by_item(request.user_payload)
     return BatchedIndependentReviewResponse(
         results=[
-            IndependentBlockResult(batch_item_id=item, block_is_sound=True)
+            IndependentBlockResult(
+                batch_item_id=item,
+                block_is_sound=True,
+                coverage=coverage.get(item, []),
+            )
             for item in ids
         ]
     )

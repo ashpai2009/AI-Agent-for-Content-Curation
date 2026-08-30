@@ -71,6 +71,15 @@ DEFAULT_CLAUDE_MAX_TURNS = 2
 #: unchanged single-block path at this value, so the default changes nothing until somebody
 #: raises it deliberately and measures the result.
 DEFAULT_SCAN_BATCH_SIZE = 1
+
+#: How many times one block may be scanned again because its coverage record was short of
+#: its graded rows. **One**, not zero and not many: zero would make the coverage record a
+#: report rather than a requirement, while an unbounded retry turns a model that keeps
+#: omitting the same row into a job that never ends. When the budget is spent the rows are
+#: recorded as never verified and the job carries on -- which denies it success and tells
+#: a curator exactly which rows nothing looked at, rather than pretending either that the
+#: rows are fine or that the workbook cannot be handed over.
+DEFAULT_COVERAGE_RESCANS = 1
 MAX_SCAN_BATCH_SIZE = 16
 #: A five-row block and a hundred-row block must not consume the same allowance, so the
 #: batch is bounded by rendered size as well as by count.
@@ -169,6 +178,8 @@ class Settings:
     #: Ceiling on a batch's total rendered contribution -- blocks, applicable claims,
     #: deterministic findings and labels together, not `render_block` alone.
     scan_batch_max_characters: int = DEFAULT_SCAN_BATCH_MAX_CHARACTERS
+    #: Re-scans allowed for a block whose audit did not account for every graded row.
+    coverage_rescans: int = DEFAULT_COVERAGE_RESCANS
 
     def __post_init__(self) -> None:
         if not 1 <= self.scan_batch_size <= MAX_SCAN_BATCH_SIZE:
@@ -179,6 +190,10 @@ class Settings:
         if self.scan_batch_max_characters < 1:
             raise ConfigurationError(
                 "SCAN_BATCH_MAX_CHARACTERS must be positive; it bounds one call's context"
+            )
+        if self.coverage_rescans < 0:
+            raise ConfigurationError(
+                "COVERAGE_RESCANS cannot be negative; it is a retry budget"
             )
         if self.claude_effort not in VALID_EFFORT_LEVELS:
             raise ConfigurationError(
@@ -332,6 +347,7 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         retention_days=_float("RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
         role_effort=role_effort or None,
         scan_batch_size=_int("SCAN_BATCH_SIZE", DEFAULT_SCAN_BATCH_SIZE),
+        coverage_rescans=_int("COVERAGE_RESCANS", DEFAULT_COVERAGE_RESCANS),
         scan_batch_max_characters=_int(
             "SCAN_BATCH_MAX_CHARACTERS", DEFAULT_SCAN_BATCH_MAX_CHARACTERS
         ),

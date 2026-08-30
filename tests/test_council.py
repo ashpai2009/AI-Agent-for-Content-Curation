@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import problem, scaffold, step
+from conftest import compliant, full_coverage, problem, scaffold, step
 from oatutor_council.agents.schemas import (
     AdjudicatorResponse,
     AuditorFinding,
@@ -141,7 +141,7 @@ def quiet_client(**overrides) -> ScriptedLLMClient:
     replies.update(overrides)
 
     client = ScriptedLLMClient()
-    client.default = lambda request: replies[request.role]
+    client.default = compliant(lambda request: replies[request.role])
     return client
 
 
@@ -188,7 +188,7 @@ def test_a_candidate_is_reviewed_before_any_workbook_byte_is_written(setup):
             return AuditorResponse()
         return IndependentReviewResponse(block_is_sound=True)
 
-    client.default = reply
+    client.default = compliant(reply)
     result = council(setup, client).run()
     assert result.state is JobState.SUCCEEDED
     assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == "30"
@@ -335,7 +335,7 @@ def test_a_revision_request_sends_the_issue_back_to_the_writer(setup):
             return AuditorResponse()
         return IndependentReviewResponse(block_is_sound=True)
 
-    client.default = reply
+    client.default = compliant(reply)
     result = council(setup, client).run()
 
     assert result.state is JobState.SUCCEEDED
@@ -424,7 +424,7 @@ def test_a_gate_rejection_is_actionable_feedback_for_the_next_writer_attempt(set
             return AuditorResponse()
         return IndependentReviewResponse(block_is_sound=True)
 
-    client.default = reply
+    client.default = compliant(reply)
     result = council(setup, client).run()
 
     assert result.state is JobState.SUCCEEDED, result.failure_reason
@@ -466,7 +466,7 @@ def test_a_semantic_duplicate_is_reviewed_before_another_writer_call(setup):
 
 
 def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(setup):
-    """A false semantic claim is dismissed on evidence, and only on evidence.
+    """A false semantic claim is dismissed only by an agent that examined it and said why.
 
     The adversarial run let an auditor call an equivalent answer wrong, then asked the
     reviewer only whether the replacement looked plausible. By then the review was
@@ -476,6 +476,10 @@ def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(s
     recomputation showing the title is already correct. That second half is what makes
     this a refutation; without it the claim would be `UNCONFIRMED`, which the next test
     pins down.
+
+    The reasoning is not checked and cannot be -- a wrong adjudication refutes a real
+    defect just as effectively. What this asserts is that *something examined the claim*,
+    which is exactly the property silence did not have.
     """
     db, _ = setup
     false_claim = AuditorResponse(
@@ -631,7 +635,7 @@ def test_an_adjudicator_may_widen_a_claim_to_the_cell_that_must_change(setup):
             )
         return ReviewerResponse(decision="accept")
 
-    client.default = reply
+    client.default = compliant(reply)
     council(setup, client).run()
 
     semantic = next(
@@ -688,6 +692,312 @@ def test_adjudication_does_not_read_an_agent_quoting_itself_as_a_leak(setup):
     adjudications = client.payloads_for(AgentRole.ADJUDICATOR)
     assert len(adjudications) == 1
     assert shared in adjudications[0]
+
+
+# --------------------------------------------------------------------------------------
+# Audit coverage
+# --------------------------------------------------------------------------------------
+
+
+def test_a_scan_that_skips_a_graded_row_is_run_again(setup):
+    """Silence about a row is not a clean bill of health for it.
+
+    The auditor reports coverage for the step and says nothing about the scaffold. The old
+    contract could not tell that from an audit that examined both and found them fine --
+    both return an empty findings list. The block is not finished, so it is scanned again,
+    and the second scan accounts for everything.
+    """
+    db, _ = setup
+    calls = 0
+
+    def reply(request):
+        nonlocal calls
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            calls += 1
+            if calls == 1:
+                # Row 3 only. Row 4 is graded and goes unmentioned.
+                return AuditorResponse(coverage=full_coverage(request.user_payload)[:1])
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert calls == 2, "the short scan should have been repeated, not accepted"
+    kinds = [event["kind"] for event in list_events(db, "job-1")]
+    assert "coverage_short_audited" in kinds
+    # The second scan covered everything, so nothing was left unverified and the job is
+    # allowed to succeed on its merits.
+    assert "rows_never_verified" not in kinds
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+
+
+def test_a_row_nothing_ever_accounted_for_denies_success(setup):
+    """The re-scan budget is bounded, and running out is not permission to proceed.
+
+    A model that keeps omitting the same row would otherwise loop forever. It does not:
+    the gap is written down, the block finishes, and the job is denied success and names
+    the rows in its record. That is the honest answer -- nobody established those rows are
+    correct, and no amount of re-asking this model is going to.
+    """
+    db, _ = setup
+
+    def reply(request):
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload)[:1])
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    events = [e for e in list_events(db, "job-1") if e["kind"] == "rows_never_verified"]
+    assert events, "the unaccounted row must be recorded, not just refused"
+    assert "4" in events[0]["detail"]
+    # Bounded: one re-scan, then it stops asking.
+    assert client.call_count(AgentRole.INITIAL_AUDITOR) == 2
+
+
+def test_a_complete_scan_is_accepted_without_a_second_call(setup):
+    """The requirement must cost nothing when it is met."""
+    client = quiet_client()
+    result = council(setup, client).run()
+
+    assert client.call_count(AgentRole.INITIAL_AUDITOR) == 1
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+
+
+def _sibling_repair_setup(
+    *,
+    claim_cells,
+    sweep,
+    adjudication=None,
+):
+    """A block where a sibling repair lands on one cell of a multi-cell semantic claim.
+
+    The fixture's scaffold row 4 has no answer, which the deterministic rules catch and the
+    Writer repairs at `(4, answer)`. A model-only claim over row 4 therefore always has one
+    of its cells rewritten by a repair that is not its own -- the exact situation the
+    supersession shortcut is about.
+    """
+    client = ScriptedLLMClient()
+    sweeps = 0
+
+    def reply(request):
+        nonlocal sweeps
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(
+                findings=[
+                    AuditorFinding(
+                        cells=claim_cells,
+                        problem="The scaffold answer and its type disagree.",
+                        category="mathematics",
+                    )
+                ]
+            )
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            sweeps += 1
+            # The first sweep is the claim-blind check; later ones are the ordinary
+            # independent pass, which must not reopen the block for these tests.
+            return sweep if sweeps == 1 else IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.ADJUDICATOR:
+            return adjudication or AdjudicatorResponse(
+                verdict="undecided", evidence="cannot establish either reading"
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client.default = compliant(reply)
+    return client
+
+
+def _semantic_issue(db):
+    return next(
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.rule_codes == ("AUDITOR_FINDING",)
+    )
+
+
+def test_a_partly_repaired_claim_is_adjudicated_when_the_audit_names_the_rest(setup):
+    """The bypass, at its sharpest: the second audit says the other cell is still wrong.
+
+    A sibling repair rewrote `(4, answer)`. The claim also names `(4, answerType)`, and the
+    claim-blind audit reports exactly that cell as still defective. Reading a one-cell
+    overlap as "an earlier repair resolved this" closes the issue on the strength of a
+    finding that says the opposite, and does it without spending an adjudication.
+    """
+    db, _ = setup
+    client = _sibling_repair_setup(
+        claim_cells=[{"row": 4, "column": "answer"}, {"row": 4, "column": "answer_type"}],
+        sweep=IndependentReviewResponse(
+            block_is_sound=False,
+            findings=[
+                IndependentFinding(
+                    cells=[{"row": 4, "column": "answer_type"}],
+                    problem="answerType is still wrong for this scaffold.",
+                    category="row_type",
+                )
+            ],
+        ),
+    )
+
+    council(setup, client).run()
+
+    semantic = _semantic_issue(db)
+    assert semantic.state is not IssueState.SUPERSEDED
+    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+
+
+def test_a_partly_repaired_claim_is_not_superseded_when_the_audit_is_silent(setup):
+    """Silence plus a partial repair is still two open questions, not a resolution.
+
+    Every cell of the claim has to have been rewritten before another issue's repair can
+    be said to have resolved it. One of two is a repair that did half the job, and the
+    remaining half is exactly what nobody has looked at.
+    """
+    db, _ = setup
+    client = _sibling_repair_setup(
+        claim_cells=[{"row": 4, "column": "answer"}, {"row": 4, "column": "answer_type"}],
+        sweep=IndependentReviewResponse(block_is_sound=True),
+    )
+
+    council(setup, client).run()
+
+    semantic = _semantic_issue(db)
+    assert semantic.state is not IssueState.SUPERSEDED
+    assert semantic.state is IssueState.UNCONFIRMED
+    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+
+
+def test_a_related_finding_is_never_bypassed_by_a_sibling_repair(setup):
+    """Even a fully-covered claim goes to adjudication if the audit named a defect.
+
+    Here the sibling repair rewrote the claim's only cell, so the coverage half of the
+    shortcut is satisfied. The audit still reported a defect on that row, and a row a
+    second agent says is wrong has not been cleared by anyone. Coverage without an
+    explicit clean audit is not supersession.
+    """
+    db, _ = setup
+    client = _sibling_repair_setup(
+        claim_cells=[{"row": 4, "column": "answer"}],
+        sweep=IndependentReviewResponse(
+            block_is_sound=False,
+            findings=[
+                IndependentFinding(
+                    cells=[{"row": 4, "column": "answer_type"}],
+                    problem="answerType is wrong for this scaffold.",
+                    category="row_type",
+                )
+            ],
+        ),
+    )
+
+    council(setup, client).run()
+
+    semantic = _semantic_issue(db)
+    assert semantic.state is not IssueState.SUPERSEDED
+    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+
+
+def test_supersession_needs_every_cell_repaired_and_a_block_called_sound(setup):
+    """The one case the shortcut is still allowed, and it must stay allowed.
+
+    Both halves hold: a sibling repair rewrote every cell the claim names, and a
+    from-scratch audit of the result examined the block and stated it is sound. Nothing a
+    model could add would change that, so no adjudication is bought.
+    """
+    db, _ = setup
+    client = _sibling_repair_setup(
+        claim_cells=[{"row": 4, "column": "answer"}],
+        sweep=IndependentReviewResponse(block_is_sound=True),
+    )
+
+    result = council(setup, client).run()
+
+    semantic = _semantic_issue(db)
+    assert semantic.state is IssueState.SUPERSEDED
+    assert client.call_count(AgentRole.ADJUDICATOR) == 0
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+
+
+def test_an_audit_that_cannot_assert_soundness_never_supersedes(setup):
+    """`audit_block` reports defects and has no field for their absence.
+
+    An Independent-Reviewer-sourced claim is checked blind by the Initial Auditor, whose
+    schema cannot say "this block is sound". Zero findings from it is silence, and silence
+    is what this whole path exists to stop reading as a clean bill of health -- so the
+    claim is adjudicated even though a sibling repair covered its only cell.
+    """
+    db, _ = setup
+    client = ScriptedLLMClient()
+    sweeps = 0
+
+    def reply(request):
+        nonlocal sweeps
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            # Both the first audit (which finds nothing) and, later, the claim-blind check
+            # on the Independent Reviewer's finding.
+            return AuditorResponse()
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            sweeps += 1
+            if sweeps == 1:
+                return IndependentReviewResponse(
+                    block_is_sound=False,
+                    findings=[
+                        IndependentFinding(
+                            cells=[{"row": 4, "column": "answer"}],
+                            problem="The scaffold answer is wrong.",
+                            category="mathematics",
+                        )
+                    ],
+                )
+            return IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.ADJUDICATOR:
+            return AdjudicatorResponse(
+                verdict="undecided", evidence="cannot establish either reading"
+            )
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        return ReviewerResponse(decision="accept")
+
+    client.default = compliant(reply)
+    council(setup, client).run()
+
+    semantic = next(
+        issue
+        for issue in list_issues(db, "job-1")
+        if issue.source is IssueSource.INDEPENDENT_REVIEWER
+    )
+    assert semantic.state is not IssueState.SUPERSEDED
+    assert client.call_count(AgentRole.ADJUDICATOR) == 1
 
 
 def test_an_adjudication_is_read_back_rather_than_paid_for_twice(setup):
@@ -880,7 +1190,7 @@ def test_a_blind_second_agent_can_corroborate_a_real_model_only_claim(setup):
             )
         return ReviewerResponse(decision="accept")
 
-    client.default = reply
+    client.default = compliant(reply)
     result = council(setup, client).run()
 
     assert result.state is JobState.SUCCEEDED, result.failure_reason
@@ -1247,7 +1557,7 @@ def test_a_misconfigured_provider_fails_the_job_rather_than_burning_its_budget(s
     def reply(_request):
         raise ProviderConfigurationError("API key not valid")
 
-    client.default = reply
+    client.default = compliant(reply)
     result = council(setup, client).run()
 
     assert result.state is JobState.FAILED
@@ -1484,7 +1794,7 @@ def failing_client(error: Exception, *, role=AgentRole.INITIAL_AUDITOR, times=10
         return healthy.default(request)
 
     client = ScriptedLLMClient()
-    client.default = reply
+    client.default = compliant(reply)
     return client
 
 
@@ -1687,7 +1997,7 @@ def test_a_call_is_charged_before_the_process_starts(setup):
         raise ProviderUnavailable("503 Service Unavailable")
 
     client = ScriptedLLMClient()
-    client.default = reply
+    client.default = compliant(reply)
     council(setup, client, provider_failure_budget=1).run(max_steps=4)
 
     assert seen and seen[0] >= 1, "the budget was committed before the call was made"

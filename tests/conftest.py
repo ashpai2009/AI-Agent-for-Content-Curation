@@ -252,3 +252,91 @@ def make_workbook(tmp_path: Path):
         return write_workbook(path, rows, **kwargs)
 
     return factory
+
+
+# --------------------------------------------------------------------------------------
+# Audit coverage
+# --------------------------------------------------------------------------------------
+#
+# A scan response must account for every graded row of the block it was sent, and a
+# response that does not is re-scanned rather than accepted. A test double returning no
+# coverage is therefore simulating a *non-compliant* model, and the council is right to
+# reject it -- which is exactly what these helpers exist to avoid doing by accident.
+#
+# The rows are read back out of the payload the agent was actually given, so a double
+# stays compliant when a fixture's block changes shape. That also keeps the doubles honest
+# in the one way that matters here: they report on the rows they were shown, and on no
+# others.
+
+#: Row types a student answers, mirroring `ProblemBlock.graded_rows`.
+GRADED_ROW_TYPES = frozenset({"step", "scaffold"})
+
+
+def graded_rows_in(payload: str) -> tuple[int, ...]:
+    """The graded rows of the single block rendered in this payload.
+
+    Deliberately parses the rendered table rather than taking the block object: most
+    doubles only see the request, and a helper that needed the block would have to be
+    threaded through every one of them.
+    """
+    rows: list[int] = []
+    for line in payload.splitlines():
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < 3 or not fields[0].isdigit():
+            continue
+        if fields[2].casefold() in GRADED_ROW_TYPES:
+            rows.append(int(fields[0]))
+    return tuple(dict.fromkeys(rows))
+
+
+def full_coverage(payload: str) -> list[Any]:
+    """A clean coverage record for every graded row the payload contains.
+
+    Built as `RowCoverage` instances rather than dicts: `model_copy(update=...)` does not
+    validate, so dicts would survive all the way into the serialized request and the only
+    sign would be a warning nobody reads.
+    """
+    from oatutor_council.agents.schemas import RowCoverage
+
+    return [
+        RowCoverage(
+            row=row,
+            computed_answer="checked",
+            submitted_answer="checked",
+            answer_correct=True,
+            answer_type_correct=True,
+            requested_form_correct=True,
+            domain_checked=True,
+            solution_count_checked=True,
+            units_checked=True,
+            choices_checked=True,
+        )
+        for row in graded_rows_in(payload)
+    ]
+
+
+def with_coverage(response: Any, payload: str) -> Any:
+    """Fill a scan response's coverage from the block it was sent, if it takes one.
+
+    Left alone when the response already carries coverage, so a test that is *about*
+    coverage -- a short record, a duplicated row -- keeps saying what it meant to say.
+    """
+    fields = getattr(type(response), "model_fields", {})
+    if "coverage" not in fields or getattr(response, "coverage", None):
+        return response
+    return response.model_copy(update={"coverage": full_coverage(payload)})
+
+
+def compliant(reply: Any) -> Any:
+    """Wrap a scripted reply so its scan responses carry the coverage a real one would.
+
+    Applied at the double, not inside `ScriptedLLMClient`: the production mock must not
+    fabricate a field the model is required to produce, or the one test that checks the
+    requirement would be the only place the requirement existed.
+    """
+
+    def wrapped(request: Any) -> Any:
+        value = reply(request) if callable(reply) else reply
+        return with_coverage(value, request.user_payload)
+
+    return wrapped

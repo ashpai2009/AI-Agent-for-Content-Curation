@@ -30,6 +30,7 @@ from ..models import (
     WorkbookConventions,
 )
 from .batching import FindingAttributionError, attribute, cells_for_block, make_items
+from .coverage import coverage_gaps
 from .isolation import AuditorPrivate, TaintRegistry
 from .rendering import (
     render_block,
@@ -40,6 +41,7 @@ from .schemas import (
     AuditorResponse,
     BatchedAuditorResponse,
     RefutedClaim,
+    RowCoverage,
     column_key,
 )
 from ..models import FIXED_COLUMNS
@@ -85,6 +87,12 @@ class AuditResult:
     findings: tuple[ValidationFinding, ...]
     refuted: tuple[RefutedClaim, ...]
     private: AuditorPrivate
+    #: One record per graded row, and the graded rows this response did not account for.
+    #: `coverage_gaps` is what decides whether the block is finished: an empty findings
+    #: list means "nothing wrong on the rows I examined", and only coverage says which
+    #: rows those were.
+    coverage: tuple[RowCoverage, ...] = ()
+    coverage_gaps: tuple[int, ...] = ()
 
 
 INSTRUCTIONS = """\
@@ -206,6 +214,8 @@ def audit_block(
             claim for claim in response.refuted_claims if claim.claim_index in shown
         ),
         private=private,
+        coverage=tuple(response.coverage),
+        coverage_gaps=coverage_gaps(block, response.coverage),
     )
 
 
@@ -462,6 +472,8 @@ def audit_blocks(
                     if claim.claim_index in item.claims_shown
                 ),
                 private=private,
+                coverage=tuple(result.coverage),
+                coverage_gaps=coverage_gaps(item.block, result.coverage),
             )
         )
 

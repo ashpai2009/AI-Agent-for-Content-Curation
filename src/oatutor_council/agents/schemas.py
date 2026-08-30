@@ -86,6 +86,75 @@ class AuditorFinding(BaseModel):
     confirms_claim: int | None = None
 
 
+class RowCoverage(BaseModel):
+    """Proof of work for one graded row: what was checked, and what it came to.
+
+    **The point is the denominator.** An audit's `findings` list says what it found; it
+    says nothing at all about what it looked at, so a model that examined three of nine
+    graded rows and a model that examined all nine and found them clean return the same
+    empty list. Eight of eleven misses on the held-out workbooks were rows nothing ever
+    reported on, and there was no way to tell those from rows that were checked and were
+    fine.
+
+    So every graded row must come back with one of these. The booleans are not a
+    checklist for the model to tick: they are the specific questions the misses were
+    hiding behind -- an extraneous root (`solution_count_checked`), a domain restriction
+    (`domain_checked`), an exact form silently decimalised (`requested_form_correct`), an
+    answer that is valid mathematics for a different question (`computed_answer` beside
+    `submitted_answer`, where a reader can see they diverge).
+
+    Writing `computed_answer` down is what makes the rest inspectable. A row whose
+    computed and submitted answers differ while `answer_correct` is true is a self-
+    contradicting record, and a human reading the audit trail can see it.
+    """
+
+    row: int = Field(gt=0, description="The real 1-based spreadsheet row")
+    computed_answer: str = Field(
+        description=(
+            "The answer you derived yourself, before looking at what is recorded. Use a "
+            "short description when the answer is not a value"
+        )
+    )
+    submitted_answer: str = Field(description="What the Answer cell actually contains")
+    answer_correct: bool = Field(
+        description="Does the recorded answer answer the question that was asked"
+    )
+    answer_type_correct: bool = Field(
+        description="Does answerType match what the recorded answer actually is"
+    )
+    requested_form_correct: bool = Field(
+        default=True,
+        description=(
+            "Exact versus decimal, simplified, units -- as the question requires. True "
+            "when the question requires nothing in particular"
+        ),
+    )
+    domain_checked: bool = Field(
+        default=False, description="You checked domain restrictions and excluded values"
+    )
+    solution_count_checked: bool = Field(
+        default=False,
+        description="You checked how many solutions exist and whether any are extraneous",
+    )
+    units_checked: bool = Field(
+        default=False, description="You checked units, or confirmed none are involved"
+    )
+    choices_checked: bool = Field(
+        default=False,
+        description=(
+            "You checked that exactly one choice matches the answer exactly, or "
+            "confirmed this row has no choice list"
+        ),
+    )
+    finding_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Zero-based positions in this response's findings list that concern this "
+            "row. Empty means you checked the row and it is correct"
+        ),
+    )
+
+
 class RefutedClaim(BaseModel):
     """A seeded claim the auditor checked and could not find.
 
@@ -109,6 +178,9 @@ class AuditorResponse(BaseModel):
     reasoning: str = ""
     findings: list[AuditorFinding] = Field(default_factory=list)
     refuted_claims: list[RefutedClaim] = Field(default_factory=list)
+    #: One entry per graded row. A block whose coverage is short is re-audited rather
+    #: than accepted, because an unexamined row is not a clean row.
+    coverage: list[RowCoverage] = Field(default_factory=list)
 
 
 class AuditorBlockResult(BaseModel):
@@ -126,6 +198,7 @@ class AuditorBlockResult(BaseModel):
     reasoning: str = ""
     findings: list[AuditorFinding] = Field(default_factory=list)
     refuted_claims: list[RefutedClaim] = Field(default_factory=list)
+    coverage: list[RowCoverage] = Field(default_factory=list)
 
 
 class BatchedAuditorResponse(BaseModel):
@@ -221,8 +294,8 @@ class AdjudicatorResponse(BaseModel):
         description=(
             "The check you actually performed -- the arithmetic, the substitution, the "
             "exact-match comparison. Required for every verdict, and most of all for "
-            "content_correct: a claim is only dismissed on evidence that it is wrong, "
-            "never on the absence of evidence that it is right"
+            "content_correct: dismiss a claim only by showing the recorded value is "
+            "already right, never by not finding anything wrong with it"
         ),
     )
     cells: list[FindingCell] = Field(
@@ -268,6 +341,9 @@ class IndependentReviewResponse(BaseModel):
 
     findings: list[IndependentFinding] = Field(default_factory=list)
     block_is_sound: bool = True
+    #: One entry per graded row, for the same reason the auditor carries them: this
+    #: response's `block_is_sound` is an assertion, and coverage is what backs it.
+    coverage: list[RowCoverage] = Field(default_factory=list)
 
 
 class IndependentBlockResult(BaseModel):
@@ -278,6 +354,7 @@ class IndependentBlockResult(BaseModel):
     )
     findings: list[IndependentFinding] = Field(default_factory=list)
     block_is_sound: bool = True
+    coverage: list[RowCoverage] = Field(default_factory=list)
 
 
 class BatchedIndependentReviewResponse(BaseModel):

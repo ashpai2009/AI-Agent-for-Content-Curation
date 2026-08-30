@@ -29,12 +29,14 @@ from ..models import (
     WorkbookConventions,
 )
 from .batching import FindingAttributionError, attribute, cells_for_block, make_items
+from .coverage import coverage_gaps
 from .isolation import TaintRegistry
 from .known_issue_reviewer import review as review_correction  # noqa: F401 - re-exported
 from .rendering import render_block, render_conventions, render_findings
 from .schemas import (
     BatchedIndependentReviewResponse,
     IndependentReviewResponse,
+    RowCoverage,
     column_key,
 )
 
@@ -56,6 +58,11 @@ class SweepResult:
     block_id: str
     findings: tuple[ValidationFinding, ...]
     block_is_sound: bool
+    #: `block_is_sound` is an assertion; this is what backs it. A sweep that declares a
+    #: block sound without accounting for each of its graded rows has asserted something
+    #: about rows it did not say it looked at.
+    coverage: tuple[RowCoverage, ...] = ()
+    coverage_gaps: tuple[int, ...] = ()
 
 
 def sweep_block(
@@ -118,6 +125,8 @@ def sweep_block(
         block_id=block.block_id,
         findings=findings,
         block_is_sound=response.block_is_sound and not findings,
+        coverage=tuple(response.coverage),
+        coverage_gaps=coverage_gaps(block, response.coverage),
     )
 
 
@@ -317,6 +326,8 @@ def sweep_blocks(
                 # Same contradiction rule as the single-block path: concrete findings beat
                 # a soundness claim made alongside them.
                 block_is_sound=result.block_is_sound and not findings,
+                coverage=tuple(result.coverage),
+                coverage_gaps=coverage_gaps(item.block, result.coverage),
             )
         )
 

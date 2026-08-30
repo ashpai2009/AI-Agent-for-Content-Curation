@@ -41,6 +41,7 @@ from oatutor_council.agents.adjudicator import adjudicate
 from oatutor_council.agents.schemas import (
     AdjudicatorResponse,
     AuditorResponse,
+    RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
     WriterResponse,
@@ -51,6 +52,7 @@ from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
     ColumnKey,
     Issue,
+    SourcePath,
     IssueCategory,
     IssueSource,
     ReviewDecision,
@@ -153,6 +155,73 @@ def test_the_adjudicator_asks_for_both_readings_and_the_block():
     assert "The disputed claim, from the first audit" in labels
     assert "What a second, independent audit of the same block reported" in labels
     assert "The block as it stands now" in labels
+
+
+def test_coverage_gaps_count_a_missing_row_and_a_duplicated_one(make_workbook):
+    """Both directions are gaps, and for the same reason the batch reader gives.
+
+    A missing row was not examined. A duplicated row means two records claim it, so at
+    least one describes something else and neither says which -- the answer cannot be
+    trusted for that row either way.
+    """
+    from oatutor_council.agents.coverage import coverage_gaps
+    from oatutor_council.workbook.reader import read_workbook
+
+    path = make_workbook(
+        [
+            problem("angles1", title="Convert"),
+            step("angles1", answer="pi/6", answer_type="algebra"),
+            scaffold("angles1", "s1", answer="30", answer_type="numeric"),
+        ]
+    )
+    block = read_workbook(SourcePath(str(path))).blocks[0]
+    assert block.graded_rows == (3, 4)
+
+    def record(row):
+        return RowCoverage(
+            row=row, computed_answer="x", submitted_answer="x",
+            answer_correct=True, answer_type_correct=True,
+        )
+
+    assert coverage_gaps(block, [record(3), record(4)]) == ()
+    assert coverage_gaps(block, [record(3)]) == (4,)
+    assert coverage_gaps(block, []) == (3, 4)
+    assert coverage_gaps(block, [record(3), record(3), record(4)]) == (3,)
+    # A row outside the block is noise in this answer, not evidence about a graded row.
+    # Counting it as a gap would let one stray entry force an endless re-scan.
+    assert coverage_gaps(block, [record(3), record(4), record(99)]) == ()
+
+
+def test_a_block_with_no_graded_rows_needs_no_coverage(make_workbook):
+    """The denominator can legitimately be empty, and then nothing is owed."""
+    from oatutor_council.agents.coverage import coverage_gaps
+    from oatutor_council.workbook.reader import read_workbook
+
+    path = make_workbook([problem("angles1", title="Convert")])
+    block = read_workbook(SourcePath(str(path))).blocks[0]
+    assert block.graded_rows == ()
+    assert coverage_gaps(block, []) == ()
+
+
+def test_a_row_that_contradicts_itself_is_surfaced_not_resolved():
+    """A record claiming the answer is right while its own two fields disagree.
+
+    Not grounds to re-scan -- the model may have written one value two ways -- but exactly
+    what somebody auditing the audit needs pointed at.
+    """
+    from oatutor_council.agents.coverage import self_contradicting
+
+    def record(computed, submitted, correct):
+        return RowCoverage(
+            row=3, computed_answer=computed, submitted_answer=submitted,
+            answer_correct=correct, answer_type_correct=True,
+        )
+
+    assert self_contradicting([record("6", "5", True)]) == (3,)
+    assert self_contradicting([record("6", "5", False)]) == ()
+    assert self_contradicting([record("6", "6", True)]) == ()
+    # Nothing to compare is not a contradiction.
+    assert self_contradicting([record("", "5", True)]) == ()
 
 
 def _adjudication_context() -> AdjudicationContext:

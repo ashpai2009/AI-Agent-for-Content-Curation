@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import problem, scaffold, step
+from conftest import compliant, problem, scaffold, step
 from oatutor_council.agents.schemas import (
     AuditorResponse,
     IndependentReviewResponse,
@@ -134,7 +134,7 @@ def quiet_client(**overrides) -> ScriptedLLMClient:
     }
     replies.update(overrides)
     client = ScriptedLLMClient()
-    client.default = lambda request: replies[request.role]
+    client.default = compliant(lambda request: replies[request.role])
     return client
 
 
@@ -344,7 +344,7 @@ def test_the_poller_does_not_queue_a_job_it_is_already_running(setup, job_dir, m
             release.wait(5)
             return inner(request)
 
-        client.default = slow
+        client.default = compliant(slow)
         return client
 
     runner = JobRunner(db=db, settings=settings(), client_factory=blocking_client)

@@ -38,6 +38,7 @@ type Report = {
   integrity_findings: Finding[];
   issues_needing_a_person: { problem_name: string; title: string }[];
   issues_unconfirmed?: number;
+  blocks_with_unverified_rows?: number;
   unconfirmed_issues?: { problem_name: string; title: string; description: string }[];
   instruction_claims_confirmed: number;
   instruction_claims_refuted: number;
@@ -538,6 +539,10 @@ function Result({
             <dd>{report.issues_unconfirmed ?? 0}</dd>
           </div>
           <div>
+            <dt>Unexamined rows</dt>
+            <dd>{report.blocks_with_unverified_rows ?? 0}</dd>
+          </div>
+          <div>
             <dt>Open issues</dt>
             <dd>{openIssues.length}</dd>
           </div>
@@ -553,6 +558,16 @@ function Result({
               The integrity check did not pass. Something in the output file cannot be
               traced to an approved edit, so do not use it until the findings below are
               understood.
+            </p>
+          </div>
+        )}
+
+        {(report.blocks_with_unverified_rows ?? 0) > 0 && (
+          <div className="notice" style={{ marginTop: 16 }}>
+            <p>
+              {report.blocks_with_unverified_rows} block(s) contain graded rows that no
+              scan ever reported on. Those rows were not examined, so nothing here says
+              whether they are correct — check them yourself before publishing.
             </p>
           </div>
         )}

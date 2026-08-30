@@ -27,6 +27,7 @@ from openpyxl import Workbook  # noqa: E402
 from oatutor_council.agents.schemas import (  # noqa: E402
     AdjudicatorResponse,
     AuditorResponse,
+    RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
     WriterResponse,
@@ -118,6 +119,41 @@ def build_demo_workbook(path: Path) -> Path:
     return path
 
 
+#: Row types a student answers, mirroring `ProblemBlock.graded_rows`.
+_GRADED_ROW_TYPES = frozenset({"step", "scaffold"})
+
+
+def _coverage(payload: str) -> list[RowCoverage]:
+    """A coverage record for every graded row of the block this call was sent.
+
+    A scripted agent has to satisfy the same contract as a real one: a scan that does not
+    account for each graded row is scanned again, and then recorded as never having
+    examined them. Read back out of the payload so this stays right when the demo
+    workbook changes shape.
+    """
+    rows: list[int] = []
+    for line in payload.splitlines():
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) >= 3 and fields[0].isdigit():
+            if fields[2].casefold() in _GRADED_ROW_TYPES:
+                rows.append(int(fields[0]))
+    return [
+        RowCoverage(
+            row=row,
+            computed_answer="matches the stated mathematics",
+            submitted_answer="matches the stated mathematics",
+            answer_correct=True,
+            answer_type_correct=True,
+            requested_form_correct=True,
+            domain_checked=True,
+            solution_count_checked=True,
+            units_checked=True,
+            choices_checked=True,
+        )
+        for row in dict.fromkeys(rows)
+    ]
+
+
 def scripted_client(db: Database) -> ScriptedLLMClient:
     """A model that behaves the way a competent one would on this workbook."""
 
@@ -125,10 +161,15 @@ def scripted_client(db: Database) -> ScriptedLLMClient:
         if request.role is AgentRole.INITIAL_AUDITOR:
             # The deterministic rules already found the planted defects, so the auditor
             # has nothing further to add. Zero findings is a valid and common answer.
-            return AuditorResponse(reasoning="the block matches the stated mathematics")
+            return AuditorResponse(
+                reasoning="the block matches the stated mathematics",
+                coverage=_coverage(request.user_payload),
+            )
 
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
-            return IndependentReviewResponse(block_is_sound=True)
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=_coverage(request.user_payload)
+            )
 
         if request.role is AgentRole.WRITER:
             return _writer_reply(db, request)

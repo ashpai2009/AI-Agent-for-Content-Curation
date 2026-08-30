@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from oatutor_council.agents.schemas import (  # noqa: E402
     AdjudicatorResponse,
     AuditorResponse,
+    RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
     WriterResponse,
@@ -62,6 +63,41 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+#: Row types a student answers, mirroring `ProblemBlock.graded_rows`.
+_GRADED_ROW_TYPES = frozenset({"step", "scaffold"})
+
+
+def _coverage(payload: str) -> list[RowCoverage]:
+    """A coverage record for every graded row of the block this call was sent.
+
+    A scripted agent has to satisfy the same contract as a real one: a scan that does not
+    account for each graded row is scanned again, and then recorded as never having
+    examined them. Read back out of the payload so this stays right when the demo
+    workbook changes shape.
+    """
+    rows: list[int] = []
+    for line in payload.splitlines():
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) >= 3 and fields[0].isdigit():
+            if fields[2].casefold() in _GRADED_ROW_TYPES:
+                rows.append(int(fields[0]))
+    return [
+        RowCoverage(
+            row=row,
+            computed_answer="matches the stated mathematics",
+            submitted_answer="matches the stated mathematics",
+            answer_correct=True,
+            answer_type_correct=True,
+            requested_form_correct=True,
+            domain_checked=True,
+            solution_count_checked=True,
+            units_checked=True,
+            choices_checked=True,
+        )
+        for row in dict.fromkeys(rows)
+    ]
+
+
 def observer_client() -> ScriptedLLMClient:
     """An agent set that looks and never touches.
 
@@ -70,8 +106,6 @@ def observer_client() -> ScriptedLLMClient:
     output is a report about the file rather than a correction of it.
     """
     replies = {
-        AgentRole.INITIAL_AUDITOR: AuditorResponse(),
-        AgentRole.INDEPENDENT_REVIEWER: IndependentReviewResponse(block_is_sound=True),
         AgentRole.WRITER: WriterResponse(
             needs_human_review=True,
             human_review_reason="shadow run: no repairs are proposed",
@@ -85,7 +119,19 @@ def observer_client() -> ScriptedLLMClient:
         ),
     }
     client = ScriptedLLMClient()
-    client.default = lambda request: replies[request.role]
+
+    def reply(request):
+        # The two scan roles answer per call, because coverage is about the block this
+        # call was sent and a fixed response cannot know which one that is.
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(
+                block_is_sound=True, coverage=_coverage(request.user_payload)
+            )
+        return replies[request.role]
+
+    client.default = reply
     return client
 
 

@@ -94,6 +94,7 @@ from .persistence import (
     Database,
     assert_lease_held,
     blocks_done,
+    count_block_events,
     count_events,
     describe_artifacts,
     get_job,
@@ -345,7 +346,11 @@ CLI_ADAPTER_VERSION = 2
 #: and an unsettled claim ends `UNCONFIRMED` instead of `REFUTED`. That is a fifth agent,
 #: a second call on some issues, and a different terminal state -- a job cannot run half
 #: under each reading and still be described as one run.
-PIPELINE_CONTRACT_VERSION = 4
+#: 5 (2026-08-29): every scan must account for each graded row it was sent, a block whose
+#: coverage is short is scanned again rather than accepted, and a row nothing ever
+#: accounted for denies the job success. Half a job under each rule would mean half its
+#: blocks were required to prove coverage and half were taken at their word.
+PIPELINE_CONTRACT_VERSION = 5
 
 
 class BudgetExhausted(Exception):
@@ -1103,6 +1108,7 @@ class CurationCouncil:
 
         by_id = {block.block_id: block for block in batch}
         opened = 0
+        rescanning = 0
         for result in results:
             block = by_id[result.block_id]
             # **One block persisted completely, then marked done, then the next.** A crash
@@ -1115,6 +1121,12 @@ class CurationCouncil:
             opened += self._open_issues(
                 result.findings, source=IssueSource.INITIAL_AUDITOR
             )
+            # Findings are kept either way. A response can be short on coverage and still
+            # be right about what it did report, and throwing that away to punish an
+            # incomplete answer would lose detection to make a point.
+            if self._coverage_incomplete(block, result.coverage_gaps, "audited"):
+                rescanning += 1
+                continue
             self._record_claim_verdicts(block.block_id, result)
             mark_block_done(self.db, self.job_id, block.block_id, "audited")
 
@@ -1126,9 +1138,48 @@ class CurationCouncil:
         return StepOutcome(
             True,
             f"audited {len(results)} block(s): {opened} issue(s) opened"
-            + (f", {len(requeued)} requeued" if requeued else ""),
+            + (f", {len(requeued)} requeued" if requeued else "")
+            + (f", {rescanning} re-scanned for coverage" if rescanning else ""),
             JobState.AUDITING,
         )
+
+    def _coverage_incomplete(
+        self, block: ProblemBlock, gaps: Sequence[int], phase: str
+    ) -> bool:
+        """Whether this block needs scanning again because rows went unaccounted for.
+
+        Returns `True` only while a re-scan is still owed. When the budget is spent the
+        gap is written down as `rows_never_verified` and the block is allowed to finish --
+        because the alternative is a job that never ends, and because a recorded gap is
+        more use to a curator than an infinite loop. Finalisation reads those events and
+        refuses to call the job successful.
+
+        The counter is a durable event, not a field on this object: the crash that loses a
+        worker is exactly the event a retry budget has to survive, and an in-memory count
+        that resets on every restart bounds nothing.
+        """
+        if not gaps:
+            return False
+        kind = f"coverage_short_{phase}"
+        used = count_block_events(self.db, self.job_id, kind, block.block_id)
+        listed = ", ".join(str(row) for row in gaps)
+        if used < self.settings.coverage_rescans:
+            record_event(
+                self.db,
+                self.job_id,
+                kind,
+                f"{block.block_id} reported no coverage for graded row(s) {listed}; "
+                "scanning it again",
+            )
+            return True
+        record_event(
+            self.db,
+            self.job_id,
+            "rows_never_verified",
+            f"{block.block_id} graded row(s) {listed} were never accounted for by "
+            f"the {phase} scan, after {used} re-scan(s)",
+        )
+        return False
 
     def _independent_review(self) -> StepOutcome:
         """Sweep every current block from scratch, then repair what it finds."""
@@ -1154,13 +1205,21 @@ class CurationCouncil:
                 taint=self.taint,
                 prompt_version=self._prompt_version(AgentRole.INDEPENDENT_REVIEWER),
             )
+            by_id = {block.block_id: block for block in batch}
             opened = 0
+            rescanning = 0
             for result in results:
                 opened += self._open_issues(
                     result.findings,
                     source=IssueSource.INDEPENDENT_REVIEWER,
                     reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
                 )
+                block = by_id.get(result.block_id)
+                if block is not None and self._coverage_incomplete(
+                    block, result.coverage_gaps, "swept"
+                ):
+                    rescanning += 1
+                    continue
                 mark_block_done(self.db, self.job_id, result.block_id, "swept")
             if requeued:
                 record_event(
@@ -1170,7 +1229,8 @@ class CurationCouncil:
             return StepOutcome(
                 True,
                 f"swept {len(results)} block(s): {opened} issue(s)"
-                + (f", {len(requeued)} requeued" if requeued else ""),
+                + (f", {len(requeued)} requeued" if requeued else "")
+                + (f", {rescanning} re-scanned for coverage" if rescanning else ""),
                 JobState.INDEPENDENT_REVIEW,
             )
 
@@ -1312,7 +1372,18 @@ class CurationCouncil:
         # defective workbook marked succeeded, because the defect it never opened an
         # issue for, or opened one and closed it wrongly, is invisible to the other two.
         remaining = unresolved(gate.content_findings)
-        succeeded = gate.passed and ledger.all_resolved and not remaining
+        # **A fourth condition, and it answers a question the other three cannot.** They
+        # are all about what the council *found*: the output is accounted for, every claim
+        # reached a good end, no rule still fires. None of them can say anything about a
+        # graded row no agent ever examined, and an audit's empty findings list looks
+        # identical whether it checked nine rows or three. Eight of eleven misses on the
+        # held-out workbooks were rows nothing reported on. A job that never established
+        # coverage of a row has not established that the row is correct, and saying
+        # `SUCCEEDED` over it is the same false reassurance as the other three guard.
+        unverified = count_events(self.db, self.job_id, "rows_never_verified")
+        succeeded = (
+            gate.passed and ledger.all_resolved and not remaining and not unverified
+        )
         final_state = (
             JobState.SUCCEEDED if succeeded else JobState.NEEDS_HUMAN_ATTENTION
         )
@@ -1933,22 +2004,40 @@ class CurationCouncil:
             return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
 
         # Unsettled. Before spending an adjudication call, the one case a model cannot
-        # improve on: a sibling repair has already edited these exact cells, and a fresh
-        # audit of the result reports nothing wrong with them. That is supersession, and
-        # it is decidable from the change ledger.
+        # improve on: a sibling repair has already rewritten **every** cell this issue
+        # names, and a fresh audit of the result examined the block and called it sound.
+        #
+        # **All three conditions, and this was a bypass when it was one.** The first
+        # version asked only whether a sibling had touched *any* named cell, on the
+        # `UNRESOLVED` branch, without consulting what the blind audit had said. So an
+        # issue naming `E16` and `F16` whose sibling repaired `E16` alone was closed as
+        # resolved -- even when the same blind audit had just reported `F16` still wrong.
+        # That is the discarded-finding failure this whole path exists to remove, rebuilt
+        # one branch further down and reachable without any adjudication at all.
+        #
+        # `block_verified_sound` carries the audit's half of the answer, because a cached
+        # verdict read back after a crash is all the next step has. A partial repair, a
+        # related finding, or an audit with no soundness signal all leave it false and all
+        # go to adjudication -- which is the safe direction: it costs one call and settles
+        # the question, where the shortcut costs nothing and answers it wrongly.
         changed_targets = {
             (change.row, change.column)
             for change in list_changes(self.db, self.job_id)
             if change.block_id == issue.block_id and change.issue_id != issue.issue_id
         }
-        if changed_targets.intersection(issue.cells):
+        if (
+            verdict.block_verified_sound
+            and issue.cells
+            and set(issue.cells) <= changed_targets
+        ):
             save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
             record_event(
                 self.db,
                 self.job_id,
                 "issue_superseded",
-                f"{issue.issue_id}: an earlier accepted repair resolved the unsupported "
-                f"semantic finding in {issue.problem_name}",
+                f"{issue.issue_id}: an earlier accepted repair rewrote every cell of the "
+                f"unsupported semantic finding in {issue.problem_name}, and a fresh audit "
+                "found the block sound",
             )
             return StepOutcome(
                 True, f"{issue.issue_id} resolved by another repair", state
@@ -1965,7 +2054,7 @@ class CurationCouncil:
     def _adjudicate(
         self, issue: Issue, blind_verdict: ReviewVerdict, state: JobState
     ) -> StepOutcome:
-        """Settle a disagreement between two audits, on evidence.
+        """Settle a disagreement between two audits, on stated reasoning.
 
         The adjudicator is the one agent shown another agent's conclusion, which is a
         deliberate trade and not an oversight: choosing between two readings of a block is
@@ -2010,7 +2099,7 @@ class CurationCouncil:
                 f"{issue.issue_id} in {issue.problem_name or issue.block_id}: "
                 f"repair authorised at {sorted(updated.cells)}",
             )
-            return StepOutcome(True, f"{issue.issue_id} confirmed on evidence", state)
+            return StepOutcome(True, f"{issue.issue_id} confirmed on adjudication", state)
 
         if verdict.decision is ReviewDecision.ACCEPT:
             save_issue(self.db, advance_issue(issue, IssueState.REFUTED))
@@ -2021,7 +2110,7 @@ class CurationCouncil:
                 f"{issue.issue_id}: an adjudicator showed the content in "
                 f"{issue.problem_name} is correct",
             )
-            return StepOutcome(True, f"{issue.issue_id} refuted on evidence", state)
+            return StepOutcome(True, f"{issue.issue_id} refuted on adjudication", state)
 
         # Undecided, and that is where it stops. Not refuted -- nothing was shown -- and
         # not escalated as a failed repair either, because no repair was attempted. The
@@ -2121,7 +2210,14 @@ class CurationCouncil:
             return None
 
         findings: tuple[ValidationFinding, ...] = ()
-        sound = True
+        # Two values, not one, because "did not say it was unsound" is not "said it was
+        # sound". Only the independent sweep has a field for this; `audit_block` reports
+        # defects and has no way to assert their absence, so a blind audit by the auditor
+        # can never clear a block on its own. That asymmetry costs one adjudication call
+        # on an Independent-Reviewer-sourced claim whose cells a sibling already repaired,
+        # and it buys never inferring an assertion from a schema that cannot make one.
+        sound_stated = False
+        sound = False
         inconclusive = ""
         reviewer_role = _blind_reviewer_role(issue)
         self._spend()
@@ -2161,12 +2257,22 @@ class CurationCouncil:
                 )
                 findings = result.findings
                 sound = result.block_is_sound
+                sound_stated = True
         except FindingAttributionError as error:
             # An out-of-block target means the corroborator did not complete a usable
             # audit.  It is not evidence either for or against the claim.
             inconclusive = str(error)
 
         outcome, matches = _classify_corroboration(issue, findings)
+        # Silent about these rows *and* explicitly sound. A related finding leaves this
+        # false however small the overlap: the audit named a defect on a disputed row, and
+        # a row a second agent says is still wrong has not been cleared by anybody.
+        verified_sound = (
+            not inconclusive
+            and outcome is Corroboration.SILENT
+            and sound_stated
+            and sound
+        )
 
         if inconclusive:
             decision = ReviewDecision.HUMAN_REVIEW
@@ -2198,7 +2304,7 @@ class CurationCouncil:
                 for finding in matches
             ]
             feedback = render_claims(reports)
-            if outcome is Corroboration.SILENT and not sound:
+            if outcome is Corroboration.SILENT and sound_stated and not sound:
                 # It called the block unsound and named nothing. That is not a refutation
                 # of anything; it is one more reason the question needs settling.
                 feedback = (
@@ -2214,6 +2320,7 @@ class CurationCouncil:
             decision=decision,
             feedback=feedback,
             rule_codes=rule_codes,
+            block_verified_sound=verified_sound,
         )
         insert_verdict(self.db, verdict)
         record_event(

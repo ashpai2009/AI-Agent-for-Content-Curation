@@ -281,7 +281,7 @@ def _validation_report(
         issue for issue in ledger.issues if issue.state is IssueState.UNCONFIRMED
     ]
     resolved_claims = resolve_claims(claims, claim_results)
-    return {
+    report: dict[str, Any] = {
         "job_id": job_id,
         "state": state.value,
         # Read from the state rather than recomputed, and that is not a shortcut:
@@ -339,6 +339,12 @@ def _validation_report(
         # the normal reading; a non-zero count is a prompt to read the events, never a
         # statement that anything leaked.
         "isolation_suspicions": (rediscoveries or {}).get("isolation_suspicion", 0),
+        # Blocks holding graded rows that no scan ever reported on, after the re-scan
+        # budget was spent. Not a defect count -- nobody knows whether those rows are
+        # defective, which is exactly the problem.
+        "blocks_with_unverified_rows": (rediscoveries or {}).get(
+            "rows_never_verified", 0
+        ),
         "instruction_claims": resolved_claims,
         # One flag on every stored segment records a document-wide event. Surface it in
         # the report so a bounded extraction is never mistaken for complete instructions.
@@ -358,6 +364,11 @@ def _validation_report(
         "artifacts": list(artifacts),
         "unresolved_summary": unresolved_summary(state, ledger, integrity_findings),
     }
+    # Appended rather than folded into `unresolved_summary`, which answers from the issue
+    # ledger. Unexamined rows are not an issue and never were one -- that is the whole
+    # point of counting them -- so they have no ledger entry to be derived from.
+    report["unresolved_summary"] += _coverage_sentence(report)
+    return report
 
 
 def _net_change_count(changes: Sequence[ChangeRecord]) -> int:
@@ -367,6 +378,16 @@ def _net_change_count(changes: Sequence[ChangeRecord]) -> int:
 
 def _count_claims(resolved: Sequence[dict[str, Any]], outcome: ClaimOutcome) -> int:
     return len([claim for claim in resolved if claim["outcome"] == outcome])
+
+
+def _coverage_sentence(report: dict[str, Any]) -> str:
+    count = report.get("blocks_with_unverified_rows", 0)
+    if not count:
+        return ""
+    return (
+        f" {count} block(s) contain graded rows that no scan ever accounted for; those "
+        "rows were not examined, and nothing here says whether they are correct."
+    )
 
 
 def unresolved_summary(
@@ -454,6 +475,8 @@ def render_markdown(reports: JobReports) -> str:
         f" refuted {validation['issues_refuted']},"
         f" resolved by another repair {validation['issues_superseded']})",
         f"- Issues left unconfirmed: {validation.get('issues_unconfirmed', 0)}",
+        f"- Blocks with rows nothing examined: "
+        f"{validation.get('blocks_with_unverified_rows', 0)}",
         f"- Cells changed: {validation['changes_applied']}",
         f"- Integrity checks: {'passed' if validation['integrity_passed'] else 'FAILED'}",
     ]

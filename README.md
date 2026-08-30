@@ -12,7 +12,7 @@ policy.
 
 ```
 XLSX (required) + optional instruction document (.pdf/.docx/.txt/.md)
-  → Initial Auditor          scans every problem block
+  → Initial Auditor          scans every block, accounting for every graded row
   → Claim Reviewer           audits the block again, blind to the claim
   → Adjudicator              settles what that audit neither reproduced nor disproved
   → Writer                   corrects confirmed issues

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import problem, scaffold, step, write_workbook
+from conftest import compliant, problem, scaffold, step, write_workbook
 from documents import write_image_only_pdf, write_markdown
 from oatutor_council.agents.schemas import (
     AuditorResponse,
@@ -60,7 +60,7 @@ def mock_client(_settings) -> ScriptedLLMClient:
         AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(decision="accept"),
     }
     client = ScriptedLLMClient()
-    client.default = lambda request: replies[request.role]
+    client.default = compliant(lambda request: replies[request.role])
     return client
 
 
@@ -713,7 +713,7 @@ def _client_that_never_repairs(_settings) -> ScriptedLLMClient:
         AgentRole.KNOWN_ISSUE_REVIEWER: ReviewerResponse(decision="accept"),
     }
     client = ScriptedLLMClient()
-    client.default = lambda request: replies[request.role]
+    client.default = compliant(lambda request: replies[request.role])
     return client
 
 

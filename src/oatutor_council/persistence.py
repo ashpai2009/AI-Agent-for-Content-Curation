@@ -1589,7 +1589,15 @@ def rediscovery_counts(db: Database, job_id: str) -> dict[str, int]:
         # event the final states cannot express. A job can succeed with suspicions
         # outstanding -- they are not failures -- so unless the report counts them, the
         # only signal that anything was flagged is a row nobody queries.
-        for kind in ("issue_reopened", "finding_absorbed", "isolation_suspicion")
+        for kind in (
+            "issue_reopened",
+            "finding_absorbed",
+            "isolation_suspicion",
+            # Graded rows no scan ever accounted for. The one fact in this list that
+            # denies the job success outright, and the only place a curator can learn
+            # that part of the workbook was never examined at all.
+            "rows_never_verified",
+        )
     }
 
 
@@ -1605,6 +1613,22 @@ def count_events(db: Database, job_id: str, kind: str) -> int:
     row = db.connection.execute(
         "SELECT COUNT(*) AS n FROM job_events WHERE job_id = ? AND kind = ?",
         (job_id, kind),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def count_block_events(db: Database, job_id: str, kind: str, block_id: str) -> int:
+    """How many times something has happened to one block, durably.
+
+    The same argument as `count_events`, one level finer: a re-scan budget held in worker
+    memory is no budget, because the crash that loses the counter is exactly the event the
+    budget is meant to survive. Callers write the block id as the first token of the
+    event detail, which is what this matches on.
+    """
+    row = db.connection.execute(
+        "SELECT COUNT(*) AS n FROM job_events "
+        "WHERE job_id = ? AND kind = ? AND (detail = ? OR detail LIKE ?)",
+        (job_id, kind, block_id, f"{block_id} %"),
     ).fetchone()
     return int(row["n"]) if row else 0
 

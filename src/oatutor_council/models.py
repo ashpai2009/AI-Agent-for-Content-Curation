@@ -367,6 +367,25 @@ class ProblemBlock(BaseModel):
     def rows_of_type(self, row_type: RowType) -> tuple[WorkbookRow, ...]:
         return tuple(r for r in self.rows if r.row_type is row_type)
 
+    @property
+    def graded_rows(self) -> tuple[int, ...]:
+        """The rows a student has to answer, and therefore the rows an audit must check.
+
+        Defined by **row type**, not by whether the answer cell has anything in it. A step
+        with an empty `Answer` is a defect, and defining the graded set from the content
+        would quietly excuse an audit from looking at exactly the rows most likely to be
+        broken. Hints are excluded: they are read, not answered.
+
+        This is the denominator for audit coverage. An audit that returns no coverage
+        record for one of these rows has not examined it, which is a different statement
+        from having examined it and found nothing.
+        """
+        return tuple(
+            row.row
+            for row in self.rows
+            if row.row_type in (RowType.STEP, RowType.SCAFFOLD)
+        )
+
     def contains_row(self, row: int) -> bool:
         return self.start_row <= row <= self.end_row
 
@@ -681,10 +700,15 @@ class IssueState(StrEnum):
     PATCH_REJECTED = "patch_rejected"
     REVISION_REQUESTED = "revision_requested"
     ACCEPTED = "accepted"
-    #: Somebody looked at the alleged defect and showed it is not there. Reachable only
-    #: with evidence -- from a deterministic recheck, or from an adjudicator that analysed
-    #: the cells and said why the content is correct. A second audit merely *not*
-    #: mentioning the cells is `UNCONFIRMED`, which is a different claim.
+    #: Somebody examined the alleged defect and stated why the content is correct --
+    #: either a deterministic recheck, or an adjudicator that analysed the cells and gave
+    #: its reasoning. **That is a stated, inspectable reason and not a proof.** An
+    #: adjudicator can reason wrongly and refute a real defect; what its evidence
+    #: establishes is that it explained itself, not that its mathematics is true.
+    #:
+    #: What is ruled out is the weaker thing that used to reach this state: a second audit
+    #: simply not mentioning the cells. That is `UNCONFIRMED`, and it is a different
+    #: claim about the world.
     REFUTED = "refuted"
     SUPERSEDED = "superseded"
     #: One audit found a defect, an independent one did not, and nothing established
@@ -797,6 +821,13 @@ class ReviewVerdict(BaseModel):
     #: Empty on every other kind of verdict, and on every row written before this existed.
     canonical_cells: tuple[tuple[int, int], ...] = ()
     canonical_category: IssueCategory | None = None
+    #: A claim-blind audit that stated the block is sound *and* reported nothing on the
+    #: disputed rows. Both halves, or it stays false: an audit that named a related defect
+    #: has not cleared the row, and an audit with no way to assert soundness has not
+    #: asserted it. It is the only thing that lets a sibling repair close a claim without
+    #: adjudication, so it is recorded rather than recomputed -- the findings behind it do
+    #: not survive the crash that the cached verdict is read back across.
+    block_verified_sound: bool = False
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @model_validator(mode="after")

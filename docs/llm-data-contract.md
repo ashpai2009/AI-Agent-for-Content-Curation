@@ -125,6 +125,13 @@ verify it.
 second audit named any cell on a disputed row it is a disagreement about extent; if it said
 nothing about those rows it is silence. Both go to the **Adjudicator**, a fifth role.
 
+Both scan roles must additionally return one **coverage record per graded row** of every
+block they are sent — the row's derived answer, its recorded answer, and whether the answer,
+its type, its requested form, its domain, its solution count, its units and its choice list
+were checked. A response short of its graded rows is scanned again rather than accepted; a
+row nothing ever accounts for is recorded and denies the job success. No workbook content
+leaves the service to make this happen: it is a field on the same response.
+
 ### Adjudicator
 
 The Adjudicator is the only agent in this system that is shown another agent's conclusion.
@@ -138,7 +145,9 @@ It returns one of three verdicts with the check it ran:
 - `defect_confirmed` — the repair proceeds, and its cell list, category and structural
   classification replace the disputed claim's.
 - `content_correct` — the claim is refuted. This is the only route from a model-only claim
-  to a refutation, and it requires stated evidence.
+  to a refutation, and it requires stated reasoning. That reasoning is recorded and can be
+  read; it is not a proof, and an adjudicator that reasons wrongly can still refute a real
+  defect. What the requirement rules out is refutation by silence.
 - `undecided` — the issue ends `unconfirmed`. Nothing is edited, no attempt is spent, and
   the job cannot report success.
 

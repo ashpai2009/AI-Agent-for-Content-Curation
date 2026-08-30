@@ -5,8 +5,14 @@ This is the fifth agent, and it was added because the pipeline had no way to say
 role, and anything short of exact agreement -- the same cells, the same category -- was
 recorded as `REFUTED`. On two held-out workbooks that discarded three defects the first
 audit had correctly found. **"The second agent did not independently rediscover it" and
-"the second agent showed it is not there" are different findings**, and only the second
-one justifies closing an issue.
+"the second agent examined it and says the content is right" are different findings**, and
+only the second one justifies closing an issue.
+
+That is a lower bar than it sounds, and it is worth being exact about: requiring stated
+reasoning establishes that this agent explained itself, **not that its mathematics is
+true**. An adjudicator can reason badly and refute a real defect. What the requirement
+removes is the specific failure that was measured -- refutation by silence, where nobody
+examined the claim at all -- and nothing stronger than that.
 
 So the blind check now classifies rather than decides:
 
