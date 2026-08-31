@@ -131,6 +131,9 @@ def test_current_semantic_prompts_pin_the_live_pilot_lessons():
     assert "every exact row-and-column cell that must change" in auditor
     assert "Do not simplify, restyle, paraphrase" in writer
     assert "exact fraction to a decimal" in writer
+    assert "Every `after` value must be the exact text OATutor can grade" in writer
+    assert "not a sentence explaining the mathematics" in writer
+    assert "Do not relabel an unchanged Answer between `numeric` and `algebra`" in writer
     assert "requested form, units, domain, number of solutions" in independent
     assert "every exact row-and-column cell that must change" in independent
 
@@ -234,6 +237,43 @@ def test_instructions_are_not_neutralised():
 def test_a_valid_response_is_parsed():
     client = ScriptedLLMClient(default=Reply(verdict="accept"))
     assert call_structured(client, request(), Reply).verdict == "accept"
+
+
+def test_defaulted_fields_are_required_in_the_transmitted_schema():
+    """A default is service convenience, not permission for the model to stay silent."""
+    client = ScriptedLLMClient(default=Reply(verdict="accept"))
+
+    call_structured(client, request(), Reply)
+
+    assert client.requests[0].schema["required"] == ["verdict", "note"]
+
+
+def test_an_omitted_defaulted_field_is_retried_then_refused():
+    """Provider schema enforcement is verified locally rather than merely requested."""
+    client = ScriptedLLMClient(default='{"verdict":"accept"}')
+
+    with pytest.raises(MalformedResponse, match=r"\$\.note"):
+        call_structured(client, request(), Reply)
+
+    assert client.call_count() == 2
+
+
+def test_nested_defaulted_fields_are_required_too():
+    class Item(BaseModel):
+        value: str
+        checked: bool = False
+
+    class Envelope(BaseModel):
+        items: list[Item] = []
+
+    client = ScriptedLLMClient(default=Envelope(items=[Item(value="x")]))
+    nested_request = request(schema=Envelope.model_json_schema())
+
+    call_structured(client, nested_request, Envelope)
+
+    sent = client.requests[0].schema
+    assert sent["required"] == ["items"]
+    assert sent["$defs"]["Item"]["required"] == ["value", "checked"]
 
 
 def test_malformed_output_is_retried_once_and_then_refused():

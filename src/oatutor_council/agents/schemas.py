@@ -1,4 +1,4 @@
-"""Structured response schemas for the five agents.
+"""Structured response schemas for the council's six agent roles.
 
 Every model call is schema-constrained, and each schema is validated against here rather
 than parsed out of prose. The split between public artefact and private reasoning happens
@@ -69,7 +69,15 @@ class AuditorFinding(BaseModel):
         ),
     )
     problem: str = Field(description="What is wrong, in one sentence")
-    expected: str = Field(default="", description="What the content should be, if known")
+    expected: str = Field(
+        default="",
+        description=(
+            "The exact validator-safe replacement text for the target cell, with no "
+            "explanation or alternatives. For a domain restriction use symbolic syntax "
+            "such as x!=4 or interval notation, not an English sentence. Empty only when "
+            "the exact replacement is genuinely unknown"
+        ),
+    )
     severity: Severity = Severity.ERROR
     #: Structural columns are repairable only under a finding that classifies itself as
     #: structural, so this field decides whether the defect can be fixed at all.
@@ -328,7 +336,15 @@ class IndependentFinding(BaseModel):
         ),
     )
     problem: str
-    expected: str = ""
+    expected: str = Field(
+        default="",
+        description=(
+            "The exact validator-safe replacement text for the target cell, with no "
+            "explanation or alternatives. For a domain restriction use symbolic syntax "
+            "such as x!=4 or interval notation, not an English sentence. Empty only when "
+            "the exact replacement is genuinely unknown"
+        ),
+    )
     severity: Severity = Severity.ERROR
     category: IssueCategory = IssueCategory.MATHEMATICS
 

@@ -37,8 +37,12 @@ from oatutor_council.agents.schemas import (
     WriterResponse,
 )
 from oatutor_council.config import Settings
-from oatutor_council.council import CLI_ADAPTER_VERSION, CurationCouncil
-from oatutor_council.llm.base import AgentRole
+from oatutor_council.council import (
+    CLI_ADAPTER_VERSION,
+    PIPELINE_CONTRACT_VERSION,
+    CurationCouncil,
+)
+from oatutor_council.llm.base import AgentRole, require_explicit_fields
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import CurationJob, FailureReason, JobState, SourcePath
 from oatutor_council.persistence import (
@@ -249,7 +253,9 @@ def test_batch_size_one_sends_the_single_block_payload_and_schema(setup):
     # forging a fence copied from an earlier one -- so it is normalised out before the
     # comparison, and asserted to differ afterwards.
     assert _without_token(delegated.user_payload) == _without_token(direct.user_payload)
-    assert delegated.schema == direct.schema == AuditorResponse.model_json_schema()
+    assert delegated.schema == direct.schema == require_explicit_fields(
+        AuditorResponse.model_json_schema()
+    )
     assert delegated.system_prompt == direct.system_prompt
     assert _tokens(delegated.user_payload) != _tokens(direct.user_payload)
 
@@ -286,7 +292,9 @@ def test_a_sweep_of_one_block_also_delegates(setup):
     assert _without_token(delegated.requests[0].user_payload) == _without_token(
         direct.requests[0].user_payload
     )
-    assert delegated.requests[0].schema == IndependentReviewResponse.model_json_schema()
+    assert delegated.requests[0].schema == require_explicit_fields(
+        IndependentReviewResponse.model_json_schema()
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -674,6 +682,29 @@ def test_a_job_resumed_under_a_different_adapter_stops_rather_than_carrying_on(s
     assert result.failure_reason is FailureReason.CONFIG
     kinds = [e["kind"] for e in list_events(db, "job-1")]
     assert "settings_migration_required" in kinds
+
+
+def test_a_job_resumed_under_a_different_pipeline_contract_stops(setup):
+    """A job cannot mix permissive and explicit response contracts across its calls."""
+    db, _ = setup
+    council(setup, batched_client(), scan_batch_size=3).run(max_steps=2)
+    assert (
+        load_job_settings(db, "job-1")["pipeline_contract_version"]
+        == PIPELINE_CONTRACT_VERSION
+    )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "oatutor_council.council.PIPELINE_CONTRACT_VERSION",
+            PIPELINE_CONTRACT_VERSION + 1,
+        )
+        result = council(setup, batched_client(), scan_batch_size=3).run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.CONFIG
+    assert "settings_migration_required" in {
+        event["kind"] for event in list_events(db, "job-1")
+    }
 
 
 def test_a_job_pinned_before_the_adapter_version_existed_is_not_a_mismatch(setup):

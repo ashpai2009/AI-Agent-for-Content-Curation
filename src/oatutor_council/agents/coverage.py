@@ -21,10 +21,28 @@ is the case the misses were actually in.
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, Sequence
 
 from ..models import ProblemBlock
+from ..validation.mathematics import MathVerdict, answers_equivalent
 from .schemas import RowCoverage
+
+
+_SIMPLE_ASSIGNMENT = re.compile(r"^[A-Za-z][A-Za-z0-9]*=(.+)$")
+
+
+def _assignment_value(text: str) -> str:
+    """Return the value from a simple ``x=...`` answer, otherwise the input.
+
+    A verifier may solve to ``7`` while the workbook records ``x=sqrt(49)``. Comparing
+    those whole strings is unparseable, even though their values are equivalent. Only a
+    single identifier on the left is stripped; a calculation such as ``2+3=5`` and a
+    function definition such as ``f(x)=...`` keep their full meaning.
+    """
+    compact = "".join(text.split())
+    match = _SIMPLE_ASSIGNMENT.fullmatch(compact)
+    return match.group(1) if match else text
 
 
 def coverage_gaps(
@@ -50,7 +68,9 @@ def coverage_gaps(
     return tuple(row for row in graded if seen.get(row, 0) != 1)
 
 
-def self_contradicting(coverage: Iterable[RowCoverage]) -> tuple[int, ...]:
+def self_contradicting(
+    coverage: Iterable[RowCoverage], *, graded_rows: Iterable[int] | None = None
+) -> tuple[int, ...]:
     """Rows whose own record does not hold together.
 
     A row that reports a computed answer differing from the submitted one while also
@@ -59,12 +79,45 @@ def self_contradicting(coverage: Iterable[RowCoverage]) -> tuple[int, ...]:
     written the same value two ways -- but it is exactly the kind of thing a person
     auditing the audit needs pointed out, so it is surfaced rather than resolved here.
     """
+    allowed = set(graded_rows) if graded_rows is not None else None
     contradictions = []
     for record in coverage:
+        # A response is contracted to contain coverage only for graded rows. Preserve a
+        # stray record in the audit trail, but do not turn commentary about a hint or
+        # problem row into a contradiction about an answer that row does not carry.
+        if allowed is not None and record.row not in allowed:
+            continue
         computed = record.computed_answer.strip()
         submitted = record.submitted_answer.strip()
         if not computed or not submitted:
             continue
-        if record.answer_correct and computed.casefold() != submitted.casefold():
+        if not record.answer_correct:
+            continue
+
+        # Models often put a short derivation after the answer despite being asked for a
+        # short value: ``83 (because 7+19*4=83)``. The live verifier also wrote calculations
+        # such as ``20000*0.85**2=14450`` beside a submitted ``14450``. Those records are
+        # verbose, not contradictory. Strip only a parenthetical introduced after a space
+        # (never a function call such as ``sqrt(3)``), and accept an exact final RHS.
+        concise = computed
+        for marker in (" (", " is ", " since ", " because "):
+            concise = concise.split(marker, 1)[0]
+        concise = concise.strip()
+        compact_computed = "".join(concise.casefold().split())
+        compact_submitted = "".join(submitted.casefold().split())
+        if compact_computed == compact_submitted:
+            continue
+        if (
+            "=" in compact_computed
+            and compact_computed.rsplit("=", 1)[1] == compact_submitted
+        ):
+            continue
+
+        verdict = answers_equivalent(
+            _assignment_value(concise), _assignment_value(submitted)
+        )
+        # UNKNOWN is not evidence of contradiction. This is a safety gate, so it may only
+        # accuse a record when deterministic mathematics says the two values differ.
+        if verdict is MathVerdict.DIFFERENT:
             contradictions.append(record.row)
     return tuple(contradictions)

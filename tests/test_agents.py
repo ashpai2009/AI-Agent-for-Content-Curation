@@ -222,6 +222,37 @@ def test_a_row_that_contradicts_itself_is_surfaced_not_resolved():
     assert self_contradicting([record("6", "6", True)]) == ()
     # Nothing to compare is not a contradiction.
     assert self_contradicting([record("", "5", True)]) == ()
+    # Coverage is contracted to graded rows. A model's stray commentary about a hint is
+    # retained in the call record, but must not become an answer contradiction.
+    assert self_contradicting(
+        [record("the hint should add", "the hint says subtract", True)],
+        graded_rows=(4,),
+    ) == ()
+
+
+def test_verbose_but_equivalent_coverage_is_not_called_contradictory():
+    from oatutor_council.agents.coverage import self_contradicting
+
+    def record(computed, submitted):
+        return RowCoverage(
+            row=3,
+            computed_answer=computed,
+            submitted_answer=submitted,
+            answer_correct=True,
+            answer_type_correct=True,
+        )
+
+    records = [
+        record("83 (because 7+19*4=83)", "83"),
+        record("20000*0.85**2=14450", "14450"),
+        record("x=2 (the denominator is zero)", "2"),
+        record("x=2 is excluded from the domain", "2"),
+        record("7", "x=sqrt(49)"),
+        record("x=sqrt(49)", "x=7"),
+        record("lim_(x->2-) f(x) = 4", "lim_(x->2-)f(x)=4"),
+    ]
+
+    assert self_contradicting(records) == ()
 
 
 def _adjudication_context() -> AdjudicationContext:

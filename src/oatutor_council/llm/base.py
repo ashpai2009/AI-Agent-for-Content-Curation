@@ -13,12 +13,13 @@ the provider module stays small enough to check against the SDK notes line by li
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import random
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Callable, Protocol, TypeVar
 
@@ -32,6 +33,95 @@ def canonical_schema_json(schema: dict[str, Any]) -> str:
     return json.dumps(
         schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
+
+
+def require_explicit_fields(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return the provider schema with every declared object field required.
+
+    Pydantic defaults are useful inside the service and in test doubles, but they are a
+    dangerous LLM contract. A model can omit a defaulted field and Pydantic will silently
+    manufacture its value. That turned an omitted ``coverage`` list into an empty list,
+    so a live run spent two calls per block while accounting for zero graded rows.
+
+    Keep the tolerant domain models, but make the transmitted contract explicit. This
+    walks nested ``$defs`` too: batch items and ``RowCoverage`` live there. Optional
+    values remain optional in type (their schema permits ``null``); the model must merely
+    say which value it chose rather than receiving an invisible default.
+    """
+
+    hardened = copy.deepcopy(schema)
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                node["required"] = list(properties)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(hardened)
+    return hardened
+
+
+def _missing_explicit_fields(
+    value: Any, schema: dict[str, Any], root: dict[str, Any], path: str = "$"
+) -> list[str]:
+    """Find required object members missing from one JSON value.
+
+    The CLI is asked to obey the hardened schema, but the service verifies the same
+    property itself. Otherwise a provider regression could still be laundered through
+    Pydantic defaults after the call returned.
+    """
+
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/"):
+        target: Any = root
+        for part in reference[2:].split("/"):
+            target = target[part.replace("~1", "/").replace("~0", "~")]
+        return _missing_explicit_fields(value, target, root, path)
+
+    alternatives = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(alternatives, list):
+        # Pydantic performs the full union/type validation. Here we only need the branch
+        # whose shape can contain required object members.
+        candidates = [
+            candidate
+            for candidate in alternatives
+            if isinstance(candidate, dict)
+            and (
+                (isinstance(value, dict) and candidate.get("type") == "object")
+                or (isinstance(value, list) and candidate.get("type") == "array")
+            )
+        ]
+        if candidates:
+            return _missing_explicit_fields(value, candidates[0], root, path)
+        return []
+
+    missing: list[str] = []
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            missing.extend(f"{path}.{name}" for name in required if name not in value)
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for name, child_schema in properties.items():
+                if name in value and isinstance(child_schema, dict):
+                    missing.extend(
+                        _missing_explicit_fields(
+                            value[name], child_schema, root, f"{path}.{name}"
+                        )
+                    )
+    elif isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for index, item in enumerate(value):
+                missing.extend(
+                    _missing_explicit_fields(item, items, root, f"{path}[{index}]")
+                )
+    return missing
 
 
 class AgentRole(StrEnum):
@@ -412,6 +502,9 @@ def call_structured_recorded(
     the trail; what a derived record must not do is claim provenance from a response
     nobody used.
     """
+    # The recorded hash and the CLI argument must describe the contract actually enforced,
+    # so harden the request before it reaches either layer rather than only in the adapter.
+    request = replace(request, schema=require_explicit_fields(request.schema))
     last: Exception | None = None
     for _ in range(retries + 1):
         response = client.complete(request)
@@ -421,8 +514,14 @@ def call_structured_recorded(
                 status=response.status,
             )
         try:
-            return response_model.model_validate_json(response.text), response.call_id
-        except ValidationError as error:
+            raw = json.loads(response.text)
+            missing = _missing_explicit_fields(raw, request.schema, request.schema)
+            if missing:
+                raise ValueError(
+                    "response omitted required field(s): " + ", ".join(missing[:12])
+                )
+            return response_model.model_validate(raw), response.call_id
+        except (json.JSONDecodeError, ValidationError, ValueError) as error:
             last = error
     raise MalformedResponse(
         f"{request.role} returned output that does not satisfy "

@@ -347,7 +347,10 @@ FINAL_GATE_ROUND = 1_000
 #: defaulting to 2, after 1 was measured to abort correct calls before their structured
 #: output arrived. That changes what every call carries, which is exactly what this
 #: constant exists to record -- a job that started under 1 must not finish under 2.
-CLI_ADAPTER_VERSION = 2
+#: Version 3 distinguishes an explicit logged-out CLI from a transient runtime token
+#: refresh failure. The latter is retried; mixing the two readings inside one resumed job
+#: would give identical recorded settings different failure semantics.
+CLI_ADAPTER_VERSION = 3
 
 #: Version of orchestration and user-payload construction that changes what agents see or
 #: when workbook bytes are committed. Prompt files are pinned separately; this covers the
@@ -365,7 +368,21 @@ CLI_ADAPTER_VERSION = 2
 #: deterministic gate, a sixth agent, a new job state, and a success condition about the
 #: file as handed over rather than as scanned. A job that ran half under each would have
 #: verified half its blocks after their last edit and half not at all.
-PIPELINE_CONTRACT_VERSION = 6
+#: 7 (2026-08-30): every field declared in an LLM response schema is required on the wire
+#: and checked for explicit presence before Pydantic can apply a default. Earlier calls
+#: could omit coverage (and any other defaulted decision), which the service silently
+#: turned into a value the model never supplied.
+#: 8 (2026-08-30): finding ``expected`` values are exact validator-safe cell replacements,
+#: not prose explanations or lists of alternatives. That field becomes Writer input, so
+#: changing its meaning mid-job would change the repair even under the same finding.
+#: 9 (2026-08-30): a safely parsed Answer with a genuine free symbol is deterministic
+#: evidence for ``algebra`` when the recorded answerType is ``numeric``. This extends the
+#: earlier equation-only rule without classifying constants or exact fractions, and changes
+#: which standalone type repairs the patch gate authorises.
+#: 10 (2026-08-30): self-contradiction checks apply only to a block's graded rows. Stray
+#: model commentary about a hint or problem row remains durable, but can no longer withhold
+#: final certification or manufacture a curator warning about an Answer the row lacks.
+PIPELINE_CONTRACT_VERSION = 10
 
 
 class BudgetExhausted(Exception):
@@ -1143,9 +1160,7 @@ class CurationCouncil:
             # complete. A short record is the more interesting one to be able to read
             # afterwards, and a trail that keeps only the passes cannot show what was
             # missing.
-            self._persist_coverage(
-                block.block_id, "audited", result.call_id, result.coverage
-            )
+            self._persist_coverage(block, "audited", result.call_id, result.coverage)
             # Findings are kept either way. A response can be short on coverage and still
             # be right about what it did report, and throwing that away to punish an
             # incomplete answer would lose detection to make a point.
@@ -1192,7 +1207,9 @@ class CurationCouncil:
             reasons.append(
                 "the block was reported as not sound without naming a single defect"
             )
-        contradictions = self_contradicting(result.coverage)
+        contradictions = self_contradicting(
+            result.coverage, graded_rows=block.graded_rows
+        )
         if contradictions:
             listed = ", ".join(str(row) for row in contradictions)
             reasons.append(
@@ -1202,7 +1219,7 @@ class CurationCouncil:
         return reasons
 
     def _persist_coverage(
-        self, block_id: str, phase: str, call_id: str, records
+        self, block: ProblemBlock, phase: str, call_id: str, records
     ) -> None:
         """Write down what a scan said it checked, and flag a record that refutes itself.
 
@@ -1219,18 +1236,20 @@ class CurationCouncil:
         record_coverage(
             self.db,
             self.job_id,
-            block_id=block_id,
+            block_id=block.block_id,
             phase=phase,
             call_id=call_id,
             records=records,
         )
-        contradictions = self_contradicting(records)
+        contradictions = self_contradicting(
+            records, graded_rows=block.graded_rows
+        )
         if contradictions:
             record_event(
                 self.db,
                 self.job_id,
                 "coverage_self_contradicting",
-                f"{block_id} {phase} coverage reports row(s) "
+                f"{block.block_id} {phase} coverage reports row(s) "
                 f"{', '.join(str(row) for row in contradictions)} correct while its own "
                 "computed and submitted answers differ",
             )
@@ -1306,10 +1325,11 @@ class CurationCouncil:
                     source=IssueSource.INDEPENDENT_REVIEWER,
                     reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
                 )
-                self._persist_coverage(
-                    result.block_id, "swept", result.call_id, result.coverage
-                )
                 block = by_id.get(result.block_id)
+                if block is not None:
+                    self._persist_coverage(
+                        block, "swept", result.call_id, result.coverage
+                    )
                 if block is not None and self._coverage_incomplete(
                     block, result.coverage_gaps, "swept"
                 ):
@@ -1420,7 +1440,7 @@ class CurationCouncil:
             )
 
         self._persist_coverage(
-            block.block_id, FINAL_SEMANTIC_PHASE, result.call_id, result.coverage
+            block, FINAL_SEMANTIC_PHASE, result.call_id, result.coverage
         )
         record_event(
             self.db,

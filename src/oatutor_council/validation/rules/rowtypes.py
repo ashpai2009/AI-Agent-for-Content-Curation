@@ -14,6 +14,7 @@ from ...models import (
     Severity,
     ValidationFinding,
 )
+from ..mathematics import UnparseableExpression, parse_expression
 from .registry import RuleContext, finding, rule
 
 
@@ -56,15 +57,16 @@ _VARIABLE_LEFT_HAND_SIDE = re.compile(
     "ANSWER_TYPE_MISMATCH",
     severity=Severity.ERROR,
     category=IssueCategory.ROW_TYPE,
-    description="answerType is numeric although Answer is an equation in a variable.",
+    description="answerType is numeric although Answer contains a free variable.",
 )
 def answer_type_mismatch(context: RuleContext) -> Iterable[ValidationFinding]:
     """Catch the high-confidence semantic mismatch that cost the pilot a whole issue.
 
-    This intentionally recognizes only an explicit equation whose left side contains a
-    variable. It does not try to classify every mathematical string: fractions, radicals
-    and scientific notation can all be numeric, and a broad letters-means-algebra rule
-    would turn LaTeX commands such as ``\\frac`` into false positives.
+    This recognizes an explicit equation whose left side contains a variable, and a
+    safely parsed expression with a genuine free symbol. It does not use a broad
+    letters-means-algebra heuristic: fractions, radicals, constants and scientific
+    notation can all be numeric, while LaTeX commands such as ``\\frac`` contain letters
+    without containing variables.
     """
     block = context.block
     if block is None:
@@ -73,15 +75,24 @@ def answer_type_mismatch(context: RuleContext) -> Iterable[ValidationFinding]:
         if row.answer_type is not AnswerType.NUMERIC:
             continue
         answer = row.get(ColumnKey.ANSWER).strip().strip("$").strip()
-        if "=" not in answer:
-            continue
-        left = answer.split("=", 1)[0]
-        if not _VARIABLE_LEFT_HAND_SIDE.search(left):
+        variable_equation = False
+        if "=" in answer:
+            left = answer.split("=", 1)[0]
+            variable_equation = bool(_VARIABLE_LEFT_HAND_SIDE.search(left))
+
+        free_variable_expression = False
+        if not variable_equation:
+            try:
+                free_variable_expression = bool(parse_expression(answer).free_symbols)
+            except UnparseableExpression:
+                pass
+
+        if not variable_equation and not free_variable_expression:
             continue
         yield finding(
             context,
             "ANSWER_TYPE_MISMATCH",
-            "answerType is numeric but Answer is an equation in a variable",
+            "answerType is numeric but Answer contains a free variable",
             row=row.row,
             column=FIXED_COLUMNS[ColumnKey.ANSWER_TYPE],
             column_key=ColumnKey.ANSWER_TYPE,

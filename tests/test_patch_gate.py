@@ -298,6 +298,78 @@ def test_a_model_cannot_renumber_a_valid_identifier_merely_to_close_a_gap(parsed
     assert result.rejection.code is RejectionCode.STRUCTURAL_EVIDENCE_MISSING
 
 
+def test_a_model_cannot_relabel_an_unchanged_fraction_by_preference(make_workbook):
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("prob1", title="Give the exact probability."),
+                step("prob1", answer="7/12", answer_type="algebra"),
+            ]
+        )
+    )
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER_TYPE, "algebra", "numeric")),
+        make_issue(
+            category=IssueCategory.ROW_TYPE,
+            is_structural=True,
+            cells=((3, 6),),
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+
+    assert result.rejection.code is RejectionCode.STRUCTURAL_EVIDENCE_MISSING
+
+
+def test_a_proven_equation_type_mismatch_can_still_be_repaired(make_workbook):
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("solve1", title="Solve."),
+                step("solve1", answer="x=7", answer_type="numeric"),
+            ]
+        )
+    )
+    result = check(
+        make_patch(edit(3, ColumnKey.ANSWER_TYPE, "numeric", "algebra")),
+        make_issue(
+            category=IssueCategory.ROW_TYPE,
+            is_structural=True,
+            cells=((3, 6),),
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+
+    assert result.accepted, result.rejection
+
+
+def test_an_answer_and_its_type_can_be_repaired_together(make_workbook):
+    parsed = read_workbook(
+        make_workbook(
+            [
+                problem("growth1", title="Give the exact doubling time."),
+                step("growth1", answer="8.66", answer_type="numeric"),
+            ]
+        )
+    )
+    result = check(
+        make_patch(
+            edit(3, ColumnKey.ANSWER, "8.66", "log(2)/log(1.08)"),
+            edit(3, ColumnKey.ANSWER_TYPE, "numeric", "algebra"),
+        ),
+        make_issue(
+            category=IssueCategory.ROW_TYPE,
+            is_structural=True,
+            cells=((3, 5), (3, 6)),
+        ),
+        parsed.blocks[0],
+        parsed,
+    )
+
+    assert result.accepted, result.rejection
+
+
 # --------------------------------------------------------------------------------------
 # Regression detection
 # --------------------------------------------------------------------------------------

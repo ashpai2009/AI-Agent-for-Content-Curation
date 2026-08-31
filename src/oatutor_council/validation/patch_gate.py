@@ -31,6 +31,7 @@ from ..models import (
     ColumnKey,
     Issue,
     IssueCategory,
+    IssueSource,
     ParsedWorkbook,
     Patch,
     PatchRejection,
@@ -410,6 +411,62 @@ def _unsupported_identifier_renumber(
     return structural[0]
 
 
+def _unsupported_answer_type_relabel(
+    issue: Issue,
+    parsed: ParsedWorkbook,
+    block: ProblemBlock,
+    edits: Sequence[CellEdit],
+) -> CellEdit | None:
+    """Reject a model-invented standalone ``numeric``/``algebra`` policy.
+
+    The curator's rules say those are valid answer types but do not define a complete
+    classifier between them. A plain exact fraction is the concrete ambiguous case: real
+    workbooks use both conventions, and the live regression changed a clean ``5/18`` row
+    from ``algebra`` to ``numeric`` solely because the model preferred that label.
+
+    Three sources of authority remain:
+
+    * a registered rule fires at the same cell (currently the high-confidence case of an
+      explicit variable equation labelled numeric);
+    * the curator's instruction document explicitly asks for the relabel; or
+    * the same patch changes the Answer on that row, so answer and type are one coordinated
+      semantic correction rather than a preference about an already-correct value.
+    """
+    if issue.source is IssueSource.INSTRUCTION_DOCUMENT:
+        return None
+
+    answer_rows = {
+        edit.row for edit in edits if edit.column_key is ColumnKey.ANSWER
+    }
+    candidates = [
+        edit
+        for edit in edits
+        if edit.column_key is ColumnKey.ANSWER_TYPE
+        and {edit.before.strip(), edit.after.strip()} == {"numeric", "algebra"}
+        and edit.row not in answer_rows
+    ]
+    if not candidates:
+        return None
+
+    findings = _findings_for(parsed, block)
+    for edit in candidates:
+        supported = any(
+            finding.row == edit.row
+            and finding.column == edit.column
+            and finding.code in REGISTRY
+            and REGISTRY[finding.code].category
+            in {
+                IssueCategory.STRUCTURE,
+                IssueCategory.ROW_TYPE,
+                IssueCategory.DEPENDENCY,
+            }
+            for finding in findings
+        )
+        if not supported:
+            return edit
+    return None
+
+
 def _choices_changed(edit: CellEdit) -> str | None:
     before = [part.strip() for part in edit.before.split(MC_CHOICE_DELIMITER)]
     after = [part.strip() for part in edit.after.split(MC_CHOICE_DELIMITER)]
@@ -668,6 +725,20 @@ def validate_patch(
             "does not identify a structural defect",
             row=structural[0].row,
             column=structural[0].column,
+        )
+
+    unsupported_type = _unsupported_answer_type_relabel(
+        issue, parsed, block, patch.edits
+    )
+    if unsupported_type is not None:
+        return _reject(
+            RejectionCode.STRUCTURAL_EVIDENCE_MISSING,
+            "the patch relabels an unchanged Answer between numeric and algebra, but "
+            "the workbook rules do not define that relabel and no deterministic finding "
+            "supports this cell; preserve the existing type unless the curator explicitly "
+            "requires a different convention",
+            row=unsupported_type.row,
+            column=unsupported_type.column,
         )
 
     patched = simulate_block(block, patch.edits)

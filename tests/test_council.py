@@ -990,9 +990,10 @@ def test_a_repair_invalidates_the_verification_that_preceded_it(setup):
                     coverage=full_coverage(request.user_payload),
                     findings=[
                         IndependentFinding(
-                            cells=[{"row": 3, "column": "answer_type"}],
-                            problem="answerType should be numeric here.",
-                            category="row_type",
+                            cells=[{"row": 3, "column": "answer"}],
+                            problem="the answer should be pi/3 here.",
+                            expected="pi/3",
+                            category="mathematics",
                         )
                     ],
                 )
@@ -1016,22 +1017,23 @@ def test_a_repair_invalidates_the_verification_that_preceded_it(setup):
                 coverage=full_coverage(request.user_payload),
                 findings=[
                     IndependentFinding(
-                        cells=[{"row": 3, "column": "answer_type"}],
-                        problem="answerType should be numeric here.",
-                        category="row_type",
+                        cells=[{"row": 3, "column": "answer"}],
+                        problem="the answer should be pi/3 here.",
+                        expected="pi/3",
+                        category="mathematics",
                     )
                 ],
             )
         if request.role is AgentRole.WRITER:
-            if "row 3 column 6" in request.user_payload:
+            if "row 3 column 5" in request.user_payload:
                 return WriterResponse(
-                    derivation="",
+                    derivation="the corrected result is pi/3",
                     edits=[
                         {
                             "row": 3,
-                            "column": "answer_type",
-                            "before": "algebra",
-                            "after": "numeric",
+                            "column": "answer",
+                            "before": "pi/6",
+                            "after": "pi/3",
                         }
                     ],
                 )
@@ -1072,9 +1074,10 @@ def test_final_verification_rounds_are_bounded_and_running_out_is_not_a_pass(set
                 coverage=full_coverage(request.user_payload),
                 findings=[
                     IndependentFinding(
-                        cells=[{"row": 3, "column": "answer_type"}],
-                        problem="answerType is still wrong.",
-                        category="row_type",
+                        cells=[{"row": 3, "column": "answer"}],
+                        problem="the answer is still wrong.",
+                        expected="pi/3",
+                        category="mathematics",
                     )
                 ],
             )
@@ -1094,22 +1097,23 @@ def test_final_verification_rounds_are_bounded_and_running_out_is_not_a_pass(set
                 coverage=full_coverage(request.user_payload),
                 findings=[
                     IndependentFinding(
-                        cells=[{"row": 3, "column": "answer_type"}],
-                        problem="answerType is still wrong.",
-                        category="row_type",
+                        cells=[{"row": 3, "column": "answer"}],
+                        problem="the answer is still wrong.",
+                        expected="pi/3",
+                        category="mathematics",
                     )
                 ],
             )
         if request.role is AgentRole.WRITER:
-            if "row 3 column 6" in request.user_payload:
+            if "row 3 column 5" in request.user_payload:
                 return WriterResponse(
-                    derivation="",
+                    derivation="the corrected result is pi/3",
                     edits=[
                         {
                             "row": 3,
-                            "column": "answer_type",
-                            "before": "algebra",
-                            "after": "numeric",
+                            "column": "answer",
+                            "before": "pi/6",
+                            "after": "pi/3",
                         }
                     ],
                 )
@@ -1149,6 +1153,10 @@ def test_a_short_final_coverage_record_leaves_the_block_unverified(setup):
             return AuditorResponse(coverage=full_coverage(request.user_payload))
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
             return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
                 block_is_sound=True, coverage=full_coverage(request.user_payload)
             )
         if request.role is AgentRole.WRITER:
@@ -1315,6 +1323,10 @@ def test_a_row_nothing_ever_accounted_for_denies_success(setup):
             return AuditorResponse(coverage=full_coverage(request.user_payload)[:1])
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
             return IndependentReviewResponse(
+                block_is_sound=True, coverage=full_coverage(request.user_payload)
+            )
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(
                 block_is_sound=True, coverage=full_coverage(request.user_payload)
             )
         if request.role is AgentRole.WRITER:

@@ -503,11 +503,19 @@ def extract_usage(envelope: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
 # Failure classification
 # --------------------------------------------------------------------------------------
 
-_AUTH_SIGNALS = (
+_AUTH_CONFIGURATION_SIGNALS = (
     "not logged in",
     "please run claude auth login",
     "authentication required",
     "invalid api key",
+)
+
+#: These can occur while the CLI still reports a healthy subscription login. In
+#: particular, the 2026-08-30 live regression completed one call, failed the next with a
+#: credential signal, and reported ``loggedIn: true`` immediately afterwards. Treating
+#: that as permanent configuration failed the whole job on one refresh race. Retrying is
+#: bounded by ``RetryingClient`` and every physical attempt remains recorded and charged.
+_AUTH_TRANSIENT_SIGNALS = (
     "unauthorized",
     "401",
     "oauth token has expired",
@@ -574,7 +582,7 @@ def classify_cli_failure(returncode: int, stdout: str, stderr: str) -> ProviderE
         (stderr.strip() or stdout.strip() or f"claude exited {returncode}")
     )
 
-    if _find(combined, _AUTH_SIGNALS):
+    if _find(combined, _AUTH_CONFIGURATION_SIGNALS):
         return ProviderConfigurationError(
             "the claude CLI is not authenticated. Run `claude auth login` and restart "
             "the service.",
@@ -582,6 +590,8 @@ def classify_cli_failure(returncode: int, stdout: str, stderr: str) -> ProviderE
         )
     if _find(combined, _USAGE_LIMIT_SIGNALS):
         return ProviderUsageLimited(message, resets_at=find_reset_time(combined))
+    if _find(combined, _AUTH_TRANSIENT_SIGNALS):
+        return ProviderUnavailable(message, status="authentication_refresh")
     if _find(combined, _CONFIGURATION_SIGNALS):
         return ProviderConfigurationError(message, status="configuration")
     if _find(combined, _REFUSAL_SIGNALS):
@@ -604,12 +614,14 @@ def classify_envelope_failure(envelope: dict[str, Any]) -> ProviderError:
 
     if _find(text, _USAGE_LIMIT_SIGNALS) or subtype in ("usage_limit", "rate_limit"):
         return ProviderUsageLimited(message, resets_at=find_reset_time(text))
-    if _find(text, _AUTH_SIGNALS):
+    if _find(text, _AUTH_CONFIGURATION_SIGNALS):
         return ProviderConfigurationError(
             "the claude CLI is not authenticated. Run `claude auth login` and restart "
             "the service.",
             status="unauthenticated",
         )
+    if _find(text, _AUTH_TRANSIENT_SIGNALS):
+        return ProviderUnavailable(message, status="authentication_refresh")
     if _find(text, _REFUSAL_SIGNALS) or subtype == "refusal":
         return ProviderRefused(message)
     if subtype in ("error_max_turns", "error_during_execution"):

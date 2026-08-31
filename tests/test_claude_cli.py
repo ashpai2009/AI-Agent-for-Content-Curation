@@ -610,6 +610,27 @@ def test_cli_failures_are_classified_into_one_class(text, expected):
 @pytest.mark.parametrize(
     "text",
     [
+        "401 unauthorized",
+        "oauth token has expired",
+        "failed to refresh credentials",
+    ],
+)
+def test_a_runtime_auth_refresh_failure_is_retryable(text):
+    """A live login can survive a transient credential refresh failure between calls."""
+    error = classify_cli_failure(1, "", text)
+    assert isinstance(error, ProviderUnavailable)
+    assert error.retryable is True
+
+
+def test_an_explicit_logged_out_message_is_still_configuration_failure():
+    error = classify_cli_failure(1, "", "not logged in; please run claude auth login")
+    assert isinstance(error, ProviderConfigurationError)
+    assert error.retryable is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "your limit will reset at 3:00pm",
         '{"resets_at": "2026-08-12T15:00:00Z"}',
         "try again after tomorrow at noon",
