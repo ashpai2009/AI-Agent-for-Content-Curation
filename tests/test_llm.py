@@ -129,6 +129,7 @@ def test_current_semantic_prompts_pin_the_live_pilot_lessons():
 
     assert "requested form, units, domain, number of solutions" in auditor
     assert "every exact row-and-column cell that must change" in auditor
+    assert "plain fraction or constant is not a defect" in auditor
     assert "Do not simplify, restyle, paraphrase" in writer
     assert "exact fraction to a decimal" in writer
     assert "Every `after` value must be the exact text OATutor can grade" in writer
@@ -136,6 +137,7 @@ def test_current_semantic_prompts_pin_the_live_pilot_lessons():
     assert "Do not relabel an unchanged Answer between `numeric` and `algebra`" in writer
     assert "requested form, units, domain, number of solutions" in independent
     assert "every exact row-and-column cell that must change" in independent
+    assert "plain fraction or constant is not a defect" in independent
 
 
 def test_an_unknown_prompt_is_fatal():

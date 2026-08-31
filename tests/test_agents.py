@@ -245,6 +245,7 @@ def test_verbose_but_equivalent_coverage_is_not_called_contradictory():
     records = [
         record("83 (because 7+19*4=83)", "83"),
         record("20000*0.85**2=14450", "14450"),
+        record("P(red then blue) = (5/9)*(4/8) = 20/72 = 5/18", "5/18"),
         record("x=2 (the denominator is zero)", "2"),
         record("x=2 is excluded from the domain", "2"),
         record("7", "x=sqrt(49)"),

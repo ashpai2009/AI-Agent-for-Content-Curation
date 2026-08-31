@@ -270,7 +270,7 @@ class Settings:
     def effort_for(self, role: str) -> str:
         """Reasoning effort for one agent role.
 
-        Per role because the four agents do different work -- but **defaulted the same for
+        Per role because the six roles do different work -- but **defaulted the same for
         all of them**, because lowering it is a quality change and not a cost trim. The
         auditor and the reviewers judge mathematics; a cheaper setting that misses defects
         also *increases* calls by producing more repair rounds. Any per-role value should

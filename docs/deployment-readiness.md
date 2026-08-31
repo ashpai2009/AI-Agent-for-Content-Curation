@@ -24,15 +24,18 @@ Bedrock or Google Vertex AI. It also documents print mode as the programmatic CL
 
 - The uploaded source file is read-only and hash-checked; output is written to a separate
   working copy.
-- Every problem is inspected by the Initial Auditor and again by the independent sweep.
+- Every graded row is accounted for by the Initial Auditor and again by the independent
+  sweep. After repairs, a blind Final Semantic Verifier re-solves every current graded row;
+  edits invalidate that block's final marker until it is checked again.
 - Every unsupported model finding is audited from scratch by the other audit role, without
-  exposing the original accusation; exact target-and-category agreement is required before
-  the Writer may edit. Reviewers then judge the simulated candidate separately.
+  exposing the original accusation. Exact agreement proceeds directly; related or silent
+  results go to a separate adjudicator, and an undecided claim cannot be reported as fixed.
+  Reviewers then judge the simulated candidate separately.
 - A Writer proposal is simulated and reviewed before it can change workbook bytes.
 - Exact target cells, before-values, allowed scope, deterministic regressions, and final
   source-to-output differences are gated in Python.
 - Prompt versions, composed prompt hashes, JSON schemas, provider behavior, and the
-  Python-side pipeline contract (currently version 3) are pinned per job.
+  Python-side pipeline contract (currently version 10) are pinned per job.
 - Each physical model invocation has a durable audit row and a pre-call budget charge.
 - Worker replacement runs recovery before resuming any durable phase.
 - Upload size, job steps, repair attempts, model calls, provider failures, process output,
@@ -68,6 +71,39 @@ The exact model disclosure is in `docs/llm-data-contract.md`.
 - **Operational controls.** Central deployment still needs institutional authentication,
   per-user authorization, managed secrets, durable database/object storage, backups,
   monitoring, incident handling, and an approved data-retention policy.
+
+## 2026-08-30 spent-regression result
+
+Workbooks 1 and 3 were rerun as fresh jobs after the corroboration, row-coverage and final
+semantic-verification redesigns. They are spent regression material, not new held-out
+evidence, but they answer whether the failures that motivated the redesign still occur.
+
+| | Workbook 1 | Workbook 3 |
+|---|---:|---:|
+| Keyed corrections | 13/13 | 10/10 |
+| Unauthorized changed cells | 0 | 0 |
+| Changed clean controls | 0 | 0 |
+| Physical CLI calls | 76 (10 failed/retried) | 92 (11 failed/retried) |
+| Final graded-row markers | 15/15 | 15/15 |
+| Source hash changed | no | no |
+
+The combined saved outputs therefore score **23/23 keyed corrections with no unexpected
+edit**. Workbook 1 finished `succeeded`. Workbook 3 finished
+`needs_human_attention` because two agents independently invented the same unsupported
+policy that a plain exact fraction must be typed `numeric`; the patch gate rejected both
+proposals and the clean cell was unchanged. The standing prompt rules now state that plain
+fractions and constants are not defects merely because an agent prefers another label.
+
+One warning in each saved report was also diagnosed as coverage-parser noise rather than a
+workbook defect: a hint-row commentary record in Workbook 1, and a full probability
+calculation ending in `=5/18` in Workbook 3. The parser now limits answer contradictions to
+graded rows and compares a calculation's final result before stripping explanatory text.
+
+This is strong regression evidence for the local prototype, but it does **not** establish an
+unbiased 100% accuracy rate. These workbooks have shaped the system repeatedly. It also
+exposes the operational blocker clearly: 21 of 168 physical CLI invocations failed and had
+to be retried, and an earlier Workbook 1 attempt exhausted the Pro allowance after 96
+calls. A personal subscription CLI is not a production capacity or reliability result.
 
 ## Evidence required before a deployment claim
 

@@ -9,11 +9,13 @@ from pathlib import Path
 
 
 REQUIRED_MEMBERS = {
-    "oatutor_council/prompts/initial_auditor.v6.md",
-    "oatutor_council/prompts/writer.v3.md",
+    "oatutor_council/prompts/initial_auditor.v7.md",
+    "oatutor_council/prompts/writer.v4.md",
     "oatutor_council/prompts/known_issue_reviewer.v3.md",
-    "oatutor_council/prompts/independent_reviewer.v5.md",
-    "oatutor_council/prompts/_shared/curation_rules.v1.md",
+    "oatutor_council/prompts/independent_reviewer.v6.md",
+    "oatutor_council/prompts/adjudicator.v1.md",
+    "oatutor_council/prompts/final_verifier.v1.md",
+    "oatutor_council/prompts/_shared/curation_rules.v2.md",
     "oatutor_council/prompts/_shared/untrusted_data.md",
 }
 FORBIDDEN_MEMBERS = {

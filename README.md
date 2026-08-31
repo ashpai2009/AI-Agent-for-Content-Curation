@@ -554,9 +554,18 @@ string.
 the four workbooks are recorded in `jobs/council.db`: two succeeded, one needed a person, and
 two were killed by the isolation false positive since fixed. Their failures went on to shape
 the architecture — the isolation demotion, the auditor/reviewer corroboration questions — so
-scoring against them now measures how well the system was fitted to them. **Reclassify these
-four as regression tests**: they can prove a known failure no longer recurs, which is worth
-having, and they cannot measure accuracy on unseen material.
+scoring against them now measures how well the system was fitted to them. **Reclassify the
+first three as regression tests**: they can prove a known failure no longer recurs, which
+is worth having, and they cannot measure accuracy on unseen material.
+
+The 2026-08-30 fresh regression jobs for Workbooks 1 and 3 are preserved under
+`outputs/live-regressions-20260830/`. Their corrected files score 13/13 and 10/10 against
+the sealed keys, with no unauthorized changed cell or changed clean control. That is
+23/23 spent-regression recall, not a fresh accuracy estimate. Workbook 1 completed in 76
+physical CLI calls (10 failed/retried); Workbook 3 completed in 92 (11 failed/retried).
+The personal Pro CLI also exhausted its allowance during an earlier 96-call attempt, so
+these runs support the repair architecture while arguing against treating the subscription
+CLI as organization-grade capacity.
 
 The fourth workbook (`heldout-04`) has never been run and is the only genuinely unseen
 material left. Deployment evidence needs a new set built after the architecture stops moving.

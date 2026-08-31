@@ -1,7 +1,7 @@
 """The model interface. Stateless by construction.
 
 **There is no `Conversation` object anywhere in this codebase, and that is the point.**
-Context isolation between the four agents is not a discipline anyone has to remember; it
+Context isolation between the six roles is not a discipline anyone has to remember; it
 is a consequence of there being no message list that could carry reasoning forward. Every
 call is assembled from durable rows and a system prompt, and nothing survives it.
 

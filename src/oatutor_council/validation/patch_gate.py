@@ -421,8 +421,8 @@ def _unsupported_answer_type_relabel(
 
     The curator's rules say those are valid answer types but do not define a complete
     classifier between them. A plain exact fraction is the concrete ambiguous case: real
-    workbooks use both conventions, and the live regression changed a clean ``5/18`` row
-    from ``algebra`` to ``numeric`` solely because the model preferred that label.
+    workbooks use both conventions, so a model preference is not authority to relabel an
+    otherwise-correct cell.
 
     Three sources of authority remain:
 

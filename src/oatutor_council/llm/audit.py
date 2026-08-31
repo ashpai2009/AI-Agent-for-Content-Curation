@@ -1,7 +1,7 @@
-"""Recording every model call, at the one place all four agents already pass through.
+"""Recording every model call, at the one place all six roles already pass through.
 
 `RecordingClient` wraps an `LLMClient` and writes an `llm_calls` row per request. It is a
-wrapper rather than a call inside each agent because there are four agents and there will
+wrapper rather than a call inside each agent because there are several roles and there will
 be more: an audit trail that each new agent has to remember to write to is an audit trail
 with holes in it, and the holes are invisible -- a missing row looks exactly like a call
 that was never made.

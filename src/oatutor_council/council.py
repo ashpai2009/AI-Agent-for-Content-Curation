@@ -957,7 +957,7 @@ class CurationCouncil:
         except ProviderConfigurationError as error:
             # Caught **before** the general provider clause, because it is a subclass of
             # it and the two need opposite handling. Handled here rather than in `_write`
-            # so it covers all four agents: the auditor and the reviewers make the same
+            # so it covers every role: auditors, reviewers and adjudication make the same
             # call against the same settings, and a key that is wrong for one is wrong for
             # every one of them. Retrying is a loop that spends the whole job budget to
             # arrive at the same message, so the job fails as CONFIG -- non-resumable

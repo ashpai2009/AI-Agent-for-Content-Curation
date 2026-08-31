@@ -45,10 +45,10 @@ POLICY_FILE = "_shared/untrusted_data.md"
 
 #: The standing curation rules, versioned in this repository. Composed into every prompt
 #: that carries the placeholder, so a curator does not have to attach the formatting
-#: guide to every job -- and so the four agents cannot drift apart on what the rules are.
+#: guide to every job -- and so the six roles cannot drift apart on what the rules are.
 #: A document uploaded with a job adds policy for that job; it never replaces this.
 RULES_PLACEHOLDER = "{curation_rules}"
-RULES_FILE = "_shared/curation_rules.v1.md"
+RULES_FILE = "_shared/curation_rules.v2.md"
 
 _VERSIONED = re.compile(r"^(?P<name>.+)\.v(?P<version>\d+)\.md$")
 

@@ -94,11 +94,26 @@ def self_contradicting(
         if not record.answer_correct:
             continue
 
-        # Models often put a short derivation after the answer despite being asked for a
-        # short value: ``83 (because 7+19*4=83)``. The live verifier also wrote calculations
-        # such as ``20000*0.85**2=14450`` beside a submitted ``14450``. Those records are
-        # verbose, not contradictory. Strip only a parenthetical introduced after a space
-        # (never a function call such as ``sqrt(3)``), and accept an exact final RHS.
+        # Models often put a derivation around the short value. Check a complete
+        # calculation chain's final RHS *before* stripping prose: the live verifier wrote
+        # ``P(red then blue) = (5/9)*(4/8) = 20/72 = 5/18``. Cutting at the first `` (``
+        # turns that into ``P(red then blue) =`` and manufactures a contradiction.
+        compact_full = "".join(computed.casefold().split())
+        compact_submitted = "".join(submitted.casefold().split())
+        if compact_full == compact_submitted:
+            continue
+        if "=" in compact_full:
+            final_rhs = compact_full.rsplit("=", 1)[1]
+            if final_rhs == compact_submitted:
+                continue
+            if answers_equivalent(
+                _assignment_value(final_rhs), _assignment_value(submitted)
+            ) is MathVerdict.EQUIVALENT:
+                continue
+
+        # A shorter common form is ``83 (because 7+19*4=83)``. Strip only a
+        # parenthetical introduced after a space (never a function call such as
+        # ``sqrt(3)``), then compare again.
         concise = computed
         for marker in (" (", " is ", " since ", " because "):
             concise = concise.split(marker, 1)[0]
