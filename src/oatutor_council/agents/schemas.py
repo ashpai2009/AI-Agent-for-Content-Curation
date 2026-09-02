@@ -179,7 +179,8 @@ class AuditorResponse(BaseModel):
     """The single-block audit response.
 
     `SCAN_BATCH_SIZE=1` uses this schema and the single-block payload directly rather than
-    wrapping one item in the batch schema. That keeps batching disabled at its default.
+    wrapping one item in the batch schema. That remains the explicit diagnostic/legacy
+    path even though production defaults to a two-block batch.
     """
 
     #: Private. Split off before anything else sees this response.
@@ -260,6 +261,21 @@ class WriterResponse(BaseModel):
     human_review_reason: str = ""
 
 
+class BlockWriterItem(BaseModel):
+    """One issue's proposal inside a coordinated block-level Writer response."""
+
+    issue_id: str = Field(
+        description="Copy the issue_id exactly from the supplied issue list"
+    )
+    proposal: WriterResponse
+
+
+class BlockWriterResponse(BaseModel):
+    """Exactly one proposal (or escalation) for every supplied issue."""
+
+    results: list[BlockWriterItem]
+
+
 # --------------------------------------------------------------------------------------
 # Reviewers
 # --------------------------------------------------------------------------------------
@@ -276,6 +292,23 @@ class ReviewerResponse(BaseModel):
     decision: Literal["accept", "revise", "human_review"]
     feedback: str = ""
     rule_codes: list[str] = Field(default_factory=list)
+
+
+class BlockReviewerItem(BaseModel):
+    """One issue's decision inside a single review of the changed block."""
+
+    issue_id: str = Field(
+        description="Copy the issue_id exactly from the supplied candidate list"
+    )
+    decision: Literal["accept", "revise", "human_review"]
+    feedback: str = ""
+    rule_codes: list[str] = Field(default_factory=list)
+
+
+class BlockReviewerResponse(BaseModel):
+    """Exactly one verdict for every candidate repair in the block."""
+
+    results: list[BlockReviewerItem]
 
 
 # --------------------------------------------------------------------------------------

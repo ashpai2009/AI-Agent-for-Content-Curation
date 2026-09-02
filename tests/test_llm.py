@@ -120,11 +120,31 @@ def test_prompts_are_versioned_and_the_highest_is_chosen():
     assert load_prompt("writer") == load_prompt("writer", versions[-1])
 
 
+def test_completed_batch_pilot_prompt_versions_remain_reproducible():
+    """The first live contract-12 job is durable evidence, so its prompt versions are too.
+
+    A regression found after that run belongs in a successor file. Editing v5/v4 in place
+    would make the job's recorded hash impossible to resolve and would strand any job that
+    was still in flight under those otherwise-valid versions.
+    """
+    import hashlib
+
+    assert hashlib.sha256(system_prompt(AgentRole.WRITER, 5).encode()).hexdigest() == (
+        "7716136c88b6c907e3677f2733a5236dba0d47674fa22e794a11c7c766c93c95"
+    )
+    assert hashlib.sha256(
+        system_prompt(AgentRole.KNOWN_ISSUE_REVIEWER, 4).encode()
+    ).hexdigest() == "136e0b07a73e2241f075decaca76c5ccd9c15bd42f77b052000b2a4abb654229"
+
+
 def test_current_semantic_prompts_pin_the_live_pilot_lessons():
     auditor = re.sub(r"\s+", " ", system_prompt(AgentRole.INITIAL_AUDITOR))
     writer = re.sub(r"\s+", " ", system_prompt(AgentRole.WRITER))
     independent = re.sub(
         r"\s+", " ", system_prompt(AgentRole.INDEPENDENT_REVIEWER)
+    )
+    reviewer = re.sub(
+        r"\s+", " ", system_prompt(AgentRole.KNOWN_ISSUE_REVIEWER)
     )
 
     assert "requested form, units, domain, number of solutions" in auditor
@@ -138,6 +158,9 @@ def test_current_semantic_prompts_pin_the_live_pilot_lessons():
     assert "Every `after` value must be the exact text OATutor can grade" in writer
     assert "not a sentence explaining the mathematics" in writer
     assert "Do not relabel an unchanged Answer between `numeric` and `algebra`" in writer
+    assert "identifiers need not be consecutive" in reviewer
+    assert "exact fraction to a decimal" in reviewer
+    assert "return exactly one decision for every supplied `issue_id`" in reviewer
     assert "requested form, units, domain, number of solutions" in independent
     assert "every exact row-and-column cell that must change" in independent
     assert "plain fraction or constant is not a defect" in independent

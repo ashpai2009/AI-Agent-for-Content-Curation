@@ -12,6 +12,7 @@ Usage:  .venv/bin/python scripts/demo.py [--keep]
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import tempfile
@@ -26,8 +27,14 @@ from openpyxl import Workbook  # noqa: E402
 
 from oatutor_council.agents.schemas import (  # noqa: E402
     AdjudicatorResponse,
+    AuditorBlockResult,
     AuditorResponse,
+    BatchedAuditorResponse,
+    BatchedIndependentReviewResponse,
+    BlockReviewerResponse,
+    BlockWriterResponse,
     FinalVerificationResponse,
+    IndependentBlockResult,
     RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -155,24 +162,77 @@ def _coverage(payload: str) -> list[RowCoverage]:
     ]
 
 
+def _batch_sections(payload: str) -> list[tuple[str, str]]:
+    """Opaque batch id and only that block's rendered section."""
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"SECTION: batch_item=([^;]+);[^\n]*\n(.*?)(?=<<<END UNTRUSTED DATA)",
+            payload,
+            flags=re.DOTALL,
+        )
+    ]
+
+
 def scripted_client(db: Database) -> ScriptedLLMClient:
     """A model that behaves the way a competent one would on this workbook."""
 
     def reply(request):
+        if "Issues and candidate edits" in request.user_payload:
+            issue_ids = re.findall(r"^issue_id: ([^\n]+)$", request.user_payload, re.MULTILINE)
+            return BlockReviewerResponse(
+                results=[{"issue_id": issue_id, "decision": "accept"} for issue_id in issue_ids]
+            )
+
         if request.role is AgentRole.INITIAL_AUDITOR:
             # The deterministic rules already found the planted defects, so the auditor
             # has nothing further to add. Zero findings is a valid and common answer.
+            if sections := _batch_sections(request.user_payload):
+                return BatchedAuditorResponse(
+                    results=[
+                        AuditorBlockResult(
+                            batch_item_id=item_id,
+                            reasoning="the block matches the stated mathematics",
+                            coverage=_coverage(section),
+                        )
+                        for item_id, section in sections
+                    ]
+                )
             return AuditorResponse(
                 reasoning="the block matches the stated mathematics",
                 coverage=_coverage(request.user_payload),
             )
 
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            if sections := _batch_sections(request.user_payload):
+                return BatchedIndependentReviewResponse(
+                    results=[
+                        IndependentBlockResult(
+                            batch_item_id=item_id,
+                            block_is_sound=True,
+                            coverage=_coverage(section),
+                        )
+                        for item_id, section in sections
+                    ]
+                )
             return IndependentReviewResponse(
                 block_is_sound=True, coverage=_coverage(request.user_payload)
             )
 
         if request.role is AgentRole.WRITER:
+            if "Issues to resolve together" in request.user_payload:
+                issue_ids = re.findall(
+                    r"^issue_id: ([^\n]+)$", request.user_payload, re.MULTILINE
+                )
+                return BlockWriterResponse(
+                    results=[
+                        {
+                            "issue_id": issue_id,
+                            "proposal": _writer_reply(db, request, issue_id=issue_id),
+                        }
+                        for issue_id in issue_ids
+                    ]
+                )
             return _writer_reply(db, request)
 
         if request.role is AgentRole.FINAL_VERIFIER:
@@ -199,10 +259,16 @@ def scripted_client(db: Database) -> ScriptedLLMClient:
     return client
 
 
-def _writer_reply(db: Database, request) -> WriterResponse:
+def _writer_reply(
+    db: Database, request, *, issue_id: str | None = None
+) -> WriterResponse:
     """Repairs keyed to the issue's own description, as a real Writer would work."""
     issue = next(
-        (i for i in list_issues(db, request.job_id) if i.issue_id == request.issue_id),
+        (
+            i
+            for i in list_issues(db, request.job_id)
+            if i.issue_id == (issue_id or request.issue_id)
+        ),
         None,
     )
     description = issue.description if issue else ""
@@ -254,6 +320,7 @@ def _writer_reply(db: Database, request) -> WriterResponse:
         )
 
     return WriterResponse(
+        derivation="",
         needs_human_review=True,
         human_review_reason=f"no confident repair for: {description[:80]}",
     )

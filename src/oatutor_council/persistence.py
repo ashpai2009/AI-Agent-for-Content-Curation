@@ -963,6 +963,32 @@ def insert_verdict(db: Database, verdict: ReviewVerdict) -> None:
         )
 
 
+def insert_verdicts(db: Database, verdicts: Sequence[ReviewVerdict]) -> None:
+    """Persist one coordinated review response atomically.
+
+    A block reviewer returns several decisions in one physical response. Committing them
+    one at a time creates a crash state in which the response was paid for but only some
+    of its evidence exists; the replacement worker then has no safe way to reconstruct
+    the missing decisions. Either the whole response is durable or none of it is.
+    """
+    with db.write() as connection:
+        for verdict in verdicts:
+            connection.execute(
+                """INSERT INTO review_verdicts (verdict_id, issue_id, reviewer_role,
+                       attempt_no, decision, decided_at, payload_json)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    verdict.verdict_id,
+                    verdict.issue_id,
+                    verdict.reviewer_role.value,
+                    verdict.attempt_no,
+                    verdict.decision.value,
+                    _iso(verdict.decided_at),
+                    verdict.model_dump_json(),
+                ),
+            )
+
+
 def list_verdicts(db: Database, job_id: str) -> tuple[ReviewVerdict, ...]:
     rows = db.connection.execute(
         """SELECT v.payload_json FROM review_verdicts v

@@ -1,4 +1,4 @@
-"""The Writer. One issue and one block in, one patch out.
+"""The Writer. One block and one or more issues in, one patch per issue out.
 
 The Writer is the only agent that proposes changes, and its output is deliberately narrow:
 exact cell edits with exact `before` values. Everything about whether those edits are
@@ -16,10 +16,10 @@ it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 from uuid import uuid4
 
-from ..llm.base import AgentRole, LLMClient, LLMRequest, call_structured
+from ..llm.base import AgentRole, LLMClient, LLMRequest, MalformedResponse, call_structured
 from ..llm.context import ContextBundle, DataSection
 from ..llm.prompts import system_prompt
 from ..models import FIXED_COLUMNS, CellEdit, Issue, Patch, ProblemBlock, ValidationFinding
@@ -30,7 +30,7 @@ from .rendering import (
     render_findings,
     render_issue,
 )
-from .schemas import WriterResponse, column_key
+from .schemas import BlockWriterResponse, WriterResponse, column_key
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,108 @@ class WriterProposedNothing(Exception):
     Treated as a malformed response rather than an empty patch: a patch with no edits and
     no escalation is not an answer to the question that was asked.
     """
+
+
+class WriterBatchIncomplete(MalformedResponse):
+    """A block response omitted, duplicated, or invented an issue identifier."""
+
+
+BLOCK_INSTRUCTIONS = """\
+Produce a coordinated repair proposal for every issue listed below. You are seeing the
+issues together because their repairs share one problem block and may interact.
+
+Return exactly one result for every supplied issue_id and no others. Each result remains
+an independently reviewable patch: put every cell needed to resolve that issue in that
+issue's proposal, do not split one necessary repair across two results, and never propose
+two different after-values for the same cell.
+
+For every proposal, follow the same rules as a single repair: copy `before` exactly,
+edit only this block, make no unrelated improvement, explain any related cell, and put a
+concrete verification in `derivation` whenever answer or mc_choices changes. If an issue
+cannot be resolved confidently, escalate that issue only; do not guess and do not omit it.
+"""
+
+
+def propose_patches(
+    client: LLMClient,
+    *,
+    issues: Sequence[Issue],
+    block: ProblemBlock,
+    conventions,
+    attempt_numbers: Mapping[str, int],
+    deterministic_findings: Sequence[ValidationFinding] = (),
+    reviewer_feedback: Mapping[str, str] | None = None,
+    curator_rules: Sequence[str] = (),
+    job_id: str = "",
+    seed: int | None = None,
+    taint: TaintRegistry | None = None,
+    prompt_version: int | None = None,
+) -> tuple[WriterResult, ...]:
+    """Ask once for every ready issue in a block, preserving per-issue patches."""
+    if not issues:
+        return ()
+    feedback = reviewer_feedback or {}
+    issue_text = []
+    for issue in issues:
+        rendered = f"issue_id: {issue.issue_id}\n{render_issue(issue)}"
+        prior = feedback.get(issue.issue_id, "").strip()
+        if prior:
+            rendered += f"\nFeedback on its previous attempt:\n{prior}"
+        issue_text.append(rendered)
+
+    sections = [
+        DataSection("Issues to resolve together", "\n\n".join(issue_text)),
+        DataSection("The shared problem block", render_block(block)),
+        DataSection("Conventions this workbook follows", render_conventions(conventions)),
+        DataSection(
+            "Deterministic findings for this block", render_findings(deterministic_findings)
+        ),
+    ]
+    if curator_rules:
+        sections.append(
+            DataSection(
+                "Curation rules the curator supplied",
+                "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
+    response = call_structured(
+        client,
+        LLMRequest(
+            role=AgentRole.WRITER,
+            system_prompt=system_prompt(AgentRole.WRITER, prompt_version),
+            user_payload=ContextBundle.build(BLOCK_INSTRUCTIONS, sections).render(),
+            schema=BlockWriterResponse.model_json_schema(),
+            seed=seed,
+            job_id=job_id,
+        ),
+        BlockWriterResponse,
+    )
+
+    expected = {issue.issue_id for issue in issues}
+    returned = [item.issue_id for item in response.results]
+    if len(returned) != len(set(returned)) or set(returned) != expected:
+        raise WriterBatchIncomplete(
+            f"expected exactly {sorted(expected)}, received {sorted(returned)}"
+        )
+    by_id = {item.issue_id: item.proposal for item in response.results}
+    results = []
+    for issue in issues:
+        attempt_no = attempt_numbers[issue.issue_id]
+        proposal = by_id[issue.issue_id]
+        private = WriterPrivate(
+            reasoning=proposal.reasoning,
+            derivation=proposal.derivation,
+            confidence=proposal.confidence,
+        )
+        if taint is not None:
+            taint.register_model(f"writer.{issue.issue_id}.{attempt_no}", private)
+        results.append(
+            WriterResult(
+                patch=_to_patch(proposal, issue=issue, attempt_no=attempt_no),
+                private=private,
+            )
+        )
+    return tuple(results)
 
 
 def propose_patch(

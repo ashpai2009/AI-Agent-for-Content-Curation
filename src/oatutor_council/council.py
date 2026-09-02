@@ -82,6 +82,7 @@ from .models import (
     JobState,
     ParsedWorkbook,
     Patch,
+    PatchRejection,
     ProblemBlock,
     RejectionCode,
     RepairAttempt,
@@ -107,6 +108,7 @@ from .persistence import (
     insert_issue,
     insert_patch,
     insert_verdict,
+    insert_verdicts,
     list_changes,
     list_artifacts,
     list_claim_results,
@@ -144,6 +146,7 @@ from .reporting.reports import build_reports, render_markdown
 from .state_machine import AttemptsExhausted, IssueMachine, advance_issue
 from .validation.final_gate import run_final_gate
 from .validation.patch_gate import (
+    GateResult as PatchGateResult,
     rejection_consumes_attempt,
     simulate_block,
     target_findings,
@@ -405,7 +408,11 @@ CLI_ADAPTER_VERSION = 5
 #: authority before entering the queue; semantic findings are repaired before routine
 #: cleanup; and linked scaffold namespace renames are mechanical. A job cannot switch to
 #: those priorities and edit-authority rules halfway through and still be one audit.
-PIPELINE_CONTRACT_VERSION = 11
+#: 12 (2026-09-02): audits default to two blocks per call; confirmed issues in one block
+#: share one coordinated Writer call and one whole-block reviewer call while retaining
+#: separate attempts, patches and verdicts. The setting is pinned because switching the
+#: call topology halfway through a job changes both context and recovery semantics.
+PIPELINE_CONTRACT_VERSION = 12
 
 
 class BudgetExhausted(Exception):
@@ -831,11 +838,13 @@ class CurationCouncil:
         """
         return {
             "scan_batch_size": self.settings.scan_batch_size,
+            "repair_batch_size": self.settings.repair_batch_size,
             "scan_batch_max_characters": self.settings.scan_batch_max_characters,
             "role_effort": {
                 role.value: self.settings.effort_for(role.value) for role in AgentRole
             },
             "model": self.settings.claude_model,
+            "provider_timeout_seconds": self.settings.provider_timeout_seconds,
             "cli_adapter_version": CLI_ADAPTER_VERSION,
             "pipeline_contract_version": PIPELINE_CONTRACT_VERSION,
         }
@@ -857,6 +866,9 @@ class CurationCouncil:
             scan_batch_size=int(
                 pinned.get("scan_batch_size", self.settings.scan_batch_size)
             ),
+            repair_batch_size=int(
+                pinned.get("repair_batch_size", self.settings.repair_batch_size)
+            ),
             scan_batch_max_characters=int(
                 pinned.get(
                     "scan_batch_max_characters", self.settings.scan_batch_max_characters
@@ -864,6 +876,11 @@ class CurationCouncil:
             ),
             role_effort=pinned.get("role_effort") or self.settings.role_effort,
             claude_model=str(pinned.get("model", self.settings.claude_model)),
+            provider_timeout_seconds=float(
+                pinned.get(
+                    "provider_timeout_seconds", self.settings.provider_timeout_seconds
+                )
+            ),
         )
 
     def _check_pinned_adapter(self) -> None:
@@ -1516,6 +1533,43 @@ class CurationCouncil:
             if state is JobState.REPAIRING_KNOWN
             else None
         )
+        # Batched calls deliberately create several in-flight rows in one block. The
+        # legacy queue excludes that situation to prevent two independent workers from
+        # racing, so group recovery must run before the legacy predicate.
+        if self.settings.repair_batch_size > 1:
+            if group := self._live_block_group(_NEEDS_REVIEW, role, minimum=2):
+                return self._review_batch(group, state)
+            if group := self._live_block_group(_NEEDS_APPLY, role, minimum=1):
+                return self._apply(group[0], state)
+            if group := self._live_block_group(
+                frozenset(
+                    {
+                        IssueState.AWAITING_PATCH,
+                        IssueState.REVISION_REQUESTED,
+                        IssueState.PATCH_REJECTED,
+                    }
+                ),
+                role,
+                minimum=2,
+            ):
+                return self._write_batch(group, state)
+
+            # Finish preparing siblings before spending the block's Writer call. An OPEN
+            # model finding still needs corroboration; an OPEN deterministic finding gets
+            # its mechanical opportunity and then becomes ready. The old single-flight
+            # SQL predicate cannot select either while a sibling is AWAITING_PATCH.
+            if sibling := self._unprepared_sibling(role):
+                return self._write(sibling, state)
+
+            # Some findings in one block name the same graded row. Their repairs are
+            # likely to interact even when the named columns differ (Answer and choices,
+            # Answer and answerType), so they deliberately do not share a Writer call.
+            # They are nevertheless both "in flight", which makes the legacy SQL queue
+            # hide each behind the other. Advance one here; after it is applied, the
+            # ordinary sibling-supersession check can often close the second for free.
+            if unbatchable := self._inflight_sibling(role):
+                return self._advance_issue(unbatchable, state)
+
         issue = self._next_live_issue(role)
         if issue is not None:
             return self._advance_issue(issue, state)
@@ -1533,6 +1587,92 @@ class CurationCouncil:
         )
         self._advance(target)
         return StepOutcome(True, f"{state.value} drained", target)
+
+    def _phase_issues(self, role: ReviewerRole | None) -> tuple[Issue, ...]:
+        return tuple(
+            issue
+            for issue in list_issues(self.db, self.job_id)
+            if role is None or issue.reviewer_role is role
+        )
+
+    def _live_block_group(
+        self,
+        states: frozenset[IssueState],
+        role: ReviewerRole | None,
+        *,
+        minimum: int,
+    ) -> tuple[Issue, ...]:
+        """First stable block group in the requested states, bounded by the setting."""
+        grouped: dict[str, list[Issue]] = {}
+        for issue in self._phase_issues(role):
+            if (
+                issue.block_id
+                and issue.state in states
+                and (
+                    issue.state not in _NEEDS_WRITER
+                    or self.machine.can_attempt(issue)
+                )
+            ):
+                grouped.setdefault(issue.block_id, []).append(issue)
+        for issues in grouped.values():
+            selected: list[Issue] = []
+            occupied_rows: set[int] = set()
+            for issue in issues:
+                rows = {row for row, _ in issue.cells}
+                # Same-row findings frequently describe two views of one repair. Process
+                # those sequentially so the first accepted patch can supersede the other;
+                # asking for two nominally-independent patches invites duplicate edits.
+                if rows and rows.intersection(occupied_rows):
+                    continue
+                selected.append(issue)
+                occupied_rows.update(rows)
+                if len(selected) >= self.settings.repair_batch_size:
+                    break
+            if len(selected) >= minimum:
+                return tuple(selected)
+        return ()
+
+    def _unprepared_sibling(self, role: ReviewerRole | None) -> Issue | None:
+        issues = self._phase_issues(role)
+        ready_blocks = {
+            issue.block_id
+            for issue in issues
+            if issue.block_id
+            and issue.state
+            in {
+                IssueState.AWAITING_PATCH,
+                IssueState.REVISION_REQUESTED,
+                IssueState.PATCH_REJECTED,
+            }
+        }
+        return next(
+            (
+                issue
+                for issue in issues
+                if issue.block_id in ready_blocks and issue.state is IssueState.OPEN
+            ),
+            None,
+        )
+
+    def _inflight_sibling(self, role: ReviewerRole | None) -> Issue | None:
+        """A live issue hidden only by another live issue in the same block.
+
+        `next_issue_for_phase` intentionally enforces one in-flight issue per block. Batch
+        coordination is the only caller allowed to relax that invariant, so it also owns
+        the fallback when a same-row conflict makes a coordinated proposal unsafe.
+        """
+        issues = tuple(
+            issue
+            for issue in self._phase_issues(role)
+            if issue.block_id and issue.state in LIVE_ISSUE_STATES
+        )
+        counts: dict[str, int] = {}
+        for issue in issues:
+            counts[issue.block_id] = counts.get(issue.block_id, 0) + 1
+        return next(
+            (issue for issue in issues if counts.get(issue.block_id or "", 0) > 1),
+            None,
+        )
 
     def _validate(self) -> StepOutcome:
         """Run the deterministic gate and decide whether another repair round is warranted."""
@@ -1804,6 +1944,19 @@ class CurationCouncil:
             if outcome is not None:
                 return outcome
 
+        # A deterministic, non-mechanical issue needs no model preflight. Mark it ready
+        # and let the block coordinator collect its siblings before asking the Writer.
+        # At batch size one the legacy path remains byte-for-byte unchanged for existing
+        # jobs and tests.
+        if (
+            self.settings.repair_batch_size > 1
+            and issue.state is IssueState.OPEN
+            and issue.attempts_used == 0
+            and remaining is not None
+        ):
+            save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
+            return StepOutcome(True, f"{issue.issue_id} ready for block repair", state)
+
         # A semantic issue cannot be re-derived mechanically, but it may already have
         # been resolved by an earlier accepted repair in the same block. Sending it
         # straight to the Writer is what produced the pilot's false "needs a person"
@@ -1963,6 +2116,285 @@ class CurationCouncil:
         settle_attempt(self.db, attempt.model_copy(update={"patch_id": patch.patch_id}))
         save_issue(self.db, advance_issue(issue, IssueState.PATCH_PROPOSED))
         return StepOutcome(True, f"patch proposed for {issue.issue_id}", state)
+
+    def _write_batch(
+        self, issues: Sequence[Issue], state: JobState
+    ) -> StepOutcome:
+        """One Writer invocation for every ready issue in one problem block."""
+        parsed = self.current_workbook()
+        block_id = issues[0].block_id if issues else None
+        block = parsed.block_by_id(block_id) if block_id else None
+        if block is None:
+            for issue in issues:
+                save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, "repair block vanished; issues escalated", state)
+
+        reserved: list[Issue] = []
+        attempts: dict[str, RepairAttempt] = {}
+        for issue in issues:
+            if not self.machine.can_attempt(issue):
+                save_issue(self.db, self.machine.exhausted(issue))
+                continue
+            try:
+                progress = self.machine.reserve_attempt(issue)
+            except AttemptsExhausted:
+                save_issue(self.db, self.machine.exhausted(issue))
+                continue
+            if progress.state is not IssueState.AWAITING_PATCH:
+                progress = advance_issue(progress, IssueState.AWAITING_PATCH)
+            save_issue(self.db, progress)
+            attempt = RepairAttempt(
+                attempt_id=uuid4().hex,
+                issue_id=progress.issue_id,
+                attempt_no=next_attempt_number(self.db, progress.issue_id),
+            )
+            insert_attempt(self.db, attempt)
+            reserved.append(progress)
+            attempts[progress.issue_id] = attempt
+        if len(reserved) < 2:
+            # This can happen only when all but one issue exhausted between selection and
+            # reservation. Let the ordinary path handle the survivor next step.
+            return StepOutcome(True, "block repair candidates were no longer batchable", state)
+
+        self._spend()
+        try:
+            results = writer.propose_patches(
+                self.client,
+                issues=reserved,
+                block=block,
+                conventions=parsed.conventions,
+                attempt_numbers={
+                    issue.issue_id: attempts[issue.issue_id].attempt_no for issue in reserved
+                },
+                deterministic_findings=self._findings_for_block(parsed, block),
+                reviewer_feedback={
+                    issue.issue_id: _latest_feedback(self.db, issue.issue_id)
+                    for issue in reserved
+                },
+                curator_rules=self.curator_rules,
+                job_id=self.job_id,
+                taint=self.taint,
+                prompt_version=self._prompt_version(AgentRole.WRITER),
+            )
+        except ProviderConfigurationError:
+            raise
+        except ProviderRefused as error:
+            for issue in reserved:
+                attempt = attempts[issue.issue_id]
+                settle_attempt(
+                    self.db,
+                    attempt.model_copy(
+                        update={
+                            "outcome": AttemptOutcome.ESCALATED,
+                            "finished_at": datetime.now(timezone.utc),
+                        }
+                    ),
+                )
+                save_issue(self.db, self.machine.exhausted(issue))
+            record_event(
+                self.db,
+                self.job_id,
+                "provider_refused",
+                f"{block.block_id}: coordinated Writer call declined: "
+                f"{sanitize_provider_message(str(error))}",
+            )
+            return StepOutcome(True, f"{block.block_id} batch escalated", state)
+        except (ProviderError, MalformedResponse, writer.WriterProposedNothing) as error:
+            for issue in reserved:
+                attempt = attempts[issue.issue_id]
+                settle_attempt(
+                    self.db,
+                    attempt.model_copy(
+                        update={
+                            "outcome": AttemptOutcome.INTERRUPTED,
+                            "finished_at": datetime.now(timezone.utc),
+                        }
+                    ),
+                )
+                save_issue(self.db, self.machine.refund_interrupted(issue))
+            if isinstance(error, (ProviderError, MalformedResponse)):
+                return self._provider_failed(error)
+            return StepOutcome(True, f"coordinated Writer call failed: {error}", state)
+
+        patches = [result.patch for result in results]
+        touched = [(edit.row, edit.column) for patch in patches for edit in patch.edits]
+        overlapping = {cell for cell in touched if touched.count(cell) > 1}
+        proposed = 0
+        for issue, result in zip(reserved, results, strict=True):
+            attempt = attempts[issue.issue_id]
+            self._keep_private(
+                AgentRole.WRITER,
+                f"writer.{issue.issue_id}.{attempt.attempt_no}",
+                result.private,
+                issue_id=issue.issue_id,
+            )
+            patch = result.patch
+            if patch.needs_human_review:
+                settle_attempt(
+                    self.db,
+                    attempt.model_copy(
+                        update={
+                            "outcome": AttemptOutcome.ESCALATED,
+                            "finished_at": datetime.now(timezone.utc),
+                        }
+                    ),
+                )
+                save_issue(self.db, self.machine.exhausted(issue))
+                continue
+            decision = validate_patch(patch, issue=issue, block=block, parsed=parsed)
+            if overlapping.intersection((edit.row, edit.column) for edit in patch.edits):
+                decision = PatchGateResult(
+                    rejection=PatchRejection(
+                        code=RejectionCode.DUPLICATE_CELL_EDIT,
+                        message=(
+                            "coordinated proposals assign the same cell to multiple issues"
+                        ),
+                    )
+                )
+            if not decision.accepted:
+                settle_attempt(
+                    self.db,
+                    attempt.model_copy(
+                        update={
+                            "outcome": AttemptOutcome.PATCH_REJECTED,
+                            "rejection": decision.rejection,
+                            "finished_at": datetime.now(timezone.utc),
+                        }
+                    ),
+                )
+                progress = issue
+                if decision.rejection and not rejection_consumes_attempt(decision.rejection):
+                    progress = self.machine.refund_interrupted(progress)
+                next_state = (
+                    IssueState.PATCH_REJECTED
+                    if self.machine.can_attempt(progress)
+                    else IssueState.NEEDS_HUMAN_REVIEW
+                )
+                save_issue(self.db, advance_issue(progress, next_state))
+                continue
+            insert_patch(self.db, patch)
+            settle_attempt(self.db, attempt.model_copy(update={"patch_id": patch.patch_id}))
+            save_issue(self.db, advance_issue(issue, IssueState.PATCH_PROPOSED))
+            proposed += 1
+        record_event(
+            self.db,
+            self.job_id,
+            "block_writer_batch",
+            f"{block.block_id}: one Writer call handled {len(reserved)} issues; "
+            f"{proposed} candidate patches passed the deterministic gate",
+        )
+        return StepOutcome(
+            True, f"{block.block_id}: {proposed}/{len(reserved)} patches proposed", state
+        )
+
+    def _review_batch(
+        self, issues: Sequence[Issue], state: JobState
+    ) -> StepOutcome:
+        """Review one simulated changed block and persist one verdict per candidate."""
+        source = self.source_workbook()
+        current = self.current_workbook()
+        block_id = issues[0].block_id if issues else None
+        original_block = source.block_by_id(block_id) if block_id else None
+        current_block = current.block_by_id(block_id) if block_id else None
+        if original_block is None or current_block is None:
+            for issue in issues:
+                save_issue(self.db, self.machine.exhausted(issue))
+            return StepOutcome(True, "review block vanished; issues escalated", state)
+
+        active: list[Issue] = []
+        patches: dict[str, Patch] = {}
+        for issue in issues:
+            progress = issue
+            if progress.state in (IssueState.PATCH_PROPOSED, IssueState.PATCH_APPLIED):
+                progress = advance_issue(progress, IssueState.AWAITING_REVIEW)
+                save_issue(self.db, progress)
+            patch = _latest_patch(self.db, progress.issue_id)
+            if patch is None:
+                save_issue(self.db, advance_issue(progress, IssueState.REVISION_REQUESTED))
+                continue
+            active.append(progress)
+            patches[progress.issue_id] = patch
+        if len(active) < 2:
+            return StepOutcome(True, "block review candidates were no longer batchable", state)
+
+        all_edits = tuple(
+            edit for issue in active for edit in patches[issue.issue_id].edits
+        )
+        simulated = simulate_block(current_block, all_edits)
+        simulated_parse = current.model_copy(
+            update={
+                "blocks": tuple(
+                    simulated if block.block_id == simulated.block_id else block
+                    for block in current.blocks
+                )
+            }
+        )
+        role = active[0].reviewer_role
+        cached = tuple(
+            _verdict_for_attempt(
+                self.db,
+                issue.issue_id,
+                patches[issue.issue_id].attempt_no,
+                reviewer_role=role,
+            )
+            for issue in active
+        )
+        if all(cached):
+            verdicts = tuple(verdict for verdict in cached if verdict is not None)
+        else:
+            # A partial cache can exist only for a job interrupted under the older
+            # one-row-at-a-time persistence. Re-review the whole combined candidate so
+            # every decision has one coherent context, then atomically supersede the
+            # partial evidence with a complete response.
+            self._spend()
+            verdicts = known_issue_reviewer.review_patches(
+                self.client,
+                issues=active,
+                original_block=original_block,
+                simulated_block=simulated,
+                conventions=current.conventions,
+                candidate_edits={
+                    issue.issue_id: patches[issue.issue_id].edits for issue in active
+                },
+                deterministic_findings=self._findings_for_block(
+                    simulated_parse, simulated
+                ),
+                curator_rules=self.curator_rules,
+                attempt_numbers={
+                    issue.issue_id: patches[issue.issue_id].attempt_no for issue in active
+                },
+                job_id=self.job_id,
+                taint=self.taint,
+                prompt_version=self._prompt_version(
+                    AgentRole.KNOWN_ISSUE_REVIEWER
+                    if role is ReviewerRole.KNOWN_ISSUE_REVIEWER
+                    else AgentRole.INDEPENDENT_REVIEWER
+                ),
+                role=role,
+            )
+            insert_verdicts(self.db, verdicts)
+        for issue, verdict in zip(active, verdicts, strict=True):
+            _settle_reviewed_attempt(self.db, issue.issue_id, verdict)
+            if verdict.decision is ReviewDecision.ACCEPT:
+                save_issue(self.db, advance_issue(issue, IssueState.PATCH_APPROVED))
+            elif verdict.decision is ReviewDecision.HUMAN_REVIEW:
+                save_issue(self.db, self.machine.exhausted(issue))
+            else:
+                next_state = (
+                    IssueState.REVISION_REQUESTED
+                    if self.machine.can_attempt(issue)
+                    else IssueState.NEEDS_HUMAN_REVIEW
+                )
+                save_issue(self.db, advance_issue(issue, next_state))
+        record_event(
+            self.db,
+            self.job_id,
+            "block_review_batch",
+            f"{current_block.block_id}: one reviewer call judged {len(active)} candidate repairs",
+        )
+        return StepOutcome(
+            True, f"{current_block.block_id}: {len(active)} candidates reviewed", state
+        )
 
     def _mechanical_patch(
         self, issue: Issue, parsed: ParsedWorkbook, block: ProblemBlock

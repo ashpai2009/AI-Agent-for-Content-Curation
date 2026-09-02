@@ -8,6 +8,7 @@ finds something new, which is the failure mode a naive implementation has.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -21,6 +22,8 @@ from oatutor_council.agents.schemas import (
     IndependentReviewResponse,
     ReviewerResponse,
     WriterResponse,
+    BlockReviewerResponse,
+    BlockWriterResponse,
 )
 from oatutor_council.config import Settings
 from oatutor_council.council import CurationCouncil
@@ -62,6 +65,7 @@ from oatutor_council.persistence import (
     list_issues,
     list_verdicts,
     load_ledger,
+    save_issue,
 )
 from oatutor_council.reporting.ledger import issue_from_finding
 from oatutor_council.workbook.reader import read_workbook
@@ -87,6 +91,8 @@ def settings(**kwargs) -> Settings:
         # what the failure-handling tests below are asserting about. The retry layer has
         # its own tests, against a client that actually fails.
         provider_max_attempts=1,
+        repair_batch_size=1,
+        scan_batch_size=1,
     )
     return Settings(**{**defaults, **kwargs})
 
@@ -195,6 +201,212 @@ def test_a_candidate_is_reviewed_before_any_workbook_byte_is_written(setup):
     result = council(setup, client).run()
     assert result.state is JobState.SUCCEEDED
     assert read_workbook(copy.path).blocks[0].rows[2].get(ColumnKey.ANSWER) == "30"
+
+
+def test_two_issues_in_one_block_use_one_writer_and_one_reviewer_call(
+    make_workbook, tmp_path
+):
+    """The production optimisation is structural, not a prompt claim: two issue rows
+    retain separate attempts, patches and verdicts while consuming one call per role."""
+    source = make_workbook(
+        [
+            problem("batch1", title="Two parts", oer_src="s", license="CC"),
+            step("batch1", answer="1", answer_type="numeric"),
+            scaffold("batch1", "s1", answer="", answer_type="numeric"),
+            scaffold("batch1", "s2", answer="", answer_type="numeric"),
+        ]
+    )
+    db = Database(tmp_path / "batch.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "batch-job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="batch-job", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = ScriptedLLMClient()
+
+    def reply(request):
+        if request.role is AgentRole.WRITER and "Issues to resolve together" in request.user_payload:
+            pairs = re.findall(
+                r"issue_id: ([^\n]+).*?cells: row (\d+) column 5",
+                request.user_payload,
+                flags=re.DOTALL,
+            )
+            return BlockWriterResponse(
+                results=[
+                    {
+                        "issue_id": issue_id,
+                        "proposal": {
+                            "derivation": f"graded scaffold row {row} needs an answer",
+                            "edits": [
+                                {
+                                    "row": int(row),
+                                    "column": "answer",
+                                    "before": "",
+                                    "after": "30" if index == 0 else "60",
+                                }
+                            ],
+                        },
+                    }
+                    for index, (issue_id, row) in enumerate(pairs)
+                ]
+            )
+        if (
+            request.role is AgentRole.KNOWN_ISSUE_REVIEWER
+            and "Issues and candidate edits" in request.user_payload
+        ):
+            ids = re.findall(r"issue_id: ([^\n]+)", request.user_payload)
+            return BlockReviewerResponse(
+                results=[{"issue_id": issue_id, "decision": "accept"} for issue_id in ids]
+            )
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse()
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(block_is_sound=True)
+        raise AssertionError(f"unexpected unbatched role call: {request.role}")
+
+    client.default = compliant(reply)
+    runner = CurationCouncil(
+        db=db,
+        settings=settings(repair_batch_size=8),
+        client=client,
+        job_id="batch-job",
+        copy=copy,
+    )
+    # Stop after the coordinated Writer has persisted both proposals. The replacement
+    # process must recover multiple in-flight rows in one block without duplicating the
+    # Writer call or refunding either real attempt.
+    while "block_writer_batch" not in {
+        event["kind"] for event in list_events(db, "batch-job")
+    }:
+        runner.step()
+    assert [issue.state for issue in list_issues(db, "batch-job")].count(
+        IssueState.PATCH_PROPOSED
+    ) == 2
+    replacement = CurationCouncil(
+        db=db,
+        settings=settings(repair_batch_size=8),
+        client=client,
+        job_id="batch-job",
+        copy=copy,
+    )
+    while "block_review_batch" not in {
+        event["kind"] for event in list_events(db, "batch-job")
+    }:
+        replacement.step()
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 1
+
+    # Model the smaller crash window after the atomic verdict set committed but before
+    # issue-state advancement did. A third process must reuse both verdicts, not ask the
+    # reviewer to judge the same combined candidate again.
+    for issue in list_issues(db, "batch-job"):
+        if issue.state is IssueState.PATCH_APPROVED:
+            save_issue(
+                db, issue.model_copy(update={"state": IssueState.AWAITING_REVIEW})
+            )
+    recovered = CurationCouncil(
+        db=db,
+        settings=settings(repair_batch_size=8),
+        client=client,
+        job_id="batch-job",
+        copy=copy,
+    )
+    result = recovered.run()
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    assert client.call_count(AgentRole.WRITER) == 1
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 1
+    assert [(change.row, change.after) for change in list_changes(db, "batch-job")] == [
+        (4, "30"),
+        (5, "60"),
+    ]
+    attempts = list_attempts(db, "batch-job")
+    verdicts = list_verdicts(db, "batch-job")
+    assert len(attempts) == 2 and len(verdicts) == 2
+
+
+def test_same_row_sibling_findings_are_repaired_sequentially_then_superseded(
+    make_workbook, tmp_path
+):
+    """Answer/choice and Answer/type findings often describe one physical repair.
+
+    They must not be forced into independent proposals in one batch: both proposals can
+    legitimately need the same cell, after which the duplicate-cell gate rejects both.
+    Repairing the highest-priority claim first lets the ordinary rule recheck establish
+    that its sibling is gone without a second Writer call.
+    """
+    source = make_workbook(
+        [
+            problem("mc-batch", title="Choose one", oer_src="s", license="CC"),
+            step(
+                "mc-batch",
+                title="Which equals one half?",
+                answer="1/2",
+                answer_type="mc",
+                mc_choices="0.5|1/3|1/4",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "same-row.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "same-row-job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="same-row",
+            source_filename=source.name,
+            source_sha256=copy.source_sha256,
+        ),
+    )
+    client = ScriptedLLMClient()
+
+    def reply(request):
+        if request.role is AgentRole.WRITER:
+            assert "Issues to resolve together" not in request.user_payload
+            return WriterResponse(
+                derivation="1/2 equals 0.5; the exact answer text must appear once",
+                related_edits_reason=(
+                    "the Answer is correct, so the equivalent choice must use its exact text"
+                ),
+                edits=[
+                    {
+                        "row": 3,
+                        "column": "mc_choices",
+                        "before": "0.5|1/3|1/4",
+                        "after": "1/2|1/3|1/4",
+                    }
+                ],
+            )
+        if request.role is AgentRole.KNOWN_ISSUE_REVIEWER:
+            return ReviewerResponse(decision="accept")
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse()
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            return IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(block_is_sound=True)
+        raise AssertionError(f"unexpected role: {request.role}")
+
+    client.default = compliant(reply)
+    result = CurationCouncil(
+        db=db,
+        settings=settings(repair_batch_size=8),
+        client=client,
+        job_id="same-row",
+        copy=copy,
+    ).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    assert client.call_count(AgentRole.WRITER) == 1
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 1
+    assert {issue.state for issue in list_issues(db, "same-row")} == {
+        IssueState.ACCEPTED,
+        IssueState.SUPERSEDED,
+    }
+    assert not any(
+        event["kind"] == "block_writer_batch" for event in list_events(db, "same-row")
+    )
 
 
 def test_a_replacement_council_recovers_before_resuming_any_phase(setup):

@@ -396,10 +396,13 @@ can quote your workbook back at you in an error, and errors end up in logs.
 
 ### Scan batching
 
-`SCAN_BATCH_SIZE` (default **1**) controls how many problem blocks one Initial Auditor or
+`SCAN_BATCH_SIZE` (default **2**) controls how many problem blocks one Initial Auditor or
 Independent Reviewer call examines. At 1 the code delegates to the unchanged single-block
-path — same prompt, same schema, same payload, same recorded prompt hash — so the default
-is a genuine no-op rather than something that resembles one.
+path — same prompt, same schema, same payload, same recorded prompt hash — which remains
+useful for diagnostics and A/B evaluation. The production default is 2; a four-problem
+live batch on realistic OpenStax material exceeded the former 120-second CLI ceiling, so
+the process timeout is five minutes; the rendered-size ceiling can still split an
+unusually large pair earlier.
 
 Above 1 the response is per block, keyed by an opaque id generated for that call. That is
 not decoration: **a block the model omitted is indistinguishable from a block it examined
@@ -409,6 +412,26 @@ valid; missing, duplicated and unknown ids all send the block back to the queue.
 semantic finding names exact `(row, column)` target pairs—never separate arrays whose
 Cartesian product can authorize unintended cells—and a finding with any target outside
 its assigned block is discarded and that block is requeued rather than credited.
+
+### Block repair and review batching
+
+`REPAIR_BATCH_SIZE` (default **8**) controls how many confirmed issues from one problem
+block the Writer handles in one coordinated response. Each issue still receives its own
+attempt, patch, deterministic gate result, reviewer verdict, and terminal ledger state.
+The optimisation removes repeated model envelopes; it does not merge accountability.
+
+When at least two candidate patches are ready in a block, the reviewer receives one
+simulated whole-block diff and returns one decision per issue in a single call. Omitted,
+duplicated, or invented issue identifiers invalidate the response. Two proposals may not
+claim the same cell, and workbook bytes are still written only after review acceptance.
+Set the value to 1 to retain the legacy one-issue call path.
+
+Issues naming the same graded row are kept sequential. Answer/choice and Answer/type
+findings often describe two views of one physical repair; forcing both into independent
+proposals makes them compete for the same cell. The first accepted correction is applied,
+then deterministic rules decide whether the sibling was resolved for free. Coordinated
+review verdicts are committed atomically, so a crash cannot preserve half of one paid
+review response and force the replacement worker to guess the missing half.
 
 **There is no `Conversation` object anywhere in the codebase**, and a test greps the whole
 package to keep it that way. Context isolation is not a discipline anyone has to remember;

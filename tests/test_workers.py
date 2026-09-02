@@ -72,6 +72,8 @@ def settings(**overrides) -> Settings:
         # what the failure-handling tests below are asserting about. The retry layer has
         # its own tests, against a client that actually fails.
         provider_max_attempts=1,
+        repair_batch_size=1,
+        scan_batch_size=1,
     )
     return Settings(**{**defaults, **overrides})
 

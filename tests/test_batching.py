@@ -79,6 +79,8 @@ def settings(**kwargs) -> Settings:
         # what the failure-handling tests below are asserting about. The retry layer has
         # its own tests, against a client that actually fails.
         provider_max_attempts=1,
+        repair_batch_size=1,
+        scan_batch_size=1,
     )
     return Settings(**{**defaults, **kwargs})
 
@@ -658,6 +660,16 @@ def test_a_resumed_job_keeps_the_batch_size_it_started_with(setup):
     assert second.settings.scan_batch_size == 3
 
 
+def test_a_resumed_job_keeps_the_repair_batch_size_it_started_with(setup):
+    db, _ = setup
+    first = council(setup, batched_client(), repair_batch_size=6)
+    first.run(max_steps=2)
+    assert load_job_settings(db, "job-1")["repair_batch_size"] == 6
+
+    second = council(setup, batched_client(), repair_batch_size=1)
+    assert second.settings.repair_batch_size == 6
+
+
 def test_a_job_resumed_under_a_different_adapter_stops_rather_than_carrying_on(setup):
     """A pinned version nothing compares against is a note in a drawer.
 
@@ -732,6 +744,7 @@ def test_every_call_records_the_behaviour_it_ran_under(setup):
     assert calls
     behaviour = calls[-1]["payload"]["behaviour"]
     assert behaviour["scan_batch_size"] == 3
+    assert behaviour["repair_batch_size"] == 1
     assert behaviour["model"] == "mock"
     assert "cli_adapter_version" in behaviour
     # Deliberately absent. An `output_limit_formula` was pinned and recorded here for a

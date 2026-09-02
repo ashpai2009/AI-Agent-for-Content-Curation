@@ -29,7 +29,10 @@ DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 #: places, so the dataclass default and the environment default cannot drift apart.
 DEFAULT_HEARTBEAT_DIVISOR = 4
 DEFAULT_POLL_INTERVAL_SECONDS = 15.0
-DEFAULT_PROVIDER_TIMEOUT_SECONDS = 120.0
+#: Real batched OpenStax audits exceeded 120 seconds while otherwise progressing. Five
+#: minutes permits one slow structured response to finish and remains a hard bound on a
+#: hung subprocess; killing at two minutes immediately paid for the same prompt again.
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 300.0
 DEFAULT_PROVIDER_MAX_ATTEMPTS = 4
 DEFAULT_PROVIDER_BACKOFF_CEILING_SECONDS = 60.0
 DEFAULT_PROVIDER_FAILURE_BUDGET = 12
@@ -68,10 +71,16 @@ ROLE_EFFORT_ENV = {
 #: iterate on. Raise it further only with the same kind of evidence.
 DEFAULT_CLAUDE_MAX_TURNS = 4
 
-#: Scan batching. **1 is today's behaviour exactly** -- `audit_blocks` delegates to the
-#: unchanged single-block path at this value, so the default changes nothing until somebody
-#: raises it deliberately and measures the result.
-DEFAULT_SCAN_BATCH_SIZE = 1
+#: Scan batching. Two is the measured CLI-safe default: the first four-block live call on
+#: realistic OpenStax material exceeded the 120-second process ceiling twice. Two still
+#: halves repeated audit envelopes without betting a whole retry on an oversized prompt.
+#: Count and rendered characters both bound it; one retains the legacy diagnostic path.
+DEFAULT_SCAN_BATCH_SIZE = 2
+
+#: Maximum issues repaired and reviewed together when they belong to one problem block.
+#: Eight comfortably covers the real-workbook clusters measured so far while keeping the
+#: response schema and simulated diff small. A value of one preserves the legacy path.
+DEFAULT_REPAIR_BATCH_SIZE = 8
 
 #: How many times one block may be scanned again because its coverage record was short of
 #: its graded rows. **One**, not zero and not many: zero would make the coverage record a
@@ -185,6 +194,8 @@ class Settings:
     #: How many problem blocks one Initial Auditor or Independent Reviewer call examines.
     #: 1 delegates to the unchanged single-block path.
     scan_batch_size: int = DEFAULT_SCAN_BATCH_SIZE
+    #: Maximum confirmed issues included in one Writer and one block-review call.
+    repair_batch_size: int = DEFAULT_REPAIR_BATCH_SIZE
     #: Ceiling on a batch's total rendered contribution -- blocks, applicable claims,
     #: deterministic findings and labels together, not `render_block` alone.
     scan_batch_max_characters: int = DEFAULT_SCAN_BATCH_MAX_CHARACTERS
@@ -198,6 +209,11 @@ class Settings:
             raise ConfigurationError(
                 f"SCAN_BATCH_SIZE must be between 1 and {MAX_SCAN_BATCH_SIZE}, "
                 f"got {self.scan_batch_size}"
+            )
+        if not 1 <= self.repair_batch_size <= MAX_SCAN_BATCH_SIZE:
+            raise ConfigurationError(
+                f"REPAIR_BATCH_SIZE must be between 1 and {MAX_SCAN_BATCH_SIZE}, "
+                f"got {self.repair_batch_size}"
             )
         if self.scan_batch_max_characters < 1:
             raise ConfigurationError(
@@ -364,6 +380,7 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         retention_days=_float("RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
         role_effort=role_effort or None,
         scan_batch_size=_int("SCAN_BATCH_SIZE", DEFAULT_SCAN_BATCH_SIZE),
+        repair_batch_size=_int("REPAIR_BATCH_SIZE", DEFAULT_REPAIR_BATCH_SIZE),
         coverage_rescans=_int("COVERAGE_RESCANS", DEFAULT_COVERAGE_RESCANS),
         final_semantic_rounds=_int(
             "FINAL_SEMANTIC_ROUNDS", DEFAULT_FINAL_SEMANTIC_ROUNDS

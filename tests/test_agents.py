@@ -29,6 +29,7 @@ from oatutor_council.agents.known_issue_reviewer import (
     build_context,
     origin_private_label,
     review,
+    review_patches,
 )
 from oatutor_council.agents.rendering import (
     AdjudicationContext,
@@ -45,9 +46,15 @@ from oatutor_council.agents.schemas import (
     IndependentReviewResponse,
     ReviewerResponse,
     WriterResponse,
+    BlockReviewerResponse,
+    BlockWriterResponse,
 )
-from oatutor_council.agents.writer import WriterProposedNothing, propose_patch
-from oatutor_council.llm.base import AgentRole
+from oatutor_council.agents.writer import (
+    WriterProposedNothing,
+    propose_patch,
+    propose_patches,
+)
+from oatutor_council.llm.base import AgentRole, MalformedResponse
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
     ColumnKey,
@@ -56,6 +63,7 @@ from oatutor_council.models import (
     IssueCategory,
     IssueSource,
     ReviewDecision,
+    ReviewerRole,
     Severity,
 )
 from oatutor_council.reporting.ledger import issue_from_finding
@@ -102,6 +110,181 @@ def make_issue(**kwargs) -> Issue:
         cells=((3, 5),),
     )
     return Issue(**{**defaults, **kwargs})
+
+
+def test_one_writer_call_returns_independent_patches_for_a_block(block, parsed):
+    issues = (
+        make_issue(issue_id="answer", cells=((3, 5),)),
+        make_issue(
+            issue_id="type",
+            category=IssueCategory.ROW_TYPE,
+            cells=((3, 6),),
+            description="answer type should be algebra",
+        ),
+    )
+    client = ScriptedLLMClient(
+        default=BlockWriterResponse(
+            results=[
+                {
+                    "issue_id": "answer",
+                    "proposal": {
+                        "derivation": "30 degrees is pi/6 radians",
+                        "edits": [
+                            {"row": 3, "column": "answer", "before": "pi/6", "after": "pi/3"}
+                        ],
+                    },
+                },
+                {
+                    "issue_id": "type",
+                    "proposal": {
+                        "derivation": "",
+                        "edits": [
+                            {"row": 3, "column": "answer_type", "before": "algebra", "after": "numeric"}
+                        ],
+                    },
+                },
+            ]
+        )
+    )
+    results = propose_patches(
+        client,
+        issues=issues,
+        block=block,
+        conventions=parsed.conventions,
+        attempt_numbers={"answer": 1, "type": 1},
+    )
+    assert client.call_count(AgentRole.WRITER) == 1
+    assert [result.patch.issue_id for result in results] == ["answer", "type"]
+    assert "issue_id: answer" in client.payloads_for(AgentRole.WRITER)[0]
+    assert "issue_id: type" in client.payloads_for(AgentRole.WRITER)[0]
+
+
+def test_one_reviewer_call_judges_all_candidates_without_writer_reasoning(block, parsed):
+    issues = (
+        make_issue(issue_id="answer"),
+        make_issue(issue_id="type", cells=((3, 6),), category=IssueCategory.ROW_TYPE),
+    )
+    client = ScriptedLLMClient(
+        default=BlockReviewerResponse(
+            results=[
+                {"issue_id": "answer", "decision": "accept"},
+                {
+                    "issue_id": "type",
+                    "decision": "revise",
+                    "feedback": "row 3 answer_type must remain algebra",
+                },
+            ]
+        )
+    )
+    verdicts = review_patches(
+        client,
+        issues=issues,
+        original_block=block,
+        simulated_block=block,
+        conventions=parsed.conventions,
+        candidate_edits={"answer": (), "type": ()},
+        attempt_numbers={"answer": 1, "type": 1},
+        role=ReviewerRole.KNOWN_ISSUE_REVIEWER,
+    )
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 1
+    assert [verdict.decision for verdict in verdicts] == [
+        ReviewDecision.ACCEPT,
+        ReviewDecision.REVISE,
+    ]
+    payload = client.payloads_for(AgentRole.KNOWN_ISSUE_REVIEWER)[0]
+    assert "issue_id: answer" in payload and "issue_id: type" in payload
+    assert "30 degrees is pi/6 radians" not in payload
+
+
+def test_block_review_keeps_public_origins_for_every_issue_from_one_audit(block, parsed):
+    """Two findings from one auditor call share one private-record label.
+
+    Building the provenance map with a dict comprehension retained only the last issue
+    summary, so the first finding looked like an exact private-text leak and killed a
+    legitimate coordinated review. Both published summaries are public ground for that
+    one originating record; neither is public ground for any other label.
+    """
+    first = "the submitted angle should be pi over six rather than pi over three"
+    second = "the answer type must remain algebra because the answer contains a symbol"
+    issues = (
+        make_issue(issue_id="answer", description=first),
+        make_issue(
+            issue_id="type",
+            cells=((3, 6),),
+            category=IssueCategory.ROW_TYPE,
+            description=second,
+        ),
+    )
+    registry = TaintRegistry()
+    registry.register("auditor.block-0000.reasoning", first)
+    client = ScriptedLLMClient(
+        default=BlockReviewerResponse(
+            results=[
+                {"issue_id": "answer", "decision": "accept"},
+                {"issue_id": "type", "decision": "accept"},
+            ]
+        )
+    )
+
+    verdicts = review_patches(
+        client,
+        issues=issues,
+        original_block=block,
+        simulated_block=block,
+        conventions=parsed.conventions,
+        candidate_edits={"answer": (), "type": ()},
+        attempt_numbers={"answer": 1, "type": 1},
+        taint=registry,
+    )
+
+    assert len(verdicts) == 2
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 1
+
+
+def test_a_block_writer_cannot_silently_omit_an_issue(block, parsed):
+    issues = (make_issue(issue_id="one"), make_issue(issue_id="two"))
+    client = ScriptedLLMClient(
+        default=BlockWriterResponse(
+            results=[
+                {
+                    "issue_id": "one",
+                    "proposal": {
+                        "derivation": "checked",
+                        "edits": [
+                            {"row": 3, "column": "answer", "before": "pi/6", "after": "pi/3"}
+                        ],
+                    },
+                }
+            ]
+        )
+    )
+    with pytest.raises(MalformedResponse, match="expected exactly"):
+        propose_patches(
+            client,
+            issues=issues,
+            block=block,
+            conventions=parsed.conventions,
+            attempt_numbers={"one": 1, "two": 1},
+        )
+
+
+def test_a_block_reviewer_cannot_silently_omit_a_candidate(block, parsed):
+    issues = (make_issue(issue_id="one"), make_issue(issue_id="two"))
+    client = ScriptedLLMClient(
+        default=BlockReviewerResponse(
+            results=[{"issue_id": "one", "decision": "accept"}]
+        )
+    )
+    with pytest.raises(MalformedResponse, match="expected exactly"):
+        review_patches(
+            client,
+            issues=issues,
+            original_block=block,
+            simulated_block=block,
+            conventions=parsed.conventions,
+            candidate_edits={"one": (), "two": ()},
+            attempt_numbers={"one": 1, "two": 1},
+        )
 
 
 # --------------------------------------------------------------------------------------

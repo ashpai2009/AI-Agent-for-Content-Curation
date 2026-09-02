@@ -45,6 +45,8 @@ def settings_for(tmp_path: Path, **kwargs) -> Settings:
         lease_seconds=60,
         # A scripted mock is not a provider; retrying one tests nothing.
         provider_max_attempts=1,
+        repair_batch_size=1,
+        scan_batch_size=1,
     )
     return Settings(**{**defaults, **kwargs})
 

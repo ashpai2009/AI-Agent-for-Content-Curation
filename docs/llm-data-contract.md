@@ -1,7 +1,7 @@
 # LLM data contract
 
 This document is the auditable answer to: **what exactly leaves the service for Claude,
-when, and why?** It describes pipeline contract version 11.
+when, and why?** It describes pipeline contract version 12.
 
 ## Transport
 
@@ -82,7 +82,7 @@ block is discarded and that block is requeued rather than silently changing the 
 
 ### Writer
 
-Sent once per repair attempt:
+For one ready issue, sent once per repair attempt:
 
 - the one issue to resolve, including authorized cells and expected result;
 - the complete current block;
@@ -94,6 +94,16 @@ Sent once per repair attempt:
 The response schema contains exact cell edits (`row`, canonical `column`, character-exact
 `before`, `after`), `related_edits_reason`, optional human escalation, and private
 `reasoning`, `derivation`, and `confidence`.
+
+When at least two ready issues belong to one block, the production path sends those issue
+records, their per-issue prior feedback, and the shared current block in **one** Writer
+call, bounded by `REPAIR_BATCH_SIZE`. The response must return each supplied opaque
+`issue_id` exactly once. Every result is immediately split into an ordinary per-issue
+attempt, patch, deterministic gate result, and private record. Two results cannot own the
+same cell; that ambiguity is rejected before review or application.
+Issues whose authorized targets share a graded row remain sequential because they commonly
+describe one coupled repair. After the first patch is accepted, the rule engine rechecks
+the sibling before another Writer call is allowed.
 
 ### Known-Issue Reviewer
 
@@ -111,6 +121,12 @@ For a new proposal, the service simulates the patch in memory and sends:
 The Writer's reasoning, derivation, and confidence are not sent. `accept` authorizes the
 candidate to be written; `revise` or `human_review` leaves the workbook untouched.
 The response schema contains `decision`, actionable `feedback`, and any rule codes used.
+When two or more candidates from one block are ready together, the service sends their
+public issue records and exact edits alongside one combined simulated block and asks once.
+The reviewer must return each supplied `issue_id` exactly once; the service persists an
+independent verdict for every candidate. The block call never contains Writer reasoning,
+derivation, or confidence. All verdicts from that physical response commit in one database
+transaction and are reused after a crash before any replacement review is requested.
 
 Every model-only finding first receives a **claim-blind corroboration pass**, before the
 Writer is called. The second agent receives the current block, derived conventions,

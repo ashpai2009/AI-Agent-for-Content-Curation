@@ -13,11 +13,11 @@ no longer matches its choice list looks perfect on its own line.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 from uuid import uuid4
 
-from ..llm.base import AgentRole, LLMClient, LLMRequest, call_structured
-from ..llm.context import ContextBundle
+from ..llm.base import AgentRole, LLMClient, LLMRequest, MalformedResponse, call_structured
+from ..llm.context import ContextBundle, DataSection
 from ..llm.prompts import system_prompt
 from ..models import (
     Issue,
@@ -38,7 +38,7 @@ from .rendering import (
     render_findings,
     render_issue,
 )
-from .schemas import ReviewerResponse
+from .schemas import BlockReviewerResponse, ReviewerResponse
 
 INSTRUCTIONS = """\
 Decide whether the issue below is resolved by the current artifact shown.
@@ -86,6 +86,122 @@ _DECISIONS = {
     "revise": ReviewDecision.REVISE,
     "human_review": ReviewDecision.HUMAN_REVIEW,
 }
+
+
+BLOCK_INSTRUCTIONS = """\
+Review the corrected problem block once as a whole. Several candidate repairs were
+proposed together and the simulated block includes all of them.
+
+Return exactly one result for every supplied issue_id and no others. For each issue,
+decide `accept`, `revise`, or `human_review`. Verify the mathematics and instructions
+yourself from the visible workbook content. Consider interactions across all changed
+cells, but judge each issue's candidate on whether the resulting block resolves that
+issue without creating another defect. For `revise`, name the cell and replacement the
+Writer should produce next. You are not shown and must not infer the Writer's reasoning.
+"""
+
+
+def review_patches(
+    client: LLMClient,
+    *,
+    issues: Sequence[Issue],
+    original_block: ProblemBlock,
+    simulated_block: ProblemBlock,
+    conventions,
+    candidate_edits: Mapping[str, Sequence],
+    deterministic_findings: Sequence[ValidationFinding] = (),
+    curator_rules: Sequence[str] = (),
+    attempt_numbers: Mapping[str, int],
+    job_id: str = "",
+    seed: int | None = None,
+    taint: TaintRegistry | None = None,
+    prompt_version: int | None = None,
+    role: ReviewerRole = ReviewerRole.KNOWN_ISSUE_REVIEWER,
+) -> tuple[ReviewVerdict, ...]:
+    """Judge every candidate in one changed-block call, retaining per-issue verdicts."""
+    if not issues:
+        return ()
+    issue_sections = []
+    for issue in issues:
+        issue_sections.append(
+            f"issue_id: {issue.issue_id}\n"
+            + render_issue(issue)
+            + "\nCandidate edits for this issue:\n"
+            + render_candidate_edits(candidate_edits.get(issue.issue_id, ()))
+        )
+    public_sections = [
+        DataSection("Issues and candidate edits", "\n\n".join(issue_sections)),
+        DataSection("Original problem block", render_block(original_block)),
+        DataSection("Simulated corrected problem block", render_block(simulated_block)),
+        DataSection("Whole block diff", render_block_diff(original_block, simulated_block)),
+        DataSection("Conventions", render_conventions(conventions)),
+        DataSection("Deterministic findings", render_findings(deterministic_findings)),
+    ]
+    if curator_rules:
+        public_sections.append(
+            DataSection(
+                "Curation rules the curator supplied",
+                "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
+    payload = ContextBundle.build(BLOCK_INSTRUCTIONS, public_sections).render()
+    if taint is not None:
+        public_for_lists: dict[str, list[str]] = {}
+        for issue in issues:
+            if label := origin_private_label(issue):
+                public_for_lists.setdefault(label, []).append(render_issue(issue))
+        public_for = {
+            label: tuple(summaries) for label, summaries in public_for_lists.items()
+        }
+        taint.assert_clean(
+            payload,
+            context=role.value,
+            public=tuple(section.content for section in public_sections[1:]),
+            public_for=public_for or None,
+        )
+    agent_role = (
+        AgentRole.KNOWN_ISSUE_REVIEWER
+        if role is ReviewerRole.KNOWN_ISSUE_REVIEWER
+        else AgentRole.INDEPENDENT_REVIEWER
+    )
+    response = call_structured(
+        client,
+        LLMRequest(
+            role=agent_role,
+            system_prompt=system_prompt(agent_role, prompt_version),
+            user_payload=payload,
+            schema=BlockReviewerResponse.model_json_schema(),
+            seed=seed,
+            job_id=job_id,
+        ),
+        BlockReviewerResponse,
+    )
+    expected = {issue.issue_id for issue in issues}
+    returned = [item.issue_id for item in response.results]
+    if len(returned) != len(set(returned)) or set(returned) != expected:
+        raise MalformedResponse(
+            f"block reviewer expected exactly {sorted(expected)}, received {sorted(returned)}"
+        )
+    by_id = {item.issue_id: item for item in response.results}
+    verdicts = []
+    for issue in issues:
+        item = by_id[issue.issue_id]
+        decision = _DECISIONS[item.decision]
+        feedback = item.feedback
+        if decision is not ReviewDecision.ACCEPT and not feedback.strip():
+            feedback = f"The reviewer returned {item.decision} without stating what is wrong."
+        verdicts.append(
+            ReviewVerdict(
+                verdict_id=uuid4().hex,
+                issue_id=issue.issue_id,
+                reviewer_role=role,
+                attempt_no=attempt_numbers[issue.issue_id],
+                decision=decision,
+                feedback=feedback,
+                rule_codes=tuple(item.rule_codes),
+            )
+        )
+    return tuple(verdicts)
 
 
 def build_context(
