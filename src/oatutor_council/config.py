@@ -66,7 +66,7 @@ ROLE_EFFORT_ENV = {
 #: A setting because it is a fuse, and the reason to keep it low is unchanged -- what is
 #: bounded is spend on somebody's subscription, and `--tools ""` already leaves nothing to
 #: iterate on. Raise it further only with the same kind of evidence.
-DEFAULT_CLAUDE_MAX_TURNS = 2
+DEFAULT_CLAUDE_MAX_TURNS = 4
 
 #: Scan batching. **1 is today's behaviour exactly** -- `audit_blocks` delegates to the
 #: unchanged single-block path at this value, so the default changes nothing until somebody

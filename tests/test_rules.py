@@ -17,6 +17,7 @@ import pytest
 from conftest import cells, hint, problem, scaffold, step
 from oatutor_council.models import ColumnKey, Severity
 from oatutor_council.validation.rules import REGISTRY, describe_rules, run_rules
+from oatutor_council.validation.rules.notation import normalize_known_non_ascii
 from oatutor_council.workbook.reader import read_workbook
 
 
@@ -231,6 +232,22 @@ def test_a_mixed_namespace_workbook_keeps_the_error(make_workbook):
     findings = findings_for(path, "SCAFFOLD_NAMESPACE_DEVIATION")
     assert [f.severity for f in findings] == [Severity.ERROR]
     assert [f.repairable for f in findings] == [True]
+
+
+def test_a_namespace_finding_authorises_the_complete_linked_rename(make_workbook):
+    path = make_workbook(
+        [
+            problem("a1"),
+            step("a1"),
+            hint("a1", "h1"),
+            scaffold("a1", "s1", dependency="h1", answer="1", answer_type="numeric"),
+            scaffold("a1", "h2", dependency="h1", answer="2", answer_type="numeric"),
+            hint("a1", "h3", dependency="h2"),
+        ]
+    )
+    finding = findings_for(path, "SCAFFOLD_NAMESPACE_DEVIATION")[0]
+    assert finding.detail["expected"] == "s2"
+    assert finding.detail["cells"] == [(6, 7), (7, 8)]
 
 
 def test_the_specified_namespace_produces_no_finding(make_workbook):
@@ -885,6 +902,17 @@ def test_operator_spacing_is_not_reported_in_prose(make_workbook):
 def test_irregular_whitespace(make_workbook, value):
     path = make_workbook([problem("a1"), step("a1", answer=value, answer_type="algebra")])
     assert codes_for(path, "IRREGULAR_WHITESPACE") == ["IRREGULAR_WHITESPACE"]
+
+
+def test_known_unicode_has_an_exact_context_aware_ascii_repair():
+    assert normalize_known_non_ascii("alpha=120° and Heron’s") == (
+        "alpha=120 degrees and Heron's"
+    )
+    assert normalize_known_non_ascii("x²≤9") == "x**2<=9"
+
+
+def test_unknown_unicode_is_reported_but_not_guessed_at_mechanically():
+    assert normalize_known_non_ascii("value ♞") is None
 
 
 def test_ordinary_single_spaces_are_not_irregular(make_workbook):

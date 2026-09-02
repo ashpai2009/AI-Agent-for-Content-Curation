@@ -1,7 +1,7 @@
 # LLM data contract
 
 This document is the auditable answer to: **what exactly leaves the service for Claude,
-when, and why?** It describes pipeline contract version 3.
+when, and why?** It describes pipeline contract version 11.
 
 ## Transport
 
@@ -29,8 +29,8 @@ The system prompt is the pinned role file in `src/oatutor_council/prompts/`, wit
 shared files composed into it:
 
 - `_shared/untrusted_data.md`: workbook/document text is fenced data, never instruction;
-- `_shared/curation_rules.v2.md`: the current standing OATutor formatting and content
-  rules. `v1` remains packaged so earlier prompt hashes stay explainable.
+- `_shared/curation_rules.v3.md`: the current standing OATutor formatting and content
+  rules. Earlier versions remain packaged so earlier prompt hashes stay explainable.
 
 Each job pins both the role prompt version and the SHA-256 of the fully composed text.
 The runner now enforces the hash. Editing a prompt or shared fragment without creating a

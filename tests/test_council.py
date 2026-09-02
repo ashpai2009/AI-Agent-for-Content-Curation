@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import compliant, full_coverage, problem, scaffold, step
+from conftest import compliant, full_coverage, hint, problem, scaffold, step
 from oatutor_council.agents.schemas import (
     AdjudicatorResponse,
     AuditorFinding,
@@ -2008,6 +2008,124 @@ def test_exact_cleanup_uses_no_writer_or_reviewer_calls(make_workbook, tmp_path)
     assert client.call_count(AgentRole.WRITER) == 0
     assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
     assert len([e for e in list_events(db, "job-1") if e["kind"] == "deterministic_repair"]) == 3
+
+
+def test_known_ascii_whitespace_and_namespace_repairs_use_no_model_calls(
+    make_workbook, tmp_path
+):
+    source = make_workbook(
+        [
+            problem(
+                "clean2",
+                title="Angle  120° and Heron’s formula",
+                oer_src="source",
+                openstax_kc="chapter",
+                taxonomy="topic",
+                license="CC",
+            ),
+            step("clean2", answer="1", answer_type="numeric"),
+            hint("clean2", "h1", body="Start here"),
+            scaffold(
+                "clean2", "s1", dependency="h1", answer="1", answer_type="numeric"
+            ),
+            scaffold(
+                "clean2", "h2", dependency="h1", answer="2", answer_type="numeric"
+            ),
+        ]
+    )
+    db = Database(tmp_path / "mechanical-expanded.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "mechanical-expanded")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client()
+    result = CurationCouncil(
+        db=db, settings=settings(), client=client, job_id="job-1", copy=copy
+    ).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    repaired = read_workbook(copy.path).blocks[0]
+    assert repaired.problem_row.get(ColumnKey.TITLE) == (
+        "Angle 120 degrees and Heron's formula"
+    )
+    assert repaired.rows[-1].get(ColumnKey.HINT_ID) == "s2"
+    assert client.call_count(AgentRole.WRITER) == 0
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+
+
+def test_unsupported_model_only_answer_type_claim_is_filtered(make_workbook, tmp_path):
+    source = make_workbook(
+        [problem("policy1"), step("policy1", answer="1/2", answer_type="algebra")]
+    )
+    db = Database(tmp_path / "policy-filter.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "policy-filter")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    block = read_workbook(copy.path).blocks[0]
+    finding = ValidationFinding(
+        code="AUDITOR_FINDING",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        message="A plain constant should be relabelled numeric.",
+        row=3,
+        column=6,
+        column_key=ColumnKey.ANSWER_TYPE,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+        detail={"category": "structure", "cells": [(3, 6)]},
+    )
+    runner = CurationCouncil(
+        db=db, settings=settings(), client=quiet_client(), job_id="job-1", copy=copy
+    )
+
+    assert runner._open_issues([finding], source=IssueSource.INITIAL_AUDITOR) == 0
+    assert list_issues(db, "job-1") == ()
+    assert any(
+        event["kind"] == "model_finding_policy_filtered"
+        for event in list_events(db, "job-1")
+    )
+
+
+def test_deterministically_supported_answer_type_claim_keeps_its_authority(
+    make_workbook, tmp_path
+):
+    source = make_workbook(
+        [problem("policy2"), step("policy2", answer="x+1", answer_type="numeric")]
+    )
+    db = Database(tmp_path / "policy-supported.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "policy-supported")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    block = read_workbook(copy.path).blocks[0]
+    finding = ValidationFinding(
+        code="AUDITOR_FINDING",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        message="The free-variable expression needs algebra answerType.",
+        row=3,
+        column=6,
+        column_key=ColumnKey.ANSWER_TYPE,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+        detail={"category": "structure", "cells": [(3, 6)]},
+    )
+    runner = CurationCouncil(
+        db=db, settings=settings(), client=quiet_client(), job_id="job-1", copy=copy
+    )
+
+    assert runner._open_issues([finding], source=IssueSource.INITIAL_AUDITOR) == 1
+    assert list_issues(db, "job-1")[0].cells == ((3, 6),)
 
 
 def test_final_reconciliation_removes_a_stale_human_alert(setup):

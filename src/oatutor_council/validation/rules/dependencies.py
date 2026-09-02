@@ -554,6 +554,21 @@ def scaffold_namespace_deviation(context: RuleContext) -> Iterable[ValidationFin
         namespace = match.group(1).casefold()
         if namespace == EXPECTED_SCAFFOLD_NAMESPACE:
             continue
+        identifier = _identifier(row)
+        scope = next(
+            (candidate for candidate in block.step_scopes() if row in candidate.rows),
+            None,
+        )
+        dependent_cells = (
+            [
+                (candidate.row, FIXED_COLUMNS[ColumnKey.DEPENDENCY])
+                for candidate in scope.rows
+                if _dependency(candidate) == identifier
+            ]
+            if scope is not None
+            else []
+        )
+        expected = f"{EXPECTED_SCAFFOLD_NAMESPACE}{match.group(2)}"
         yield finding(
             context,
             "SCAFFOLD_NAMESPACE_DEVIATION",
@@ -573,4 +588,13 @@ def scaffold_namespace_deviation(context: RuleContext) -> Iterable[ValidationFin
             repairable=not consistent,
             namespace=namespace,
             workbook_is_consistent=consistent,
+            expected=expected,
+            # A namespace repair is one linked rename.  Authorising only the identifier
+            # cell can make an otherwise-correct Writer patch fail the dependency gate
+            # when a later row references the scaffold.  The issue must name the full
+            # atomic boundary before any patch is proposed.
+            cells=[
+                (row.row, FIXED_COLUMNS[ColumnKey.HINT_ID]),
+                *dependent_cells,
+            ],
         )

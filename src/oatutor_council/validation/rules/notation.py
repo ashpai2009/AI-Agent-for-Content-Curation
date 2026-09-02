@@ -40,9 +40,55 @@ NON_ASCII_MATH = {
     "°": "degrees",
     "²": "**2",
     "³": "**3",
+    "‘": "'",
+    "’": "'",
+    "“": '"',
+    "”": '"',
+    "–": "-",
+    "—": "-",
+    "‑": "-",
+    "…": "...",
+    "\u00a0": " ",
+    "\u202f": " ",
 }
 
 _CARET = re.compile(r"[A-Za-z0-9)\]]\s*\^")
+
+
+def normalize_known_non_ascii(text: str) -> str | None:
+    """Return the exact ASCII spelling when every non-ASCII glyph is known.
+
+    Detection deliberately reports every non-ASCII codepoint, including ones this
+    function does not know how to interpret.  Mechanical repair is narrower: it runs
+    only when every glyph has a lossless, policy-defined replacement.  In particular,
+    the degree sign needs context -- ``120°`` is ``120 degrees``, not ``120degrees``.
+    The latter was measured in a live workbook after the model copied the replacement
+    label from the rule message literally.
+    """
+    if any(ord(ch) > 127 and ch not in NON_ASCII_MATH for ch in text):
+        return None
+
+    pieces: list[str] = []
+    for index, ch in enumerate(text):
+        if ord(ch) <= 127:
+            pieces.append(ch)
+            continue
+        replacement = NON_ASCII_MATH[ch]
+        if ch == "°":
+            if pieces and pieces[-1] and not pieces[-1][-1].isspace():
+                pieces.append(" ")
+            pieces.append(replacement)
+            following = text[index + 1 : index + 2]
+            if following and following.isalpha():
+                pieces.append(" ")
+        else:
+            pieces.append(replacement)
+    return "".join(pieces)
+
+
+def normalize_irregular_whitespace(text: str) -> str:
+    """Apply the written one-space rule without interpreting cell content."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _cells(context: RuleContext, columns):

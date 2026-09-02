@@ -53,7 +53,7 @@ Every flag below exists in 2.1.219's `--help`:
 | `--safe-mode` | No CLAUDE.md, skills, plugins, hooks, MCP, custom agents or output styles. |
 | `--disable-slash-commands` | No skills reachable through `/name`. |
 | `--strict-mcp-config` + `--mcp-config '{"mcpServers":{}}'` | An explicitly empty MCP set, and every other MCP configuration ignored. |
-| `--max-turns 2` | A turn ceiling enforced by the CLI rather than inferred from having no tools. **2, not 1** — see below. `COUNCIL_CLAUDE_MAX_TURNS`. |
+| `--max-turns 4` | A turn ceiling enforced by the CLI rather than inferred from having no tools. **4, measured rather than guessed** — see below. `COUNCIL_CLAUDE_MAX_TURNS`. |
 | `--permission-mode dontAsk` | Never blocks waiting for a human. With no tools there is nothing to permit, so this is belt and braces. |
 | `--no-session-persistence` | Nothing written to disk, nothing resumable. |
 
@@ -79,7 +79,7 @@ against the binary and the reference, before "deliberately not used" is written 
 an argument about what the model has no reason to do, the other is the CLI refusing to let
 it. Both, because what is being bounded is spend on somebody's subscription.
 
-### Why the ceiling is 2 — measured, 2026-08-16
+### Why the ceiling is 4 — measured, 2026-09-01
 
 It was 1, and 1 was wrong. A live pilot lost **four independent-review calls** to
 `Reached maximum number of turns (1)`, raised before the model had emitted its structured
@@ -88,10 +88,20 @@ ceiling that existed to bound spend was *causing* whole extra invocations, each 
 separately billed process. At 1 the flag was not a limit, it was a retry loop with a
 confusing error message.
 
-The reason to keep it low is untouched — this is somebody's subscription — so it moved to
-2 rather than to a comfortable number, and it is a setting (`COUNCIL_CLAUDE_MAX_TURNS`) so
-it can be tightened during an incident without a redeploy. Raise it again only with the
-same kind of evidence: an observed failure mode, not a hunch about headroom.
+The reason to keep it low is untouched — this is somebody's subscription — so it first
+moved to 2 rather than to a comfortable number. A later blind run over a real 30-block
+workbook lost eight physical calls to `Reached maximum number of turns (2)` (six Initial
+Auditor calls and two Writer calls). Each failure reported three turns and then retried the
+entire prompt, so 2 was again increasing spend. The measured default is therefore 3. It
+remains a setting (`COUNCIL_CLAUDE_MAX_TURNS`) so it can be tightened during an incident
+without a redeploy. Raise it again only with the same kind of evidence: an observed failure
+mode, not a hunch about headroom.
+
+The first fresh run under the contract-11 architecture then lost two of its first four
+completed Initial Auditor invocations to `Reached maximum number of turns (3)`. Each failed
+envelope reported four turns; the first retry succeeded, so this was the same measured waste
+one level higher. The job was stopped early rather than spending the rest of the allowance
+on retries, and the pinned adapter default moved to 4.
 
 Structured output arriving on turn 2 is not itself surprising — the CLI's own turn
 accounting is not documented at this version, and nothing here claims to know why the

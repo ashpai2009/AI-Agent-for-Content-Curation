@@ -357,11 +357,13 @@ The properties that matter:
 - **A restricted child environment** built by allowlist, dropping every credential variable.
 - **A timeout kills the whole process group**, because the CLI spawns helpers that would
   otherwise outlive it.
-- **`--max-turns 2`** (`COUNCIL_CLAUDE_MAX_TURNS`), a ceiling the CLI enforces rather than one
-  inferred from having no tools. It was 1 until a live run lost four calls to `Reached maximum
-  number of turns (1)` before their structured output arrived — retry recovered every one, so
-  a limit meant to bound spend was buying extra billed processes instead. Raise it further only
-  on the same kind of evidence.
+- **`--max-turns 4`** (`COUNCIL_CLAUDE_MAX_TURNS`), a ceiling the CLI enforces rather than one
+  inferred from having no tools. It rose from 1 to 2 after a live run lost four calls at turn 1,
+  then from 2 to 3 after a 30-block real workbook lost eight more calls at turn 2. In both cases
+  the model had produced another turn but the adapter discarded it and paid to retry the whole
+  prompt, so the lower ceiling increased rather than bounded spend. A fresh contract-11 run
+  then lost two of its first four completed audit invocations at turn 3, so the measured
+  ceiling is now 4.
 
 Settings are prefixed `COUNCIL_` because `CLAUDE_EFFORT` is a variable the CLI itself sets:
 unprefixed, the service would inherit an effort level from whatever session launched it.

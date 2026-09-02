@@ -166,12 +166,15 @@ def test_the_call_carries_the_configured_turn_ceiling(tmp_path, recorder):
     nothing to iterate on, but a limit the CLI enforces is worth more than a limit that
     follows from an argument about what the model should have no reason to do.
 
-    The value is **2**. At 1 the live pilot lost four independent-review calls to
+    The value is **4**. At 1 the first live pilot lost four independent-review calls to
     `Reached maximum number of turns (1)` before the structured output arrived, and retry
-    recovered every one -- so the ceiling meant to bound spend was buying extra calls."""
+    recovered every one. At 2, a 30-block blind workbook lost another eight physical
+    calls the same way. At 3, two of the first four completed audit invocations in a fresh
+    contract-11 run reported a fourth turn and were discarded. The ceiling meant to bound
+    spend was buying duplicate calls."""
     executable, args, _, _ = recorder
     configured = settings(tmp_path, executable)
-    assert configured.claude_max_turns == 2
+    assert configured.claude_max_turns == 4
 
     ClaudeCLIClient(configured).complete(request())
     sent = args.read_text().splitlines()

@@ -23,6 +23,7 @@ human attention, which is the honest outcome after three failed repairs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -149,6 +150,10 @@ from .validation.patch_gate import (
     validate_patch,
 )
 from .validation.rules import run_rules
+from .validation.rules.notation import (
+    normalize_irregular_whitespace,
+    normalize_known_non_ascii,
+)
 from .workbook.diff import net_changes
 from .workbook.reader import read_workbook, render_cell
 from .workbook.writer import (
@@ -187,6 +192,12 @@ _ROOT_FINDING_CODES = frozenset(
         "ROW_HAS_FORBIDDEN_CONTENT",
         "PROBLEM_ROW_HAS_GRADED_CONTENT",
     }
+)
+
+#: Findings authored by a model rather than a registered deterministic rule.  These are
+#: passed through the policy boundary below before they can consume repair calls.
+_MODEL_FINDING_CODES = frozenset(
+    {"AUDITOR_FINDING", "INDEPENDENT_FINDING", "FINAL_VERIFICATION_FINDING"}
 )
 
 #: The durable event kind counted against `provider_failure_budget`.
@@ -350,7 +361,15 @@ FINAL_GATE_ROUND = 1_000
 #: Version 3 distinguishes an explicit logged-out CLI from a transient runtime token
 #: refresh failure. The latter is retried; mixing the two readings inside one resumed job
 #: would give identical recorded settings different failure semantics.
-CLI_ADAPTER_VERSION = 3
+#: 4 (2026-09-01): the verified default turn ceiling rose from 2 to 3 after a 30-block
+#: live workbook lost eight physical calls to ``Reached maximum number of turns (2)``.
+#: Each retry paid for the same prompt again; allowing the already-produced third turn is
+#: the tighter spend bound in practice.
+#: 5 (2026-09-01): the first fresh contract-11 run lost two of its first four completed
+#: Initial Auditor invocations to ``Reached maximum number of turns (3)``. Both envelopes
+#: reported a fourth turn; the first retry succeeded, proving the lower ceiling was again
+#: paying twice for one prompt. The job was stopped before more allowance was wasted.
+CLI_ADAPTER_VERSION = 5
 
 #: Version of orchestration and user-payload construction that changes what agents see or
 #: when workbook bytes are committed. Prompt files are pinned separately; this covers the
@@ -382,7 +401,11 @@ CLI_ADAPTER_VERSION = 3
 #: 10 (2026-08-30): self-contradiction checks apply only to a block's graded rows. Stray
 #: model commentary about a hint or problem row remains durable, but can no longer withhold
 #: final certification or manufacture a curator warning about an Answer the row lacks.
-PIPELINE_CONTRACT_VERSION = 10
+#: 11 (2026-09-01): model-only numeric/algebra claims are filtered against deterministic
+#: authority before entering the queue; semantic findings are repaired before routine
+#: cleanup; and linked scaffold namespace renames are mechanical. A job cannot switch to
+#: those priorities and edit-authority rules halfway through and still be one audit.
+PIPELINE_CONTRACT_VERSION = 11
 
 
 class BudgetExhausted(Exception):
@@ -1944,7 +1967,7 @@ class CurationCouncil:
     def _mechanical_patch(
         self, issue: Issue, parsed: ParsedWorkbook, block: ProblemBlock
     ) -> Patch | None:
-        if len(issue.cells) != 1 or len(issue.rule_codes) != 1:
+        if not issue.cells or len(issue.rule_codes) != 1:
             return None
         row_number, column_number = issue.cells[0]
         row = next((candidate for candidate in block.rows if candidate.row == row_number), None)
@@ -1955,33 +1978,13 @@ class CurationCouncil:
         code = issue.rule_codes[0]
 
         if code == "WHITESPACE_PADDING":
+            if len(issue.cells) != 1:
+                return None
             after = before.strip()
             if not before or after == before:
                 return None
             reason = "remove leading or trailing whitespace exactly"
-        elif code == "METADATA_ON_NON_PROBLEM_ROW":
-            # Clearing a misplaced value is lossless only when the problem row already
-            # carries that metadata field. Otherwise it may be displaced source content
-            # and the Writer/reviewer must decide where it belongs.
-            if not before or not block.problem_row.get(key).strip():
-                return None
-            after = ""
-            reason = "remove duplicate metadata from a non-problem row"
-        elif (
-            code == "ANSWER_TYPE_MISMATCH"
-            and key is ColumnKey.ANSWER_TYPE
-            and before.strip().lower() == "numeric"
-        ):
-            after = "algebra"
-            reason = "label an explicit variable equation as algebra"
-        else:
-            return None
-
-        return Patch(
-            patch_id=f"deterministic-{uuid4().hex}",
-            issue_id=issue.issue_id,
-            attempt_no=1,
-            edits=(
+            edits = (
                 CellEdit(
                     row=row_number,
                     column=column_number,
@@ -1989,7 +1992,130 @@ class CurationCouncil:
                     before=before,
                     after=after,
                 ),
-            ),
+            )
+        elif code == "IRREGULAR_WHITESPACE":
+            if len(issue.cells) != 1:
+                return None
+            after = normalize_irregular_whitespace(before)
+            if not before or after == before:
+                return None
+            reason = "replace prohibited whitespace runs with one ordinary space"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif code == "NON_ASCII_MATH":
+            if len(issue.cells) != 1:
+                return None
+            after = normalize_known_non_ascii(before)
+            if after is None or after == before:
+                return None
+            reason = "replace known Unicode glyphs with their exact ASCII spelling"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif code == "SCAFFOLD_NAMESPACE_DEVIATION":
+            if key is not ColumnKey.HINT_ID or not issue.expected:
+                return None
+            after = issue.expected.strip()
+            if not re.fullmatch(r"s\d+", after, re.IGNORECASE):
+                return None
+            scope = next(
+                (candidate for candidate in block.step_scopes() if row in candidate.rows),
+                None,
+            )
+            if scope is None or any(
+                candidate.row != row_number
+                and candidate.get(ColumnKey.HINT_ID).strip().casefold() == after.casefold()
+                for candidate in scope.identified
+            ):
+                return None
+            linked_edits = [
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                )
+            ]
+            for linked_row, linked_column in issue.cells[1:]:
+                linked_key = parsed.column_map.key_at(linked_column)
+                workbook_row = next(
+                    (candidate for candidate in block.rows if candidate.row == linked_row),
+                    None,
+                )
+                if (
+                    linked_key is not ColumnKey.DEPENDENCY
+                    or workbook_row is None
+                    or workbook_row.get(linked_key).strip() != before.strip()
+                ):
+                    return None
+                linked_edits.append(
+                    CellEdit(
+                        row=linked_row,
+                        column=linked_column,
+                        column_key=linked_key,
+                        before=workbook_row.get(linked_key),
+                        after=after,
+                    )
+                )
+            reason = "rename a scaffold and every linked dependency into the required s namespace"
+            edits = tuple(linked_edits)
+        elif code == "METADATA_ON_NON_PROBLEM_ROW":
+            if len(issue.cells) != 1:
+                return None
+            # Clearing a misplaced value is lossless only when the problem row already
+            # carries that metadata field. Otherwise it may be displaced source content
+            # and the Writer/reviewer must decide where it belongs.
+            if not before or not block.problem_row.get(key).strip():
+                return None
+            after = ""
+            reason = "remove duplicate metadata from a non-problem row"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif (
+            code == "ANSWER_TYPE_MISMATCH"
+            and key is ColumnKey.ANSWER_TYPE
+            and before.strip().lower() == "numeric"
+        ):
+            after = "algebra"
+            reason = "label an explicit variable equation as algebra"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        else:
+            return None
+
+        return Patch(
+            patch_id=f"deterministic-{uuid4().hex}",
+            issue_id=issue.issue_id,
+            attempt_no=1,
+            edits=edits,
             reason=reason,
             derivation=(
                 "removing boundary whitespace preserves the mathematical value exactly"
@@ -2760,6 +2886,97 @@ class CurationCouncil:
             f for f in run_rules(parsed) if f.block_id == block.block_id
         ) + block.findings
 
+    def _apply_model_policy_boundary(
+        self, findings: Sequence[ValidationFinding]
+    ) -> tuple[ValidationFinding, ...]:
+        """Remove edit authority a model claim cannot obtain from workbook policy.
+
+        Prompt wording is guidance; the patch gate is authority.  A live workbook proved
+        why the distinction matters: despite every role being told that a plain constant
+        is not evidence for choosing between ``numeric`` and ``algebra``, the Initial
+        Auditor opened 28 answer-type-only findings.  They would each consume blind
+        corroboration, adjudication and repair calls only for the patch gate to reject the
+        same unsupported relabel at the end.
+
+        Apply the gate's rule at ingestion instead.  A model may target answerType when a
+        registered deterministic rule supports that exact cell, or when its coordinated
+        repair also changes the Answer on the same row.  Otherwise that target is removed;
+        a claim with no targets left is not opened.  This is deliberately limited to the
+        three model-finding codes, so curator instructions and registered rules retain
+        their existing authority.
+        """
+        if not any(finding.code in _MODEL_FINDING_CODES for finding in findings):
+            return tuple(findings)
+
+        parsed = self.current_workbook()
+        supported_type_cells = {
+            (finding.row, finding.column)
+            for finding in run_rules(parsed, only={"ANSWER_TYPE_MISMATCH"})
+            if finding.row is not None and finding.column is not None
+        }
+        normalized: list[ValidationFinding] = []
+        for finding in findings:
+            if finding.code not in _MODEL_FINDING_CODES:
+                normalized.append(finding)
+                continue
+
+            targets = sorted(_finding_targets(finding))
+            answer_rows = {
+                row
+                for row, column in targets
+                if parsed.column_map.key_at(column) is ColumnKey.ANSWER
+            }
+            kept: list[tuple[int, int]] = []
+            removed: list[tuple[int, int]] = []
+            for target in targets:
+                row, column = target
+                unsupported_type = (
+                    parsed.column_map.key_at(column) is ColumnKey.ANSWER_TYPE
+                    and row not in answer_rows
+                    and target not in supported_type_cells
+                )
+                (removed if unsupported_type else kept).append(target)
+
+            if not removed:
+                normalized.append(finding)
+                continue
+
+            detail = dict(finding.detail)
+            detail["policy_filtered_cells"] = removed
+            if not kept:
+                record_event(
+                    self.db,
+                    self.job_id,
+                    "model_finding_policy_filtered",
+                    f"{finding.code}: discarded unsupported numeric/algebra claim at "
+                    f"{removed}",
+                )
+                continue
+
+            primary_row, primary_column = kept[0]
+            detail["cells"] = kept
+            normalized.append(
+                finding.model_copy(
+                    update={
+                        "row": primary_row,
+                        "column": primary_column,
+                        "column_key": parsed.column_map.key_at(primary_column),
+                        "message": (
+                            f"{finding.message} Policy boundary: do not change "
+                            "answerType solely to relabel an unchanged plain value."
+                        ),
+                        "detail": detail,
+                    }
+                )
+            )
+            record_event(
+                self.db,
+                self.job_id,
+                "model_finding_policy_narrowed",
+                f"{finding.code}: removed unsupported answerType targets {removed}",
+            )
+        return tuple(normalized)
+
     def _open_issues(
         self,
         findings: Sequence[ValidationFinding],
@@ -2769,7 +2986,7 @@ class CurationCouncil:
     ) -> int:
         opened = 0
         candidates = sorted(
-            actionable(tuple(findings)),
+            actionable(self._apply_model_policy_boundary(findings)),
             key=lambda finding: (
                 finding.block_id or "",
                 0 if finding.code in _ROOT_FINDING_CODES else 1,
@@ -2815,7 +3032,7 @@ class CurationCouncil:
         existing = {i.fingerprint: i for i in list_issues(self.db, self.job_id)}
         result = Rediscovery()
 
-        for finding in actionable(tuple(findings)):
+        for finding in actionable(self._apply_model_policy_boundary(findings)):
             mark = fingerprint(finding)
             seen = existing.get(mark)
             if seen is not None:

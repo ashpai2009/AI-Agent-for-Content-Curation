@@ -278,6 +278,49 @@ def test_the_phase_queue_can_filter_by_reviewer_role(db, job):
     assert found.issue_id == "i"
 
 
+def test_semantic_work_precedes_routine_warnings(db, job):
+    insert_issue(
+        db,
+        make_issue(
+            "warning",
+            severity=Severity.WARNING,
+            rule_codes=("GENERIC_WARNING",),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+    insert_issue(
+        db,
+        make_issue(
+            "semantic",
+            rule_codes=("AUDITOR_FINDING",),
+            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            block_id="block-2",
+        ),
+    )
+    assert next_issue_for_phase(db, "job-1", [IssueState.OPEN]).issue_id == "semantic"
+
+
+def test_a_known_error_precedes_a_duplicate_semantic_claim(db, job):
+    insert_issue(
+        db,
+        make_issue(
+            "semantic",
+            rule_codes=("AUDITOR_FINDING",),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            block_id="block-2",
+        ),
+    )
+    insert_issue(
+        db,
+        make_issue(
+            "known",
+            rule_codes=("SCAFFOLD_MISSING_ANSWER",),
+            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ),
+    )
+    assert next_issue_for_phase(db, "job-1", [IssueState.OPEN]).issue_id == "known"
+
+
 def test_a_drained_phase_returns_nothing(db, job):
     """A phase advances when its predicate returns zero rows -- there is no cursor to
     get out of step with the data."""

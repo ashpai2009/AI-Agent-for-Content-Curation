@@ -784,7 +784,30 @@ def next_issue_for_phase(
                     AND busy.state IN ('awaiting_patch','patch_proposed','patch_approved','applying',
                                        'patch_applied','awaiting_review')
               )
-            ORDER BY i.created_at LIMIT 1""",
+            ORDER BY
+              CASE
+                -- A displaced row or broken block boundary can make every semantic cell
+                -- below it look wrong, so the small root set remains first.
+                WHEN json_extract(i.payload_json, '$.rule_codes[0]') IN (
+                    'ROW_SHIFT_RIGHT','COLUMN_SHIFT','BLOCK_BOUNDARY_DISAGREEMENT',
+                    'PROBLEM_NAME_MISMATCH_IN_BLOCK','MISSING_PROBLEM_NAME',
+                    'ROW_HAS_FORBIDDEN_CONTENT','PROBLEM_ROW_HAS_GRADED_CONTENT'
+                ) THEN 0
+                WHEN i.severity = 'blocking' THEN 1
+                -- Remaining deterministic errors precede a same-cell model duplicate.
+                WHEN json_extract(i.payload_json, '$.rule_codes[0]') NOT IN (
+                    'AUDITOR_FINDING','INDEPENDENT_FINDING','FINAL_VERIFICATION_FINDING'
+                ) AND i.severity = 'error' THEN 2
+                -- On the first large blind workbook, semantic findings also sat behind
+                -- routine warnings until subscription usage was exhausted. Once known
+                -- errors are settled, math and instruction defects come before polish.
+                WHEN json_extract(i.payload_json, '$.rule_codes[0]') IN (
+                    'AUDITOR_FINDING','INDEPENDENT_FINDING','FINAL_VERIFICATION_FINDING'
+                ) THEN 3
+                ELSE 4
+              END,
+              i.created_at
+            LIMIT 1""",
         parameters,
     ).fetchone()
     return Issue.model_validate_json(row["payload_json"]) if row else None
