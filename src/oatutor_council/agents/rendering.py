@@ -282,12 +282,12 @@ assert_no_private_fields(AdjudicationContext)
 
 @dataclass(frozen=True)
 class FinalVerificationContext:
-    """The narrowest context in the council, and narrow on purpose.
+    """The corrected block plus the public net edits that require its final check.
 
-    The block as it now stands, the workbook's own conventions, and the curation rules.
-    **No deterministic findings, no issue ledger, no repair history, no earlier finding,
-    no answer.** Every one of those would tell this agent where somebody already looked,
-    and the whole value of a final pass is that it does not know.
+    The block as it now stands, the workbook's own conventions, the curation rules, and
+    the literal source-to-current cell changes. **No deterministic findings, issue
+    descriptions, model reasoning, or review verdicts.** The diff focuses this phase on
+    the content the pipeline changed without leaking an earlier agent's interpretation.
 
     That is a stricter diet than the Independent Reviewer's, which does see the
     deterministic findings so it can avoid re-reporting what the rule engine already
@@ -299,11 +299,13 @@ class FinalVerificationContext:
 
     block: str
     conventions: str
+    changed_content: str
     curator_rules: str = ""
 
     def sections(self) -> tuple[DataSection, ...]:
         sections = [
             DataSection("The problem block, as the workbook now stands", self.block),
+            DataSection("Changed content requiring a final re-check", self.changed_content),
             DataSection("Conventions this workbook follows", self.conventions),
         ]
         if self.curator_rules.strip():

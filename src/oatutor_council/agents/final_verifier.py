@@ -1,4 +1,4 @@
-"""The Final Semantic Verifier. Solves the corrected workbook again, knowing nothing.
+"""The Final Semantic Verifier. Re-solves corrected blocks after their last edit.
 
 Every other scan in this pipeline examined a workbook that has since been edited. The
 Initial Auditor read the file as submitted; the Independent Reviewer swept it mid-repair.
@@ -11,11 +11,10 @@ re-run of an earlier marker. A block's verification is *invalidated by any accep
 to it* and redone, which is the only way "this workbook was checked after its last change"
 can be true rather than merely plausible.
 
-**It is shown less than any other agent**: the block, the conventions, the curator's rules.
-No deterministic findings, no ledger, no repair history, no earlier finding, no answer. A
-verifier told where somebody already looked stops being an independent look, and the
-population that matters here is exactly the rows nobody flagged -- eight of the eleven
-held-out misses were in it.
+It is shown the block, conventions, curator rules, and the literal public net diff from
+the uploaded block. It receives no issue description, deterministic finding, model
+reasoning, or verdict. The diff focuses it on the content the pipeline changed without
+letting an earlier agent's explanation become its evidence.
 
 It never edits. Its findings are model claims like any other, and they go through the same
 claim-blind corroboration and adjudication before a Writer is allowed near a cell. A last
@@ -35,6 +34,7 @@ from ..llm.base import (
 from ..llm.context import ContextBundle
 from ..llm.prompts import system_prompt
 from ..models import (
+    ChangeRecord,
     FindingScope,
     ProblemBlock,
     Severity,
@@ -44,20 +44,24 @@ from ..models import (
 from .batching import FindingAttributionError
 from .coverage import coverage_gaps
 from .isolation import TaintRegistry
-from .rendering import FinalVerificationContext, render_block, render_conventions
+from .rendering import (
+    FinalVerificationContext,
+    render_block,
+    render_candidate_edits,
+    render_conventions,
+)
 from .schemas import FinalVerificationResponse, RowCoverage, column_key
 from ..models import FIXED_COLUMNS
 from dataclasses import dataclass
 
 INSTRUCTIONS = """\
-This problem block is about to be handed back to a curator as finished. Check it.
+This changed problem block is about to be handed back to a curator. Check it after its
+last accepted edit.
 
 Solve every graded row yourself, from the question as posed. You are given the block, the
-conventions the workbook follows, and the curation rules — and deliberately nothing else.
-No earlier finding, no list of what was repaired, no answer key. Anything already reported
-by another agent is not your concern and is not evidence that the rest of the block is
-sound; some of these rows were edited by an automated repair that a reviewer accepted, and
-those are the rows most worth re-deriving rather than reading.
+conventions the workbook follows, the curation rules, and a literal source-to-current diff.
+The diff says what bytes changed, not why. Treat it as a checklist, not an answer key:
+derive the affected mathematics yourself and check that coordinated fields still agree.
 
 Return a coverage record for **every** graded row — every row whose Row Type is `step` or
 `scaffold` — whether or not you find anything wrong. A block short of its graded rows is
@@ -85,6 +89,7 @@ def verify_block(
     *,
     block: ProblemBlock,
     conventions: WorkbookConventions,
+    changes: Sequence[ChangeRecord] = (),
     curator_rules: Sequence[str] = (),
     job_id: str = "",
     seed: int | None = None,
@@ -94,6 +99,7 @@ def verify_block(
     context = FinalVerificationContext(
         block=render_block(block),
         conventions=render_conventions(conventions),
+        changed_content=render_candidate_edits(changes),
         curator_rules="\n".join(f"- {rule}" for rule in curator_rules),
     )
     bundle = ContextBundle.build(INSTRUCTIONS, context.sections())
@@ -106,7 +112,12 @@ def verify_block(
         taint.assert_clean(
             payload,
             context=AgentRole.FINAL_VERIFIER.value,
-            public=(context.block, context.conventions, context.curator_rules),
+            public=(
+                context.block,
+                context.changed_content,
+                context.conventions,
+                context.curator_rules,
+            ),
         )
 
     response, call_id = call_structured_recorded(

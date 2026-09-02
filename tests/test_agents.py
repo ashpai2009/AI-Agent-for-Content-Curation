@@ -49,11 +49,7 @@ from oatutor_council.agents.schemas import (
     BlockReviewerResponse,
     BlockWriterResponse,
 )
-from oatutor_council.agents.writer import (
-    WriterProposedNothing,
-    propose_patch,
-    propose_patches,
-)
+from oatutor_council.agents.writer import propose_patch, propose_patches
 from oatutor_council.llm.base import AgentRole, MalformedResponse
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
@@ -154,9 +150,74 @@ def test_one_writer_call_returns_independent_patches_for_a_block(block, parsed):
         attempt_numbers={"answer": 1, "type": 1},
     )
     assert client.call_count(AgentRole.WRITER) == 1
-    assert [result.patch.issue_id for result in results] == ["answer", "type"]
+    assert [result.patch.issue_id for result in results if result.patch] == [
+        "answer",
+        "type",
+    ]
     assert "issue_id: answer" in client.payloads_for(AgentRole.WRITER)[0]
     assert "issue_id: type" in client.payloads_for(AgentRole.WRITER)[0]
+
+
+def test_one_invalid_block_proposal_does_not_discard_its_valid_sibling(block, parsed):
+    """A paid batch is an envelope, not one atomic patch.
+
+    The CLI returned this shape in the sealed pilot: one issue repeated the cell's
+    current value while another supplied a valid repair. The no-op must be rejected for
+    its own issue without raising out of the call and losing the valid sibling result.
+    """
+    issues = (
+        make_issue(issue_id="no-op", cells=((3, 3),)),
+        make_issue(issue_id="answer", cells=((3, 5),)),
+    )
+    client = ScriptedLLMClient(
+        default=BlockWriterResponse(
+            results=[
+                {
+                    "issue_id": "no-op",
+                    "proposal": {
+                        "derivation": "",
+                        "edits": [
+                            {
+                                "row": 3,
+                                "column": "problem_name",
+                                "before": "angles1",
+                                "after": "angles1",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "issue_id": "answer",
+                    "proposal": {
+                        "derivation": "30 degrees is pi/6 radians",
+                        "edits": [
+                            {
+                                "row": 3,
+                                "column": "answer",
+                                "before": "pi/6",
+                                "after": "pi/3",
+                            }
+                        ],
+                    },
+                },
+            ]
+        )
+    )
+
+    results = propose_patches(
+        client,
+        issues=issues,
+        block=block,
+        conventions=parsed.conventions,
+        attempt_numbers={"no-op": 1, "answer": 1},
+    )
+
+    assert results[0].patch is None
+    assert results[0].rejection is not None
+    assert results[0].rejection.code.value == "NO_OP"
+    assert results[1].rejection is None
+    assert results[1].patch is not None
+    assert results[1].patch.issue_id == "answer"
 
 
 def test_one_reviewer_call_judges_all_candidates_without_writer_reasoning(block, parsed):
@@ -1118,11 +1179,16 @@ def test_escalation_produces_no_edits_and_is_terminal(parsed, block):
 def test_neither_edits_nor_escalation_is_refused(parsed, block):
     """A patch with no edits and no escalation is not an answer to the question asked."""
     client = ScriptedLLMClient(default=WriterResponse(derivation=""))
-    with pytest.raises(WriterProposedNothing):
-        propose_patch(
-            client, issue=make_issue(), block=block, conventions=parsed.conventions,
-            attempt_no=1,
-        )
+    result = propose_patch(
+        client,
+        issue=make_issue(),
+        block=block,
+        conventions=parsed.conventions,
+        attempt_no=1,
+    )
+    assert result.patch is None
+    assert result.rejection is not None
+    assert result.rejection.code.value == "NO_OP"
 
 
 def test_reviewer_feedback_reaches_the_writer(parsed, block):

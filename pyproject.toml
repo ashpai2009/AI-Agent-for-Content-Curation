@@ -44,5 +44,5 @@ where = ["src"]
 oatutor_council = ["prompts/*.md", "prompts/_shared/*.md"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]

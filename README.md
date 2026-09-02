@@ -14,13 +14,14 @@ policy.
 XLSX (required) + optional instruction document (.pdf/.docx/.txt/.md)
   → Initial Auditor          scans every block, accounting for every graded row
   → Claim Reviewer           audits the block again, blind to the claim
-  → Adjudicator              settles what that audit neither reproduced nor disproved
+  → Adjudicator              reconciles two related findings on the same row
+     or curator              receives a claim the blind audit did not reproduce
   → Writer                   corrects confirmed issues
   → Known-Issue Reviewer     checks simulated corrections before they are written
   → repair loop              bounded at three attempts per issue
   → Independent Reviewer     rechecks every current problem from scratch
   → repair loop
-  → Final Semantic Verifier   re-solves every graded row of the corrected workbook
+  → Final Semantic Verifier  re-solves graded rows in blocks whose content changed
   → final deterministic validation
   → corrected XLSX + reports
 ```

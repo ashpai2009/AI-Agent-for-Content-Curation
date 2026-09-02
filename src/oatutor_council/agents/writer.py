@@ -19,10 +19,21 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from ..llm.base import AgentRole, LLMClient, LLMRequest, MalformedResponse, call_structured
 from ..llm.context import ContextBundle, DataSection
 from ..llm.prompts import system_prompt
-from ..models import FIXED_COLUMNS, CellEdit, Issue, Patch, ProblemBlock, ValidationFinding
+from ..models import (
+    FIXED_COLUMNS,
+    CellEdit,
+    Issue,
+    Patch,
+    PatchRejection,
+    ProblemBlock,
+    RejectionCode,
+    ValidationFinding,
+)
 from .isolation import TaintRegistry, WriterPrivate
 from .rendering import (
     render_block,
@@ -35,8 +46,9 @@ from .schemas import BlockWriterResponse, WriterResponse, column_key
 
 @dataclass(frozen=True)
 class WriterResult:
-    patch: Patch
+    patch: Patch | None
     private: WriterPrivate
+    rejection: PatchRejection | None = None
 
 
 INSTRUCTIONS = """\
@@ -173,12 +185,21 @@ def propose_patches(
         )
         if taint is not None:
             taint.register_model(f"writer.{issue.issue_id}.{attempt_no}", private)
-        results.append(
-            WriterResult(
-                patch=_to_patch(proposal, issue=issue, attempt_no=attempt_no),
-                private=private,
+        try:
+            patch = _to_patch(proposal, issue=issue, attempt_no=attempt_no)
+        except (WriterProposedNothing, ValidationError) as error:
+            # A coordinated call contains independently reviewable proposals. One bad
+            # proposal must spend only its own attempt; letting it escape here crashes
+            # the job and throws away valid sibling proposals from the same paid call.
+            results.append(
+                WriterResult(
+                    patch=None,
+                    private=private,
+                    rejection=_invalid_patch_rejection(error),
+                )
             )
-        )
+        else:
+            results.append(WriterResult(patch=patch, private=private))
     return tuple(results)
 
 
@@ -249,8 +270,29 @@ def propose_patch(
     if taint is not None:
         taint.register_model(f"writer.{issue.issue_id}.{attempt_no}", private)
 
-    patch = _to_patch(response, issue=issue, attempt_no=attempt_no)
+    try:
+        patch = _to_patch(response, issue=issue, attempt_no=attempt_no)
+    except (WriterProposedNothing, ValidationError) as error:
+        return WriterResult(
+            patch=None,
+            private=private,
+            rejection=_invalid_patch_rejection(error),
+        )
     return WriterResult(patch=patch, private=private)
+
+
+def _invalid_patch_rejection(
+    error: WriterProposedNothing | ValidationError,
+) -> PatchRejection:
+    """Turn an unusable proposal into a normal, issue-local gate rejection."""
+    message = str(error)
+    if "changes nothing" in message or "returned no edits" in message:
+        code = RejectionCode.NO_OP
+    elif "same cell twice" in message:
+        code = RejectionCode.DUPLICATE_CELL_EDIT
+    else:
+        code = RejectionCode.SCHEMA_INVALID
+    return PatchRejection(code=code, message=message)
 
 
 def _to_patch(response: WriterResponse, *, issue: Issue, attempt_no: int) -> Patch:
@@ -274,6 +316,10 @@ def _to_patch(response: WriterResponse, *, issue: Issue, attempt_no: int) -> Pat
     edits = []
     for edit in response.edits:
         key = column_key(edit.column)
+        if edit.before == edit.after:
+            raise WriterProposedNothing(
+                f"edit at row {edit.row} column {FIXED_COLUMNS[key]} changes nothing"
+            )
         edits.append(
             CellEdit(
                 row=edit.row,

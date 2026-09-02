@@ -327,6 +327,100 @@ def test_two_issues_in_one_block_use_one_writer_and_one_reviewer_call(
     assert len(attempts) == 2 and len(verdicts) == 2
 
 
+def test_one_invalid_block_proposal_does_not_crash_or_discard_its_sibling(
+    make_workbook, tmp_path
+):
+    """One malformed issue result is not allowed to poison a coordinated call."""
+    source = make_workbook(
+        [
+            problem("partial-batch", title="Two parts", oer_src="s", license="CC"),
+            step("partial-batch", answer="1", answer_type="numeric"),
+            scaffold("partial-batch", "s1", answer="", answer_type="numeric"),
+            scaffold("partial-batch", "s2", answer="", answer_type="numeric"),
+        ]
+    )
+    db = Database(tmp_path / "partial-batch.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "partial-batch-job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="partial-batch",
+            source_filename=source.name,
+            source_sha256=copy.source_sha256,
+        ),
+    )
+    client = ScriptedLLMClient()
+
+    def reply(request):
+        if request.role is AgentRole.WRITER:
+            pairs = re.findall(
+                r"issue_id: ([^\n]+).*?cells: row (\d+) column 5",
+                request.user_payload,
+                flags=re.DOTALL,
+            )
+            assert len(pairs) == 2
+            return BlockWriterResponse(
+                results=[
+                    {
+                        "issue_id": pairs[0][0],
+                        "proposal": {
+                            "derivation": "",
+                            "edits": [
+                                {
+                                    "row": int(pairs[0][1]),
+                                    "column": "answer",
+                                    "before": "",
+                                    "after": "",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "issue_id": pairs[1][0],
+                        "proposal": {
+                            "derivation": "the graded scaffold answer is 60",
+                            "edits": [
+                                {
+                                    "row": int(pairs[1][1]),
+                                    "column": "answer",
+                                    "before": "",
+                                    "after": "60",
+                                }
+                            ],
+                        },
+                    },
+                ]
+            )
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse()
+        raise AssertionError(f"unexpected role before batch assertion: {request.role}")
+
+    client.default = compliant(reply)
+    runner = CurationCouncil(
+        db=db,
+        settings=settings(repair_batch_size=8),
+        client=client,
+        job_id="partial-batch",
+        copy=copy,
+    )
+    while "block_writer_batch" not in {
+        event["kind"] for event in list_events(db, "partial-batch")
+    }:
+        runner.step()
+
+    issues = list_issues(db, "partial-batch")
+    assert {issue.state for issue in issues} == {
+        IssueState.PATCH_REJECTED,
+        IssueState.PATCH_PROPOSED,
+    }
+    attempts = list_attempts(db, "partial-batch")
+    assert len(attempts) == 2
+    assert {attempt.outcome.value if attempt.outcome else None for attempt in attempts} == {
+        "patch_rejected",
+        None,
+    }
+
+
 def test_same_row_sibling_findings_are_repaired_sequentially_then_superseded(
     make_workbook, tmp_path
 ):
@@ -680,21 +774,16 @@ def test_a_semantic_duplicate_is_reviewed_before_another_writer_call(setup):
     assert client.call_count(AgentRole.WRITER) == 1
 
 
-def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(setup):
-    """A false semantic claim is dismissed only by an agent that examined it and said why.
+def test_a_silent_second_audit_routes_the_claim_to_a_curator_without_adjudication(setup):
+    """One claim plus one absence is ambiguity, not a useful adjudication pair.
 
     The adversarial run let an auditor call an equivalent answer wrong, then asked the
     reviewer only whether the replacement looked plausible. By then the review was
     anchored on the proposed change. Attempt zero is the unbiased claim check.
 
-    Here the blind audit reports nothing about the cell *and* the adjudicator states the
-    recomputation showing the title is already correct. That second half is what makes
-    this a refutation; without it the claim would be `UNCONFIRMED`, which the next test
-    pins down.
-
-    The reasoning is not checked and cannot be -- a wrong adjudication refutes a real
-    defect just as effectively. What this asserts is that *something examined the claim*,
-    which is exactly the property silence did not have.
+    The blind audit reports nothing about the cell. Buying an adjudication after that
+    would show a third agent one accusation and one absence, inviting an anchored guess.
+    The claim is left unconfirmed for a curator and no Writer may touch the clean cell.
     """
     db, _ = setup
     false_claim = AuditorResponse(
@@ -711,13 +800,13 @@ def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(s
 
     result = council(setup, client).run()
 
-    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
     semantic = next(
         issue
         for issue in list_issues(db, "job-1")
         if issue.rule_codes == ("AUDITOR_FINDING",)
     )
-    assert semantic.state is IssueState.REFUTED
+    assert semantic.state is IssueState.UNCONFIRMED
     # The one Writer call belongs to the real deterministic missing-answer issue.
     assert client.call_count(AgentRole.WRITER) == 1
     precheck = next(
@@ -732,11 +821,7 @@ def test_a_model_only_claim_is_refuted_before_the_writer_can_edit_a_clean_cell(s
     assert independent_payloads
     assert all("already-correct title" not in payload for payload in independent_payloads)
     assert all("different but equivalent" not in payload for payload in independent_payloads)
-    # The adjudicator, by contrast, is shown the claim on purpose. It is the one agent
-    # that cannot do its job blind, and its evidence is what closed the issue.
-    adjudications = client.payloads_for(AgentRole.ADJUDICATOR)
-    assert len(adjudications) == 1
-    assert "already-correct title" in adjudications[0]
+    assert client.call_count(AgentRole.ADJUDICATOR) == 0
 
 
 def test_silence_from_the_second_audit_leaves_a_claim_unconfirmed(setup):
@@ -784,6 +869,7 @@ def test_silence_from_the_second_audit_leaves_a_claim_unconfirmed(setup):
     # Nothing was edited for it, so it must not be presented as a repair that failed.
     assert semantic.attempts_used == 0
     assert client.call_count(AgentRole.WRITER) == 1
+    assert client.call_count(AgentRole.ADJUDICATOR) == 0
 
 
 def test_an_adjudicator_may_widen_a_claim_to_the_cell_that_must_change(setup):
@@ -867,6 +953,44 @@ def test_an_adjudicator_may_widen_a_claim_to_the_cell_that_must_change(setup):
     assert semantic.is_structural
 
 
+def _related_then_clean_client(claim, *, related_problem, adjudication):
+    """One related blind finding, then clean ordinary sweeps."""
+    client = ScriptedLLMClient()
+    independent_calls = 0
+
+    def reply(request):
+        nonlocal independent_calls
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return claim
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            independent_calls += 1
+            if independent_calls == 1:
+                return IndependentReviewResponse(
+                    block_is_sound=False,
+                    findings=[
+                        IndependentFinding(
+                            cells=[{"row": 2, "column": "body_text"}],
+                            problem=related_problem,
+                            category="mathematics",
+                        )
+                    ],
+                )
+            return IndependentReviewResponse(block_is_sound=True)
+        if request.role is AgentRole.ADJUDICATOR:
+            return adjudication
+        if request.role is AgentRole.WRITER:
+            return WriterResponse(
+                derivation="the scaffold answer is 30",
+                edits=[{"row": 4, "column": "answer", "before": "", "after": "30"}],
+            )
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return FinalVerificationResponse(block_is_sound=True)
+        return ReviewerResponse(decision="accept")
+
+    client.default = compliant(reply)
+    return client
+
+
 def test_adjudication_does_not_read_an_agent_quoting_itself_as_a_leak(setup):
     """The adjudicator is shown two published findings, and both have private twins.
 
@@ -892,13 +1016,12 @@ def test_adjudication_does_not_read_an_agent_quoting_itself_as_a_leak(setup):
             )
         ],
     )
-    client = quiet_client(
-        **{
-            AgentRole.INITIAL_AUDITOR: claim,
-            AgentRole.ADJUDICATOR: AdjudicatorResponse(
-                verdict="undecided", evidence="cannot establish either reading"
-            ),
-        }
+    client = _related_then_clean_client(
+        claim,
+        related_problem=shared,
+        adjudication=AdjudicatorResponse(
+            verdict="undecided", evidence="cannot establish either reading"
+        ),
     )
 
     result = council(setup, client).run()
@@ -914,14 +1037,13 @@ def test_adjudication_does_not_read_an_agent_quoting_itself_as_a_leak(setup):
 # --------------------------------------------------------------------------------------
 
 
-def test_the_final_verifier_runs_after_repairs_and_is_told_nothing(setup):
-    """The last look, and the least informed one.
+def test_the_final_verifier_runs_after_repairs_with_only_the_public_net_diff(setup):
+    """The last look is focused on changed content without inheriting conclusions.
 
     It runs after the repair phases, so the block it sees is the block being handed over --
-    every earlier scan read a file that has since been edited. And it is shown the block,
-    the conventions and the rules only: no deterministic finding, no issue, no record of
-    what was repaired. An agent told where somebody already looked stops looking anywhere
-    else, and the rows nobody flagged are the population that matters here.
+    every earlier scan read a file that has since been edited. It sees the current block,
+    conventions, rules, and the literal source-to-current values -- but no issue text,
+    deterministic finding, private reasoning, or reviewer verdict.
     """
     db, _ = setup
     client = quiet_client()
@@ -932,6 +1054,7 @@ def test_the_final_verifier_runs_after_repairs_and_is_told_nothing(setup):
     payload = payloads[0]
     # The block is there, with the repair the Writer made visible in it.
     assert "angles1" in payload
+    assert "row 4 answer: '' -> '30'" in payload
     # None of the history is.
     assert "SCAFFOLD_MISSING_ANSWER" not in payload
     assert "MISSING_ANSWER" not in payload
@@ -994,7 +1117,7 @@ def test_a_final_verification_finding_cannot_edit_without_corroboration(setup):
     # the verifier's say-so.
     assert verifier_issue.state is IssueState.UNCONFIRMED
     assert verifier_issue.attempts_used == 0
-    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+    assert client.call_count(AgentRole.ADJUDICATOR) == 0
     assert result.state is JobState.NEEDS_HUMAN_ATTENTION
 
 
@@ -1172,12 +1295,49 @@ def test_a_contradictory_audit_record_reaches_the_report(setup):
     assert "Self-contradicting coverage records: 1" in render_markdown(reports)
 
 
-def test_one_verifier_call_per_unchanged_block(setup):
-    """The cost promise. A sound, complete, self-consistent answer is accepted at once."""
+def test_one_verifier_call_per_changed_block(setup):
+    """The cost promise for a block whose handed-back bytes differ from its upload."""
     client = quiet_client()
     result = council(setup, client).run()
 
     assert client.call_count(AgentRole.FINAL_VERIFIER) == 1
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+
+
+def test_an_untouched_block_is_not_paid_for_twice(tmp_path, make_workbook):
+    """Its independent sweep already describes the same final content.
+
+    With no accepted change there is no newer workbook version for a final verifier to
+    inspect. Deterministic validation still runs over the full file.
+    """
+    source = make_workbook(
+        [
+            problem("clean1", title="Evaluate", oer_src="s", license="CC"),
+            step("clean1", answer="1", answer_type="numeric"),
+        ]
+    )
+    db = Database(tmp_path / "clean.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "clean-job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="clean-job",
+            source_filename=source.name,
+            source_sha256=copy.source_sha256,
+        ),
+    )
+    client = quiet_client()
+    runner = CurationCouncil(
+        db=db,
+        settings=settings(),
+        client=client,
+        job_id="clean-job",
+        copy=copy,
+    )
+
+    result = runner.run()
+
+    assert client.call_count(AgentRole.FINAL_VERIFIER) == 0
     assert result.state is JobState.SUCCEEDED, result.failure_reason
 
 
@@ -1673,7 +1833,7 @@ def test_a_partly_repaired_claim_is_not_superseded_when_the_audit_is_silent(setu
     semantic = _semantic_issue(db)
     assert semantic.state is not IssueState.SUPERSEDED
     assert semantic.state is IssueState.UNCONFIRMED
-    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+    assert client.call_count(AgentRole.ADJUDICATOR) == 0
 
 
 def test_a_related_finding_is_never_bypassed_by_a_sibling_repair(setup):
@@ -1779,7 +1939,8 @@ def test_an_audit_that_cannot_assert_soundness_never_supersedes(setup):
         if issue.source is IssueSource.INDEPENDENT_REVIEWER
     )
     assert semantic.state is not IssueState.SUPERSEDED
-    assert client.call_count(AgentRole.ADJUDICATOR) == 1
+    assert semantic.state is IssueState.UNCONFIRMED
+    assert client.call_count(AgentRole.ADJUDICATOR) == 0
 
 
 def test_an_adjudication_is_read_back_rather_than_paid_for_twice(setup):
@@ -1800,13 +1961,12 @@ def test_an_adjudication_is_read_back_rather_than_paid_for_twice(setup):
             )
         ]
     )
-    client = quiet_client(
-        **{
-            AgentRole.INITIAL_AUDITOR: claim,
-            AgentRole.ADJUDICATOR: AdjudicatorResponse(
-                verdict="undecided", evidence="cannot establish either reading"
-            ),
-        }
+    client = _related_then_clean_client(
+        claim,
+        related_problem="The body asks for a different operation on the same row.",
+        adjudication=AdjudicatorResponse(
+            verdict="undecided", evidence="cannot establish either reading"
+        ),
     )
     council(setup, client).run()
 

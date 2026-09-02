@@ -1,7 +1,7 @@
 # LLM data contract
 
 This document is the auditable answer to: **what exactly leaves the service for Claude,
-when, and why?** It describes pipeline contract version 12.
+when, and why?** It describes pipeline contract version 13.
 
 ## Transport
 
@@ -151,21 +151,25 @@ leaves the service to make this happen: it is a field on the same response.
 
 ### Final Semantic Verifier
 
-Runs after every repair and before deterministic validation. It receives the problem block
-as the workbook now stands, the derived conventions, and the curator's policy rules — and
-nothing else. No deterministic findings, no issue ledger, no repair history, no earlier
-finding, no answer key, and no agent's private reasoning.
+Runs after every repair and before deterministic validation, but only for a block whose
+net content differs from the uploaded workbook. An untouched block already has a complete
+Independent Reviewer pass over the same bytes. It receives the problem block as it now
+stands, derived conventions, curator policy, and the literal source-to-current cell diff.
+It receives no deterministic findings, issue descriptions, verdicts, or agent reasoning.
 
 It returns findings with exact cells and the same mandatory per-graded-row coverage
-records. It never edits: its findings go through claim-blind corroboration and adjudication
-like any other model claim. A block's verification is discarded whenever a repair is
-applied to it, and the block is verified again.
+records. It never edits: its findings go through claim-blind corroboration like any other
+model claim. A block's verification is discarded whenever a repair is applied to it, and
+the block is verified again.
 
 ### Adjudicator
 
-The Adjudicator is the only agent in this system that is shown another agent's conclusion.
-It receives both published findings, the current block, derived conventions, deterministic
-findings and curator policy. It does **not** receive any agent's private reasoning: its
+The Adjudicator is used only when two claim-blind audits report related defects on the same
+row and disagree about the exact repair target. Silence is not a second conclusion: a
+claim the blind audit does not reproduce goes directly to a curator as `UNCONFIRMED`, with
+no adjudication call. When used, the Adjudicator receives both published findings, the
+current block, derived conventions, deterministic findings and curator policy. It does
+**not** receive any agent's private reasoning: its
 context type cannot name a private model, checked at import, and the taint registry checks
 the rendered bytes on top of that.
 

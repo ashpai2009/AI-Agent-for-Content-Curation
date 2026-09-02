@@ -412,7 +412,11 @@ CLI_ADAPTER_VERSION = 5
 #: share one coordinated Writer call and one whole-block reviewer call while retaining
 #: separate attempts, patches and verdicts. The setting is pinned because switching the
 #: call topology halfway through a job changes both context and recovery semantics.
-PIPELINE_CONTRACT_VERSION = 12
+#: 13 (2026-09-02): final semantic verification is required only for blocks whose net
+#: content differs from the upload, and it is shown that public net diff; a claim-blind
+#: audit that is silent about a disputed row now routes the claim directly to a curator,
+#: reserving adjudication for two audits that both found a related defect on the row.
+PIPELINE_CONTRACT_VERSION = 13
 
 
 class BudgetExhausted(Exception):
@@ -1398,13 +1402,16 @@ class CurationCouncil:
         return StepOutcome(True, "independent review complete", JobState.FINAL_SEMANTIC)
 
     def _final_semantic(self) -> StepOutcome:
-        """Verify the corrected workbook, repair what that finds, and verify it again.
+        """Verify changed blocks, repair what that finds, and verify them again.
 
         The phase is a queue predicate like every other, but its predicate is the
         interesting part: a block is pending when it carries no `final_semantic` marker,
         and **the marker is deleted by any accepted repair to that block**. So a repair
         this phase asks for puts its own block back on the queue, and the phase does not
-        end until every block has been verified against the file as it finally stands.
+        end until every changed block has been verified against the file as it finally
+        stands. Untouched blocks already received a full independent sweep and have no
+        later mutation to invalidate it; paying for the same semantic pass again adds no
+        new version of the content to inspect.
 
         Bounded by `final_semantic_rounds` per block. Reaching the bound does *not* mark
         the block verified: it stops asking, and the block stays unmarked, which denies
@@ -1413,11 +1420,13 @@ class CurationCouncil:
         bound cannot quietly become a pass.
         """
         parsed = self.current_workbook()
+        targets = self._final_semantic_targets()
         done = blocks_done(self.db, self.job_id, FINAL_SEMANTIC_PHASE)
         pending = [
             block
             for block in parsed.blocks
-            if block.block_id not in done
+            if block.block_id in targets
+            and block.block_id not in done
             and count_block_events(
                 self.db, self.job_id, "final_verification", block.block_id
             )
@@ -1451,10 +1460,16 @@ class CurationCouncil:
         """
         self._spend()
         try:
+            changes = tuple(
+                change
+                for change in net_changes(list_changes(self.db, self.job_id)).values()
+                if change.before != change.after and change.block_id == block.block_id
+            )
             result = final_verifier.verify_block(
                 self.client,
                 block=block,
                 conventions=parsed.conventions,
+                changes=changes,
                 curator_rules=self.curator_rules,
                 job_id=self.job_id,
                 taint=self.taint,
@@ -1525,6 +1540,20 @@ class CurationCouncil:
             True,
             f"{block.block_id} verified: {opened} issue(s) opened",
             JobState.FINAL_SEMANTIC,
+        )
+
+    def _final_semantic_targets(self) -> frozenset[str]:
+        """Blocks whose handed-back content differs from the uploaded workbook.
+
+        The append-only ledger may contain a repair followed by a rollback. Collapsing it
+        first means a block restored byte-for-byte to its submitted content is not charged
+        for a final model pass. Any surviving edit keeps its block in the set, and every
+        later accepted edit clears that block's marker at the mutation site.
+        """
+        return frozenset(
+            change.block_id
+            for change in net_changes(list_changes(self.db, self.job_id)).values()
+            if change.block_id and change.before != change.after
         )
 
     def _repair(self, state: JobState) -> StepOutcome:
@@ -1794,7 +1823,7 @@ class CurationCouncil:
         # coverage of a row has not established that the row is correct, and saying
         # `SUCCEEDED` over it is the same false reassurance as the other three guard.
         unverified = count_events(self.db, self.job_id, "rows_never_verified")
-        # **A fifth condition, and the only one about the file as handed over.** Every
+        # **A fifth condition, and the only one about changed content as handed over.**
         # other check -- including the coverage one above -- is satisfied by work done to
         # a workbook that has since been edited. A block carries this marker only when the
         # Final Semantic Verifier solved every graded row of it *and* nothing has been
@@ -1802,11 +1831,7 @@ class CurationCouncil:
         # missing from this set is one whose last independent check predates its last
         # change, and there is no honest way to call that finished.
         verified = blocks_done(self.db, self.job_id, FINAL_SEMANTIC_PHASE)
-        unverified_blocks = [
-            block.block_id
-            for block in self.current_workbook().blocks
-            if block.block_id not in verified
-        ]
+        unverified_blocks = sorted(self._final_semantic_targets() - verified)
         succeeded = (
             gate.passed
             and ledger.all_resolved
@@ -2071,6 +2096,29 @@ class CurationCouncil:
         )
 
         patch = result.patch
+        if result.rejection is not None:
+            settle_attempt(
+                self.db,
+                attempt.model_copy(
+                    update={
+                        "outcome": AttemptOutcome.PATCH_REJECTED,
+                        "rejection": result.rejection,
+                        "finished_at": datetime.now(timezone.utc),
+                    }
+                ),
+            )
+            next_state = (
+                IssueState.PATCH_REJECTED
+                if self.machine.can_attempt(issue)
+                else IssueState.NEEDS_HUMAN_REVIEW
+            )
+            save_issue(self.db, advance_issue(issue, next_state))
+            return StepOutcome(
+                True,
+                f"patch rejected: {result.rejection.code.value}",
+                state,
+            )
+        assert patch is not None
         if patch.needs_human_review:
             settle_attempt(
                 self.db,
@@ -2216,7 +2264,7 @@ class CurationCouncil:
                 return self._provider_failed(error)
             return StepOutcome(True, f"coordinated Writer call failed: {error}", state)
 
-        patches = [result.patch for result in results]
+        patches = [result.patch for result in results if result.patch is not None]
         touched = [(edit.row, edit.column) for patch in patches for edit in patch.edits]
         overlapping = {cell for cell in touched if touched.count(cell) > 1}
         proposed = 0
@@ -2229,6 +2277,25 @@ class CurationCouncil:
                 issue_id=issue.issue_id,
             )
             patch = result.patch
+            if result.rejection is not None:
+                settle_attempt(
+                    self.db,
+                    attempt.model_copy(
+                        update={
+                            "outcome": AttemptOutcome.PATCH_REJECTED,
+                            "rejection": result.rejection,
+                            "finished_at": datetime.now(timezone.utc),
+                        }
+                    ),
+                )
+                next_state = (
+                    IssueState.PATCH_REJECTED
+                    if self.machine.can_attempt(issue)
+                    else IssueState.NEEDS_HUMAN_REVIEW
+                )
+                save_issue(self.db, advance_issue(issue, next_state))
+                continue
+            assert patch is not None
             if patch.needs_human_review:
                 settle_attempt(
                     self.db,
@@ -2818,8 +2885,10 @@ class CurationCouncil:
         Attempt zero is a durable namespace for both checks and cannot be mistaken for a
         verdict on Writer attempt one after a crash.
 
-        **Second**, when that audit neither reproduced the claim nor contradicted it, an
-        adjudicator that is shown both readings and decides between them.
+        **Second**, only when the audit found a related defect on the same row, an
+        adjudicator is shown both readings and resolves the repair target. If the audit
+        is silent, there is no second reading to adjudicate: the claim goes directly to a
+        curator as `UNCONFIRMED` instead of buying another model opinion about an absence.
 
         The second check is the correction. This method used to read "the blind audit did
         not report the same cells" as "the claim is refuted", and closed the issue. Those
@@ -2844,11 +2913,7 @@ class CurationCouncil:
             save_issue(self.db, advance_issue(issue, IssueState.AWAITING_PATCH))
             return StepOutcome(True, f"{issue.issue_id} corroborated", state)
 
-        if verdict.decision is ReviewDecision.HUMAN_REVIEW:
-            save_issue(self.db, self.machine.exhausted(issue))
-            return StepOutcome(True, f"{issue.issue_id} sent to a person", state)
-
-        # Unsettled. Before spending an adjudication call, the one case a model cannot
+        # Before either escalation or adjudication, the one case a model cannot
         # improve on: a sibling repair has already rewritten **every** cell this issue
         # names, and a fresh audit of the result examined the block and called it sound.
         #
@@ -2887,6 +2952,17 @@ class CurationCouncil:
             return StepOutcome(
                 True, f"{issue.issue_id} resolved by another repair", state
             )
+
+        if verdict.decision is ReviewDecision.HUMAN_REVIEW:
+            save_issue(self.db, advance_issue(issue, IssueState.UNCONFIRMED))
+            record_event(
+                self.db,
+                self.job_id,
+                "issue_unconfirmed",
+                f"{issue.issue_id}: the claim-blind audit did not produce a related "
+                "finding, so the unresolved claim was sent directly to a curator",
+            )
+            return StepOutcome(True, f"{issue.issue_id} sent to a curator", state)
 
         if cached is None:
             # The blind audit was this step's one model call. The issue stays OPEN, the
@@ -3043,11 +3119,11 @@ class CurationCouncil:
         prompt that would drift from them.  It costs the same one physical call as the
         former issue-framed pre-check, but removes the accusation from the payload.
 
-        It **classifies and does not conclude**. Exact agreement is corroboration; nothing
-        else here is a refutation, because a from-scratch audit that did not mention a
-        cell has not examined the claim about it. Whatever it did report is written into
-        the verdict's feedback, since that text is what the adjudicator is shown next and
-        re-deriving it would mean paying for this call twice.
+        Exact agreement is corroboration. A related finding is persisted for one
+        adjudication call because there are two concrete readings to reconcile. Silence
+        is neither corroboration nor refutation and goes directly to a curator: an
+        adjudicator shown one claim and one absence would only be a second, anchored
+        attempt to infer what the blind audit did not establish.
         """
         current = self.current_workbook()
         block = current.block_by_id(issue.block_id) if issue.block_id else None
@@ -3058,9 +3134,8 @@ class CurationCouncil:
         # Two values, not one, because "did not say it was unsound" is not "said it was
         # sound". Only the independent sweep has a field for this; `audit_block` reports
         # defects and has no way to assert their absence, so a blind audit by the auditor
-        # can never clear a block on its own. That asymmetry costs one adjudication call
-        # on an Independent-Reviewer-sourced claim whose cells a sibling already repaired,
-        # and it buys never inferring an assertion from a schema that cannot make one.
+        # can never clear a block on its own. The claim goes to a curator rather than
+        # inferring an assertion from a schema that cannot make one.
         sound_stated = False
         sound = False
         inconclusive = ""
@@ -3135,7 +3210,7 @@ class CurationCouncil:
             decision = ReviewDecision.REVISE
             event = "blind_claim_corroborated"
             rule_codes = (match.code,)
-        else:
+        elif outcome is Corroboration.RELATED:
             decision = ReviewDecision.UNRESOLVED
             event = "blind_claim_unresolved"
             rule_codes = ()
@@ -3149,13 +3224,13 @@ class CurationCouncil:
                 for finding in matches
             ]
             feedback = render_claims(reports)
-            if outcome is Corroboration.SILENT and sound_stated and not sound:
-                # It called the block unsound and named nothing. That is not a refutation
-                # of anything; it is one more reason the question needs settling.
-                feedback = (
-                    f"{feedback}, but reported the block as not sound without naming a "
-                    "defect."
-                )
+        else:
+            decision = ReviewDecision.HUMAN_REVIEW
+            event = "blind_claim_silent"
+            rule_codes = ()
+            feedback = "The claim-blind audit reported no related defect on these rows."
+            if sound_stated and not sound:
+                feedback += " It also called the block unsound without naming a defect."
 
         verdict = ReviewVerdict(
             verdict_id=uuid4().hex,
