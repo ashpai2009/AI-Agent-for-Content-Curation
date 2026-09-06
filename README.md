@@ -183,7 +183,7 @@ src/oatutor_council/
   uploads.py       magic bytes, archive inspection, path containment
   config.py        every setting, read from the environment in one place
   workbook/        reader · writer · diff · styles
-  validation/      rules/ (61 rules) · mathematics · patch_gate · final_gate
+  validation/      rules/ (63 rules) · mathematics · patch_gate · final_gate
   agents/          initial_auditor · writer · known_issue_reviewer ·
                    independent_reviewer · adjudicator · final_verifier ·
                    coverage · isolation · rendering · schemas · batching
@@ -413,6 +413,17 @@ valid; missing, duplicated and unknown ids all send the block back to the queue.
 semantic finding names exact `(row, column)` target pairs—never separate arrays whose
 Cartesian product can authorize unintended cells—and a finding with any target outside
 its assigned block is discarded and that block is requeued rather than credited.
+
+The same bounded envelope is reused for claim-blind corroboration: one Independent
+Reviewer call may examine one unresolved model claim in each of several unrelated blocks.
+The accusations are still absent from the payload. At most one claim per block is
+prefetched, and a block with another live issue stays sequential so an accepted edit can
+never make a cached blind verdict describe stale bytes.
+
+Final semantic verification is batched by the same count and rendered-size limits. Every
+changed block retains its own coverage, findings, round counter, and completion marker.
+An omitted, duplicated, or cross-block result consumes that block's bounded round and is
+requeued; it is never treated as a clean certification.
 
 ### Block repair and review batching
 

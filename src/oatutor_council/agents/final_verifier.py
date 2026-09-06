@@ -31,7 +31,7 @@ from ..llm.base import (
     LLMRequest,
     call_structured_recorded,
 )
-from ..llm.context import ContextBundle
+from ..llm.context import ContextBundle, DataSection
 from ..llm.prompts import system_prompt
 from ..models import (
     ChangeRecord,
@@ -41,7 +41,12 @@ from ..models import (
     ValidationFinding,
     WorkbookConventions,
 )
-from .batching import FindingAttributionError
+from .batching import (
+    FindingAttributionError,
+    attribute,
+    cells_for_block,
+    make_items,
+)
 from .coverage import coverage_gaps
 from .isolation import TaintRegistry
 from .rendering import (
@@ -50,7 +55,12 @@ from .rendering import (
     render_candidate_edits,
     render_conventions,
 )
-from .schemas import FinalVerificationResponse, RowCoverage, column_key
+from .schemas import (
+    BatchedFinalVerificationResponse,
+    FinalVerificationResponse,
+    RowCoverage,
+    column_key,
+)
 from ..models import FIXED_COLUMNS
 from dataclasses import dataclass
 
@@ -71,6 +81,20 @@ Report a finding only for a defect that is still present now. Name every exact c
 must change. Most blocks at this stage are correct: equivalent expressions are not defects,
 and do not ask for simplification, rewording, decimal conversion or choice reordering when
 the content is already right.
+"""
+
+BATCH_INSTRUCTIONS = """\
+The changed problem blocks below are about to be handed back to a curator. Check every
+block after its last accepted edit.
+
+Each block is in a section whose label carries a `batch_item` id. Return exactly one
+result per block and copy that id into `batch_item_id`. A sound block still needs its own
+result with `block_is_sound` true, an empty findings list, and coverage for every graded
+row. An omitted or duplicated result certifies nothing and will not be marked complete.
+
+For every block, solve every `step` and `scaffold` row yourself. Treat its literal diff as
+a checklist rather than an answer key. Report only defects still present, and name only
+cells whose rows belong to that result's block.
 """
 
 
@@ -167,6 +191,126 @@ def verify_block(
         coverage_gaps=coverage_gaps(block, response.coverage),
         call_id=call_id,
     )
+
+
+def verify_blocks(
+    client: LLMClient,
+    *,
+    blocks: Sequence[ProblemBlock],
+    conventions: WorkbookConventions,
+    changes_for=None,
+    curator_rules: Sequence[str] = (),
+    job_id: str = "",
+    seed: int | None = None,
+    taint: TaintRegistry | None = None,
+    prompt_version: int | None = None,
+) -> tuple[tuple[VerificationResult, ...], tuple[ProblemBlock, ...]]:
+    """Verify several changed blocks in one physical call.
+
+    A one-block batch delegates to :func:`verify_block`, preserving the diagnostic path.
+    Missing, duplicated, unknown, or cross-block results are requeued and never marked.
+    """
+    blocks = list(blocks)
+    if not blocks:
+        return (), ()
+    if len(blocks) == 1:
+        try:
+            result = verify_block(
+                client,
+                block=blocks[0],
+                conventions=conventions,
+                changes=changes_for(blocks[0]) if changes_for else (),
+                curator_rules=curator_rules,
+                job_id=job_id,
+                seed=seed,
+                taint=taint,
+                prompt_version=prompt_version,
+            )
+        except FindingAttributionError:
+            return (), (blocks[0],)
+        return (result,), ()
+
+    items = make_items(blocks)
+    sections = [
+        DataSection("Conventions this workbook follows", render_conventions(conventions))
+    ]
+    for item in items:
+        sections.append(
+            DataSection(
+                item.label,
+                "\n".join(
+                    [
+                        f"problem name: {item.block.problem_name}",
+                        render_block(item.block),
+                        "",
+                        "Literal source-to-current changes for this block:",
+                        render_candidate_edits(
+                            changes_for(item.block) if changes_for else ()
+                        ),
+                    ]
+                ),
+            )
+        )
+    if curator_rules:
+        sections.append(
+            DataSection(
+                "Curation rules the curator supplied",
+                "\n".join(f"- {rule}" for rule in curator_rules),
+            )
+        )
+
+    payload = ContextBundle.build(BATCH_INSTRUCTIONS, sections).render()
+    if taint is not None:
+        taint.assert_clean(
+            payload,
+            context=AgentRole.FINAL_VERIFIER.value,
+            public=tuple(section.content for section in sections),
+        )
+
+    response, call_id = call_structured_recorded(
+        client,
+        LLMRequest(
+            role=AgentRole.FINAL_VERIFIER,
+            system_prompt=system_prompt(AgentRole.FINAL_VERIFIER, prompt_version),
+            user_payload=payload,
+            schema=BatchedFinalVerificationResponse.model_json_schema(),
+            seed=seed,
+            job_id=job_id,
+        ),
+        BatchedFinalVerificationResponse,
+    )
+    attribution = attribute(items, response.results)
+    results: list[VerificationResult] = []
+    requeue = [item.block for item in attribution.requeue]
+    for item in items:
+        raw = attribution.resolved.get(item.item_id)
+        if raw is None:
+            continue
+        findings: list[ValidationFinding] = []
+        invalid = False
+        for finding in raw.findings:
+            cells = cells_for_block(finding.cells, item.block)
+            if cells is None:
+                invalid = True
+                break
+            findings.append(
+                _to_finding(finding.model_copy(update={"cells": cells}), item.block)
+            )
+        if invalid:
+            requeue.append(item.block)
+            continue
+        results.append(
+            VerificationResult(
+                block_id=item.block.block_id,
+                findings=tuple(findings),
+                block_is_sound=raw.block_is_sound and not findings,
+                coverage=tuple(raw.coverage),
+                coverage_gaps=coverage_gaps(item.block, raw.coverage),
+                call_id=call_id,
+            )
+        )
+    unique_requeue = {block.block_id: block for block in requeue}
+    return tuple(results), tuple(unique_requeue.values())
 
 
 def _to_finding(item, block: ProblemBlock) -> ValidationFinding:

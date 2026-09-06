@@ -7,12 +7,13 @@ finds something new, which is the failure mode a naive implementation has.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 
 import pytest
 
-from conftest import compliant, full_coverage, hint, problem, scaffold, step
+from conftest import cells, compliant, full_coverage, hint, problem, scaffold, step
 from oatutor_council.agents.schemas import (
     AdjudicatorResponse,
     AuditorFinding,
@@ -38,6 +39,7 @@ from oatutor_council.llm.base import (
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
     ColumnKey,
+    ChangeRecord,
     CurationJob,
     FailureReason,
     FindingScope,
@@ -65,6 +67,8 @@ from oatutor_council.persistence import (
     list_issues,
     list_verdicts,
     load_ledger,
+    mark_block_done,
+    record_changes,
     save_issue,
 )
 from oatutor_council.reporting.ledger import issue_from_finding
@@ -2382,6 +2386,77 @@ def test_exact_cleanup_uses_no_writer_or_reviewer_calls(make_workbook, tmp_path)
     assert len([e for e in list_events(db, "job-1") if e["kind"] == "deterministic_repair"]) == 3
 
 
+def test_exact_step_title_body_duplicate_is_cleared_without_model_repair_calls(
+    make_workbook, tmp_path
+):
+    source = make_workbook(
+        [
+            problem("shift1", title="A matrix question", oer_src="source", license="CC"),
+            cells(
+                problem_name="shift1",
+                row_type="step",
+                title="Find the determinant.",
+                body_text="Find the determinant.",
+                answer="-2",
+                answer_type="numeric",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "duplicate-step-text.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "duplicate-step-text")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client()
+    result = council((db, copy), client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    repaired = read_workbook(copy.path).blocks[0].rows[1]
+    assert repaired.get(ColumnKey.TITLE) == "Find the determinant."
+    assert repaired.get(ColumnKey.BODY_TEXT) == ""
+    assert client.call_count(AgentRole.WRITER) == 0
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+
+
+def test_answer_type_root_fix_preserves_valid_mc_choices_without_model_calls(
+    make_workbook, tmp_path
+):
+    source = make_workbook(
+        [
+            problem("mc1", title="Choose the formula", oer_src="source", license="CC"),
+            step(
+                "mc1",
+                answer="a_n=2*5**(n-1)",
+                answer_type="numeric",
+                mc_choices="a_n=2*5**(n-1)|a_n=5*2**(n-1)|a_n=2+5*n",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "mc-root-fix.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "mc-root-fix")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client()
+
+    result = council((db, copy), client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    repaired = read_workbook(copy.path).blocks[0].rows[1]
+    assert repaired.get(ColumnKey.ANSWER_TYPE) == "mc"
+    assert repaired.get(ColumnKey.MC_CHOICES) == (
+        "a_n=2*5**(n-1)|a_n=5*2**(n-1)|a_n=2+5*n"
+    )
+    assert client.call_count(AgentRole.WRITER) == 0
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+
+
 def test_known_ascii_whitespace_and_namespace_repairs_use_no_model_calls(
     make_workbook, tmp_path
 ):
@@ -2530,6 +2605,114 @@ def test_final_reconciliation_removes_a_stale_human_alert(setup):
         event["kind"] == "stale_escalation_reconciled"
         for event in list_events(db, "job-1")
     )
+
+
+def test_final_reconciliation_closes_a_semantic_claim_a_sibling_exactly_fixed(setup):
+    from openpyxl import load_workbook
+    from oatutor_council.council import FINAL_SEMANTIC_PHASE
+
+    db, copy = setup
+    workbook = load_workbook(copy.path)
+    workbook.active["E3"] = "1/6"
+    workbook.save(copy.path)
+    workbook.close()
+    parsed = read_workbook(copy.path)
+    block = parsed.blocks[0]
+    finding = ValidationFinding(
+        code="AUDITOR_FINDING",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        message="the answer should be 1/6",
+        row=3,
+        column=5,
+        column_key=ColumnKey.ANSWER,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+        detail={"category": "mathematics", "expected": "1/6"},
+    )
+    stale = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    ).model_copy(update={"state": IssueState.UNCONFIRMED})
+    insert_issue(db, stale)
+    record_changes(
+        db,
+        "job-1",
+        [
+            ChangeRecord(
+                change_id="sibling-change",
+                issue_id="a-different-issue",
+                patch_id="sibling-patch",
+                block_id=block.block_id,
+                row=3,
+                column=5,
+                column_key=ColumnKey.ANSWER,
+                before="pi/6",
+                after="1/6",
+                applied_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    mark_block_done(db, "job-1", block.block_id, FINAL_SEMANTIC_PHASE)
+
+    council(setup, quiet_client())._reconcile_stale_escalations(parsed)
+
+    reloaded = next(issue for issue in list_issues(db, "job-1") if issue.issue_id == stale.issue_id)
+    assert reloaded.state is IssueState.SUPERSEDED
+
+
+def test_semantic_reconciliation_preserves_requested_form_disagreements(setup):
+    from openpyxl import load_workbook
+    from oatutor_council.council import FINAL_SEMANTIC_PHASE
+
+    db, copy = setup
+    workbook = load_workbook(copy.path)
+    workbook.active["E3"] = "1/25"
+    workbook.save(copy.path)
+    workbook.close()
+    parsed = read_workbook(copy.path)
+    block = parsed.blocks[0]
+    finding = ValidationFinding(
+        code="AUDITOR_FINDING",
+        severity=Severity.ERROR,
+        scope=FindingScope.CELL,
+        message="the prompt requests a nearest-hundredth decimal",
+        row=3,
+        column=5,
+        column_key=ColumnKey.ANSWER,
+        block_id=block.block_id,
+        problem_name=block.problem_name,
+        detail={"category": "mathematics", "expected": "0.04"},
+    )
+    disputed = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    ).model_copy(update={"state": IssueState.UNCONFIRMED})
+    insert_issue(db, disputed)
+    record_changes(
+        db,
+        "job-1",
+        [
+            ChangeRecord(
+                change_id="sibling-change",
+                issue_id="a-different-issue",
+                patch_id="sibling-patch",
+                block_id=block.block_id,
+                row=3,
+                column=5,
+                column_key=ColumnKey.ANSWER,
+                before="pi/6",
+                after="1/25",
+                applied_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    mark_block_done(db, "job-1", block.block_id, FINAL_SEMANTIC_PHASE)
+
+    council(setup, quiet_client())._reconcile_stale_escalations(parsed)
+
+    reloaded = next(
+        issue for issue in list_issues(db, "job-1") if issue.issue_id == disputed.issue_id
+    )
+    assert reloaded.state is IssueState.UNCONFIRMED
 
 
 # --------------------------------------------------------------------------------------

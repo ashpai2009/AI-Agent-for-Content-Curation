@@ -68,6 +68,7 @@ from .llm.prompts import current_prompt_versions, resolve_prompt
 from .models import (
     FIXED_COLUMNS,
     STRUCTURAL_COLUMNS,
+    AnswerType,
     ArtifactKind,
     AttemptOutcome,
     CellEdit,
@@ -224,7 +225,12 @@ _ADJUDICATIONS = {
 
 #: Categories that authorise an edit to a structural column.
 _STRUCTURAL_CATEGORIES = frozenset(
-    {IssueCategory.STRUCTURE, IssueCategory.ROW_TYPE, IssueCategory.DEPENDENCY}
+    {
+        IssueCategory.STRUCTURE,
+        IssueCategory.ROW_TYPE,
+        IssueCategory.DEPENDENCY,
+        IssueCategory.MULTIPLE_CHOICE,
+    }
 )
 
 _COLUMN_BY_INDEX = {index: key for key, index in FIXED_COLUMNS.items()}
@@ -416,7 +422,14 @@ CLI_ADAPTER_VERSION = 5
 #: content differs from the upload, and it is shown that public net diff; a claim-blind
 #: audit that is silent about a disputed row now routes the claim directly to a curator,
 #: reserving adjudication for two audits that both found a related defect on the row.
-PIPELINE_CONTRACT_VERSION = 13
+#: 15 (2026-09-05): ordered-pair equivalence and two high-confidence duplicate-content
+#: rules add deterministic findings to agent payloads, and an exact step Title/Body copy
+#: can now be cleared without a model call. A resumed job must not acquire those new
+#: authorities halfway through its audit.
+#: 16 (2026-09-05): claim-blind Independent Reviewer checks and final semantic
+#: verification share bounded multi-block calls. Per-block opaque attribution and final
+#: round accounting preserve the old safety decisions while changing call topology.
+PIPELINE_CONTRACT_VERSION = 16
 
 
 class BudgetExhausted(Exception):
@@ -1434,7 +1447,10 @@ class CurationCouncil:
         ]
 
         if pending:
-            return self._verify_block(parsed, pending[0])
+            batch = self._take_final_batch(parsed, pending)
+            if len(batch) == 1:
+                return self._verify_block(parsed, batch[0])
+            return self._verify_blocks(parsed, batch)
 
         # Repairs the verifier asked for. They run here rather than in a repair state so
         # that an accepted one re-enters the loop above against the block it changed.
@@ -1494,6 +1510,68 @@ class CurationCouncil:
                 JobState.FINAL_SEMANTIC,
             )
 
+        outcome, _ = self._record_final_verification(block, result)
+        return outcome
+
+    def _verify_blocks(
+        self, parsed: ParsedWorkbook, blocks: Sequence[ProblemBlock]
+    ) -> StepOutcome:
+        """Verify a bounded group of changed blocks in one physical call."""
+        self._spend()
+        changes = net_changes(list_changes(self.db, self.job_id))
+
+        def changes_for(block: ProblemBlock):
+            return tuple(
+                change
+                for change in changes.values()
+                if change.before != change.after and change.block_id == block.block_id
+            )
+
+        results, requeued = final_verifier.verify_blocks(
+            self.client,
+            blocks=blocks,
+            conventions=parsed.conventions,
+            changes_for=changes_for,
+            curator_rules=self.curator_rules,
+            job_id=self.job_id,
+            taint=self.taint,
+            prompt_version=self._prompt_version(AgentRole.FINAL_VERIFIER),
+        )
+        by_id = {block.block_id: block for block in blocks}
+        opened = 0
+        for result in results:
+            _, result_opened = self._record_final_verification(
+                by_id[result.block_id], result
+            )
+            opened += result_opened
+
+        for block in requeued:
+            # Count an unusable result against the same per-block round ceiling. Without
+            # this, a model that repeatedly omits one batch item can keep a job alive
+            # forever while every physical call remains perfectly valid JSON.
+            record_event(
+                self.db,
+                self.job_id,
+                "final_verification",
+                f"{block.block_id} rejected from batch",
+            )
+            record_event(
+                self.db,
+                self.job_id,
+                "final_verification_rejected",
+                f"{block.block_id} was omitted, duplicated, or named an out-of-block cell",
+            )
+        return StepOutcome(
+            True,
+            f"verified {len(results)} block(s): {opened} issue(s) opened"
+            + (f", {len(requeued)} requeued" if requeued else ""),
+            JobState.FINAL_SEMANTIC,
+        )
+
+    def _record_final_verification(
+        self, block: ProblemBlock, result
+    ) -> tuple[StepOutcome, int]:
+        """Persist and decide one result, whether its call carried one block or several."""
         self._persist_coverage(
             block, FINAL_SEMANTIC_PHASE, result.call_id, result.coverage
         )
@@ -1526,21 +1604,51 @@ class CurationCouncil:
                 "final_verification_short",
                 f"{block.block_id} final verification withheld: {'; '.join(withheld)}",
             )
-            return StepOutcome(
-                True,
-                f"{block.block_id} verification incomplete; will verify again",
-                JobState.FINAL_SEMANTIC,
+            return (
+                StepOutcome(
+                    True,
+                    f"{block.block_id} verification incomplete; will verify again",
+                    JobState.FINAL_SEMANTIC,
+                ),
+                opened,
             )
 
         # Marked even when findings were opened. The marker records that *this* version of
         # the block was verified; if a repair follows, applying it clears the marker again,
         # which is the mechanism rather than a gap in it.
         mark_block_done(self.db, self.job_id, block.block_id, FINAL_SEMANTIC_PHASE)
-        return StepOutcome(
-            True,
-            f"{block.block_id} verified: {opened} issue(s) opened",
-            JobState.FINAL_SEMANTIC,
+        return (
+            StepOutcome(
+                True,
+                f"{block.block_id} verified: {opened} issue(s) opened",
+                JobState.FINAL_SEMANTIC,
+            ),
+            opened,
         )
+
+    def _take_final_batch(
+        self, parsed: ParsedWorkbook, pending: Sequence[ProblemBlock]
+    ) -> list[ProblemBlock]:
+        """Bound final batches by the same count and character fuses as scan batches."""
+        from .agents.rendering import render_block, render_candidate_edits
+
+        limit = max(1, self.settings.scan_batch_size)
+        budget = self.settings.scan_batch_max_characters
+        changes = net_changes(list_changes(self.db, self.job_id))
+        used = sum(len(rule) for rule in self.curator_rules)
+        batch: list[ProblemBlock] = []
+        for block in pending[:limit]:
+            block_changes = tuple(
+                change
+                for change in changes.values()
+                if change.before != change.after and change.block_id == block.block_id
+            )
+            cost = len(render_block(block)) + len(render_candidate_edits(block_changes)) + 200
+            if batch and used + cost > budget:
+                break
+            batch.append(block)
+            used += cost
+        return batch
 
     def _final_semantic_targets(self) -> frozenset[str]:
         """Blocks whose handed-back content differs from the uploaded workbook.
@@ -1890,14 +1998,80 @@ class CurationCouncil:
 
     def _reconcile_stale_escalations(self, parsed: ParsedWorkbook) -> None:
         changes = list_changes(self.db, self.job_id)
-        for issue in list_issues(self.db, self.job_id):
-            if issue.state is not IssueState.NEEDS_HUMAN_REVIEW or not issue.rule_codes:
+        issues = list_issues(self.db, self.job_id)
+        issues_by_id = {candidate.issue_id: candidate for candidate in issues}
+        verified_blocks = blocks_done(self.db, self.job_id, FINAL_SEMANTIC_PHASE)
+        for issue in issues:
+            if issue.state not in {
+                IssueState.NEEDS_HUMAN_REVIEW,
+                IssueState.UNCONFIRMED,
+            }:
                 continue
             block = parsed.block_by_id(issue.block_id) if issue.block_id else None
             if block is None:
                 continue
             remaining = target_findings(issue, parsed, block)
-            if remaining is None or remaining:
+            deterministic_is_gone = remaining is not None and not remaining
+
+            # A semantic claim has no registered rule to re-run. It may nevertheless be
+            # stale when a sibling repair put the exact expected value in its cell and a
+            # later final-semantic pass examined that resulting block. This is deliberately
+            # exact, not mathematical equivalence: requested form can distinguish 0.04
+            # from 1/25 even though the values are equal.
+            semantic_expectation_met = False
+            if (
+                remaining is None
+                and issue.block_id in verified_blocks
+                and len(issue.cells) == 1
+                and bool(issue.expected.strip())
+            ):
+                row_number, column_number = issue.cells[0]
+                workbook_row = next(
+                    (row for row in block.rows if row.row == row_number), None
+                )
+                column_key = parsed.column_map.key_at(column_number)
+                if workbook_row is not None and column_key is not None:
+                    semantic_expectation_met = (
+                        workbook_row.get(column_key).strip() == issue.expected.strip()
+                    )
+
+            # Multiple-choice distractors do not have one privileged correct rewrite.
+            # If a *deterministic MC sibling* changed the choice cell and every MC rule is
+            # now silent there, retaining a model duplicate of that same invariant merely
+            # because its proposed list used different distractors overfits the run to one
+            # synthetic answer key. An arbitrary sibling edit is insufficient: two real
+            # semantic defects can share one choice list.
+            semantic_mc_invariant_met = False
+            if (
+                remaining is None
+                and issue.block_id in verified_blocks
+                and issue.category is IssueCategory.MULTIPLE_CHOICE
+                and len(issue.cells) == 1
+            ):
+                row_number, column_number = issue.cells[0]
+                deterministic_mc_sibling = any(
+                    change.issue_id != issue.issue_id
+                    and (change.row, change.column) == (row_number, column_number)
+                    and (sibling := issues_by_id.get(change.issue_id or "")) is not None
+                    and any(code.startswith("MC_") for code in sibling.rule_codes)
+                    for change in changes
+                )
+                semantic_mc_invariant_met = (
+                    parsed.column_map.key_at(column_number) is ColumnKey.MC_CHOICES
+                    and deterministic_mc_sibling
+                    and not any(
+                        finding.row == row_number
+                        and finding.code.startswith("MC_")
+                        and finding.severity.value in {"blocking", "error"}
+                        for finding in run_rules(parsed)
+                    )
+                )
+
+            if not (
+                deterministic_is_gone
+                or semantic_expectation_met
+                or semantic_mc_invariant_met
+            ):
                 continue
             # Compatibility with jobs that began before rejected-patch rollback existed:
             # a rule may be quiet only because this very issue's rejected bytes are still
@@ -1908,13 +2082,22 @@ class CurationCouncil:
             )
             if any(change.before != change.after for change in own_net.values()):
                 continue
+            # Semantic reconciliation must be attributable to a sibling mutation. Without
+            # this, a mistaken model expectation that happened to equal untouched source
+            # content could erase a genuine disagreement without anyone repairing it.
+            if remaining is None and not any(
+                change.issue_id != issue.issue_id
+                and (change.row, change.column) in set(issue.cells)
+                for change in changes
+            ):
+                continue
             save_issue(self.db, advance_issue(issue, IssueState.SUPERSEDED))
             record_event(
                 self.db,
                 self.job_id,
                 "stale_escalation_reconciled",
-                f"{issue.issue_id}: final workbook no longer has "
-                f"{', '.join(issue.rule_codes)} at {issue.problem_name}",
+                f"{issue.issue_id}: a sibling repair and later final verification "
+                f"made the terminal finding stale at {issue.problem_name}",
             )
 
     # -- issue-level steps -------------------------------------------------------------
@@ -2591,13 +2774,54 @@ class CurationCouncil:
                     after=after,
                 ),
             )
+        elif code == "STEP_TITLE_DUPLICATES_BODY" and key is ColumnKey.BODY_TEXT:
+            if len(issue.cells) != 1:
+                return None
+            title = row.get(ColumnKey.TITLE).strip()
+            if not title or before.strip() != title:
+                return None
+            after = ""
+            reason = "remove Body Text that exactly duplicates the step Title"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
         elif (
             code == "ANSWER_TYPE_MISMATCH"
             and key is ColumnKey.ANSWER_TYPE
             and before.strip().lower() == "numeric"
         ):
-            after = "algebra"
-            reason = "label an explicit variable equation as algebra"
+            after = issue.expected.strip().lower()
+            if after not in {AnswerType.ALGEBRA.value, AnswerType.MC.value}:
+                return None
+            reason = (
+                "preserve the populated multiple-choice interaction"
+                if after == AnswerType.MC.value
+                else "label an explicit variable equation as algebra"
+            )
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif (
+            code == "MC_CHOICES_ON_NON_MC_ROW"
+            and key is ColumnKey.ANSWER_TYPE
+            and issue.expected.strip().lower() == AnswerType.MC.value
+        ):
+            after = AnswerType.MC.value
+            if before.strip().lower() == after:
+                return None
+            reason = "preserve the valid populated multiple-choice interaction"
             edits = (
                 CellEdit(
                     row=row_number,
@@ -3130,6 +3354,19 @@ class CurationCouncil:
         if block is None:
             return None
 
+        # Initial/final-verifier claims all need the same opposite-role operation: a
+        # from-scratch Independent Reviewer sweep that contains none of the accusations.
+        # Pay for several unrelated blocks in one envelope. We intentionally select at
+        # most one issue per block: after the first issue is repaired, a verdict about the
+        # pre-repair bytes of a sibling issue in that block would be stale.
+        if (
+            issue.source is not IssueSource.INDEPENDENT_REVIEWER
+            and self.settings.scan_batch_size > 1
+        ):
+            verdicts = self._ask_independent_blind_batch(issue, current)
+            if issue.issue_id in verdicts:
+                return verdicts[issue.issue_id]
+
         findings: tuple[ValidationFinding, ...] = ()
         # Two values, not one, because "did not say it was unsound" is not "said it was
         # sound". Only the independent sweep has a field for this; `audit_block` reports
@@ -3183,6 +3420,106 @@ class CurationCouncil:
             # audit.  It is not evidence either for or against the claim.
             inconclusive = str(error)
 
+        return self._record_blind_verdict(
+            issue,
+            findings,
+            reviewer_role=reviewer_role,
+            sound_stated=sound_stated,
+            sound=sound,
+            inconclusive=inconclusive,
+        )
+
+    def _ask_independent_blind_batch(
+        self, anchor: Issue, current: ParsedWorkbook
+    ) -> dict[str, ReviewVerdict]:
+        """Corroborate one model-only issue per unrelated block in one blind sweep."""
+        candidates: list[Issue] = []
+        seen_blocks: set[str] = set()
+        all_issues = list_issues(self.db, self.job_id)
+        ordered = [anchor, *all_issues]
+        for candidate in ordered:
+            if candidate.issue_id != anchor.issue_id and (
+                candidate.state is not IssueState.OPEN
+                or candidate.attempts_used != 0
+                or candidate.source is IssueSource.INDEPENDENT_REVIEWER
+            ):
+                continue
+            if not candidate.block_id or candidate.block_id in seen_blocks:
+                continue
+            block = current.block_by_id(candidate.block_id)
+            if block is None or target_findings(candidate, current, block) is not None:
+                continue
+            # The anchor is consumed immediately by the caller. A prefetched verdict for
+            # another block must remain about the same bytes until that issue is selected,
+            # so do not prefetch when a sibling issue could edit the block first.
+            if candidate.issue_id != anchor.issue_id and any(
+                sibling.issue_id != candidate.issue_id
+                and sibling.block_id == candidate.block_id
+                and sibling.state in LIVE_ISSUE_STATES
+                for sibling in all_issues
+            ):
+                continue
+            if _verdict_for_attempt(
+                self.db,
+                candidate.issue_id,
+                0,
+                reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
+            ) is not None:
+                continue
+            candidates.append(candidate)
+            seen_blocks.add(candidate.block_id)
+
+        blocks = [current.block_by_id(candidate.block_id) for candidate in candidates]
+        selected = self._take_batch(current, [block for block in blocks if block is not None])
+        selected_ids = {block.block_id for block in selected}
+        selected_issues = [
+            candidate for candidate in candidates if candidate.block_id in selected_ids
+        ]
+        self._spend()
+        results, requeued = independent_reviewer.sweep_blocks(
+            self.client,
+            blocks=selected,
+            conventions=current.conventions,
+            findings_for=lambda block: self._findings_for_block(current, block),
+            curator_rules=self.curator_rules,
+            job_id=self.job_id,
+            taint=self.taint,
+            prompt_version=self._prompt_version(AgentRole.INDEPENDENT_REVIEWER),
+        )
+        by_block = {result.block_id: result for result in results}
+        rejected = {block.block_id for block in requeued}
+        verdicts: dict[str, ReviewVerdict] = {}
+        for candidate in selected_issues:
+            result = by_block.get(candidate.block_id)
+            if result is None or candidate.block_id in rejected:
+                continue
+            verdicts[candidate.issue_id] = self._record_blind_verdict(
+                candidate,
+                result.findings,
+                reviewer_role=ReviewerRole.INDEPENDENT_REVIEWER,
+                sound_stated=True,
+                sound=result.block_is_sound,
+            )
+        if requeued:
+            record_event(
+                self.db,
+                self.job_id,
+                "blind_blocks_requeued",
+                f"{len(requeued)} block(s) came back unattributable from a blind batch",
+            )
+        return verdicts
+
+    def _record_blind_verdict(
+        self,
+        issue: Issue,
+        findings: Sequence[ValidationFinding],
+        *,
+        reviewer_role: ReviewerRole,
+        sound_stated: bool,
+        sound: bool,
+        inconclusive: str = "",
+    ) -> ReviewVerdict:
+        """Persist how one claim relates to one claim-blind block result."""
         outcome, matches = _classify_corroboration(issue, findings)
         # Silent about these rows *and* explicitly sound. A related finding leaves this
         # false however small the overlap: the audit named a defect on a disputed row, and
@@ -3418,7 +3755,10 @@ class CurationCouncil:
         parsed = self.current_workbook()
         supported_type_cells = {
             (finding.row, finding.column)
-            for finding in run_rules(parsed, only={"ANSWER_TYPE_MISMATCH"})
+            for finding in run_rules(
+                parsed,
+                only={"ANSWER_TYPE_MISMATCH", "MC_CHOICES_ON_NON_MC_ROW"},
+            )
             if finding.row is not None and finding.column is not None
         }
         normalized: list[ValidationFinding] = []

@@ -139,8 +139,9 @@ review. This prevents one plausible accusation from anchoring the agent that is 
 verify it.
 
 **A result that is neither exact agreement nor an unusable audit refutes nothing.** If the
-second audit named any cell on a disputed row it is a disagreement about extent; if it said
-nothing about those rows it is silence. Both go to the **Adjudicator**, a fifth role.
+second audit named any cell on a disputed row it is a disagreement about extent and goes
+to the **Adjudicator**; if it said nothing about those rows it is silence and goes directly
+to a curator as `UNCONFIRMED`.
 
 Both scan roles must additionally return one **coverage record per graded row** of every
 block they are sent — the row's derived answer, its recorded answer, and whether the answer,
@@ -161,6 +162,11 @@ It returns findings with exact cells and the same mandatory per-graded-row cover
 records. It never edits: its findings go through claim-blind corroboration like any other
 model claim. A block's verification is discarded whenever a repair is applied to it, and
 the block is verified again.
+
+Several unrelated changed blocks may share one physical final-verifier call. Each is
+labelled by a fresh opaque `batch_item_id` and must return exactly one attributable result.
+Missing, duplicated, unknown, and cross-block results do not certify their block and count
+against that block's ordinary bounded verification rounds.
 
 ### Adjudicator
 

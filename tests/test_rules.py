@@ -160,6 +160,89 @@ def test_ordinary_explanation_of_an_operation_is_not_an_inverse_claim(make_workb
     assert codes_for(path, "HINT_INVERSE_OPERATION_CONTRADICTION") == []
 
 
+def test_duplicate_hint_body_is_reported_only_within_one_step(make_workbook):
+    duplicate = make_workbook(
+        [
+            problem("a1"),
+            step("a1", answer="3"),
+            hint("a1", "h1", title="Start", body="Use the unit circle."),
+            hint("a1", "h2", title="Continue", body=" use  the UNIT circle. ", dependency="h1"),
+        ]
+    )
+    findings = findings_for(duplicate, "DUPLICATE_HINT_BODY")
+    assert len(findings) == 1
+    assert findings[0].row == 5
+    assert findings[0].column == 4
+    assert findings[0].detail["first_use_row"] == 4
+
+    separate_steps = make_workbook(
+        [
+            problem("a1"),
+            step("a1", answer="3"),
+            hint("a1", "h1", body="Use the unit circle."),
+            step("a1", answer="4"),
+            hint("a1", "h1", body="Use the unit circle."),
+        ]
+    )
+    assert codes_for(separate_steps, "DUPLICATE_HINT_BODY") == []
+
+    separated_reminder = make_workbook(
+        [
+            problem("a1"),
+            step("a1", answer="3"),
+            hint("a1", "h1", body="Use the unit circle."),
+            scaffold("a1", "s1", answer="1", dependency="h1"),
+            hint("a1", "h2", body="Use the unit circle.", dependency="h1"),
+        ]
+    )
+    assert codes_for(separated_reminder, "DUPLICATE_HINT_BODY") == []
+
+    placeholder = make_workbook(
+        [
+            problem("a1"),
+            step("a1", answer="3"),
+            hint("a1", "h1", body="scaffold"),
+            hint("a1", "h2", body="scaffold", dependency="h1"),
+        ]
+    )
+    assert codes_for(placeholder, "DUPLICATE_HINT_BODY") == []
+
+
+def test_step_title_that_exactly_duplicates_body_is_redundant(make_workbook):
+    duplicate = make_workbook(
+        [
+            problem("a1"),
+            cells(
+                problem_name="a1",
+                row_type="step",
+                title="Find the determinant.",
+                body_text="Find the determinant.",
+                answer="-2",
+                answer_type="numeric",
+            ),
+        ]
+    )
+    findings = findings_for(duplicate, "STEP_TITLE_DUPLICATES_BODY")
+    assert len(findings) == 1
+    assert findings[0].row == 3
+    assert findings[0].column == 4
+
+    useful_body = make_workbook(
+        [
+            problem("a1"),
+            cells(
+                problem_name="a1",
+                row_type="step",
+                title="Find the determinant.",
+                body_text="Use ad-bc.",
+                answer="-2",
+                answer_type="numeric",
+            ),
+        ]
+    )
+    assert codes_for(useful_body, "STEP_TITLE_DUPLICATES_BODY") == []
+
+
 def test_answer_without_a_type(make_workbook):
     path = make_workbook(
         [problem("a1"), cells(problem_name="a1", row_type="step", answer="1")]
@@ -653,6 +736,25 @@ def test_numeric_type_is_rejected_for_a_free_variable_expression(make_workbook):
     ]
 
 
+def test_numeric_variable_answer_preserves_an_existing_mc_interaction(make_workbook):
+    """The root fix is the type, not deleting a valid authored choice list."""
+    path = make_workbook(
+        [
+            problem("a1"),
+            step(
+                "a1",
+                answer="a_n=2*5**(n-1)",
+                answer_type="numeric",
+                mc_choices="a_n=2*5**(n-1)|a_n=5*2**(n-1)|a_n=2+5*n",
+            ),
+        ]
+    )
+    finding = findings_for(path, "ANSWER_TYPE_MISMATCH")[0]
+    assert finding.column_key is ColumnKey.ANSWER_TYPE
+    assert finding.detail["expected"] == "mc"
+    assert finding.detail["preserve_interaction"] is True
+
+
 def test_numeric_type_rule_does_not_misread_latex_numbers_as_variables(make_workbook):
     path = make_workbook(
         [problem("a1"), step("a1", answer=r"$$\frac{1}{2}$$", answer_type="numeric")]
@@ -715,6 +817,26 @@ def test_choices_on_a_non_mc_row(make_workbook):
         [problem("a1"), step("a1", answer="1", answer_type="numeric", mc_choices="1|2")]
     )
     assert codes_for(path, "MC_CHOICES_ON_NON_MC_ROW") == ["MC_CHOICES_ON_NON_MC_ROW"]
+
+
+def test_valid_choices_on_a_non_mc_row_point_to_the_type_cell(make_workbook):
+    path = make_workbook(
+        [problem("a1"), step("a1", answer="1", answer_type="algebra", mc_choices="1|2")]
+    )
+    finding = findings_for(path, "MC_CHOICES_ON_NON_MC_ROW")[0]
+    assert finding.column_key is ColumnKey.ANSWER_TYPE
+    assert finding.detail["expected"] == "mc"
+    assert finding.detail["preserve_interaction"] is True
+
+
+def test_ambiguous_choices_on_a_non_mc_row_still_point_to_the_list(make_workbook):
+    path = make_workbook(
+        [problem("a1"), step("a1", answer="3", answer_type="algebra", mc_choices="1|2")]
+    )
+    finding = findings_for(path, "MC_CHOICES_ON_NON_MC_ROW")[0]
+    assert finding.column_key is ColumnKey.MC_CHOICES
+    assert finding.detail["expected"] == ""
+    assert finding.detail["preserve_interaction"] is False
 
 
 def test_duplicate_and_empty_choices(make_workbook):

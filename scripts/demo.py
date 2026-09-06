@@ -30,10 +30,12 @@ from oatutor_council.agents.schemas import (  # noqa: E402
     AuditorBlockResult,
     AuditorResponse,
     BatchedAuditorResponse,
+    BatchedFinalVerificationResponse,
     BatchedIndependentReviewResponse,
     BlockReviewerResponse,
     BlockWriterResponse,
     FinalVerificationResponse,
+    FinalVerificationBlockResult,
     IndependentBlockResult,
     RowCoverage,
     IndependentReviewResponse,
@@ -236,6 +238,17 @@ def scripted_client(db: Database) -> ScriptedLLMClient:
             return _writer_reply(db, request)
 
         if request.role is AgentRole.FINAL_VERIFIER:
+            if sections := _batch_sections(request.user_payload):
+                return BatchedFinalVerificationResponse(
+                    results=[
+                        FinalVerificationBlockResult(
+                            batch_item_id=item_id,
+                            block_is_sound=True,
+                            coverage=_coverage(section),
+                        )
+                        for item_id, section in sections
+                    ]
+                )
             return FinalVerificationResponse(
                 block_is_sound=True, coverage=_coverage(request.user_payload)
             )

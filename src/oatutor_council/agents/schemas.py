@@ -440,5 +440,22 @@ class FinalVerificationResponse(BaseModel):
     block_is_sound: bool = True
 
 
+class FinalVerificationBlockResult(BaseModel):
+    """One corrected block's certification inside a batched final pass."""
+
+    batch_item_id: str = Field(
+        description="Copy the batch_item id from the block's section label exactly"
+    )
+    findings: list[IndependentFinding] = Field(default_factory=list)
+    coverage: list[RowCoverage] = Field(default_factory=list)
+    block_is_sound: bool = True
+
+
+class BatchedFinalVerificationResponse(BaseModel):
+    """Every dispatched changed block must appear exactly once."""
+
+    results: list[FinalVerificationBlockResult] = Field(default_factory=list)
+
+
 def column_key(name: str) -> ColumnKey:
     return ColumnKey(name)

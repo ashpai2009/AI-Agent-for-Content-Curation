@@ -40,17 +40,34 @@ def _mc_rows(context: RuleContext):
     description="mcChoices is populated on a row whose answerType is not mc.",
 )
 def mc_choices_on_non_mc_row(context: RuleContext) -> Iterable[ValidationFinding]:
-    for row, _ in _mc_rows(context):
+    for row, choices_text in _mc_rows(context):
         if row.answer_type is not AnswerType.MC:
             found = row.get(ColumnKey.ANSWER_TYPE).strip() or "empty"
+            choices = split_choices(choices_text)
+            answer = row.get(ColumnKey.ANSWER).strip()
+            # A valid list containing the exact Answer once is affirmative evidence of
+            # the intended interaction. Point at the cell that must change and preserve
+            # the authored choices. When that evidence is absent, keep pointing at the
+            # list: choosing between repairing/removing it remains a semantic decision.
+            preserve_interaction = (
+                MIN_MC_CHOICES <= len(choices) <= MAX_MC_CHOICES
+                and bool(answer)
+                and choices.count(answer) == 1
+                and all(choices)
+            )
+            column_key = (
+                ColumnKey.ANSWER_TYPE if preserve_interaction else ColumnKey.MC_CHOICES
+            )
             yield finding(
                 context,
                 "MC_CHOICES_ON_NON_MC_ROW",
                 f"mcChoices is populated but answerType is {found}",
                 row=row.row,
-                column=FIXED_COLUMNS[ColumnKey.MC_CHOICES],
-                column_key=ColumnKey.MC_CHOICES,
+                column=FIXED_COLUMNS[column_key],
+                column_key=column_key,
                 answer_type=found,
+                expected=(AnswerType.MC.value if preserve_interaction else ""),
+                preserve_interaction=preserve_interaction,
             )
 
 

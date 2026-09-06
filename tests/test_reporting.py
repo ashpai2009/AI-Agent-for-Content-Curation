@@ -130,6 +130,16 @@ def test_a_finding_in_a_structural_column_is_marked_structural():
     assert issue.is_structural
 
 
+def test_a_multiple_choice_finding_can_authorise_its_answer_type_repair():
+    finding = make_finding(
+        code="AUDITOR_FINDING", column_key=ColumnKey.MC_CHOICES, column=9
+    ).model_copy(update={"detail": {"category": "multiple_choice", "cells": [(3, 9)]}})
+    issue = issue_from_finding(
+        finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+    )
+    assert issue.is_structural
+
+
 def test_observations_and_unrepairable_findings_do_not_become_issues():
     """An observation the system will not act on would consume attempts and block
     success forever."""

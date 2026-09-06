@@ -495,6 +495,12 @@ def test_verbose_but_equivalent_coverage_is_not_called_contradictory():
         record("7", "x=sqrt(49)"),
         record("x=sqrt(49)", "x=7"),
         record("lim_(x->2-) f(x) = 4", "lim_(x->2-)f(x)=4"),
+        record("x**2-6x+13", "g(x)=x**2-6x+13"),
+        record("cos(t)=9/12 using given adjacent=9 and hypotenuse=12", "cos(t)=9/12"),
+        record("-35/364 ≈ -0.096", "-35/364"),
+        record("77.4 degrees", "77.4"),
+        # Different prose descriptions are not deterministic mathematical evidence.
+        record("the second listed relationship", "input is distance; output is force"),
     ]
 
     assert self_contradicting(records) == ()

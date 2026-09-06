@@ -18,6 +18,7 @@ from oatutor_council.validation.mathematics import (
     is_numeric_literal,
     latex_to_ascii,
     parse_expression,
+    split_ordered_tuple,
     split_equation,
 )
 
@@ -93,6 +94,13 @@ def test_hostile_input_is_refused(hostile):
 def test_unparseable_input_is_unknown_not_different():
     assert equivalent("this is prose, not mathematics", "1") is MathVerdict.UNKNOWN
     assert equivalent("", "1") is MathVerdict.UNKNOWN
+
+
+def test_ordered_tuple_components_are_compared_mathematically():
+    assert equivalent("(3,2)", "(6/2, 2)") is MathVerdict.EQUIVALENT
+    assert equivalent("(3,2)", "(2,3)") is MathVerdict.DIFFERENT
+    assert equivalent("(3,2)", "3") is MathVerdict.UNKNOWN
+    assert split_ordered_tuple("(sqrt(4), (1+2)/3)") == ("sqrt(4)", "(1+2)/3")
 
 
 # --------------------------------------------------------------------------------------

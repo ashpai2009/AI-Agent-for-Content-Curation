@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from conftest import compliant, full_coverage, problem, scaffold, step
-from oatutor_council.agents import independent_reviewer, initial_auditor
+from oatutor_council.agents import final_verifier, independent_reviewer, initial_auditor
 from oatutor_council.agents.batching import (
     BatchItem,
     attribute,
@@ -30,7 +30,10 @@ from oatutor_council.agents.schemas import (
     AuditorFinding,
     AuditorResponse,
     BatchedAuditorResponse,
+    BatchedFinalVerificationResponse,
     BatchedIndependentReviewResponse,
+    FinalVerificationBlockResult,
+    FinalVerificationResponse,
     IndependentBlockResult,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -44,18 +47,30 @@ from oatutor_council.council import (
 )
 from oatutor_council.llm.base import AgentRole, require_explicit_fields
 from oatutor_council.llm.mock import ScriptedLLMClient
-from oatutor_council.models import CurationJob, FailureReason, JobState, SourcePath
+from oatutor_council.models import (
+    CurationJob,
+    FindingScope,
+    IssueSource,
+    JobState,
+    FailureReason,
+    Severity,
+    SourcePath,
+    ValidationFinding,
+)
 from oatutor_council.persistence import (
     Database,
     blocks_done,
     create_job,
+    insert_issue,
     list_claim_results,
     list_issues,
     list_events,
     list_llm_calls,
+    list_verdicts,
     load_job_settings,
     load_private_blobs,
 )
+from oatutor_council.reporting.ledger import issue_from_finding
 from oatutor_council.workbook.reader import read_workbook
 from oatutor_council.workbook.writer import create_working_copy
 
@@ -133,6 +148,8 @@ def batched_client(**overrides) -> ScriptedLLMClient:
             return _auditor_reply(request)
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
             return _sweep_reply(request)
+        if request.role is AgentRole.FINAL_VERIFIER:
+            return _final_reply(request)
         if request.role is AgentRole.WRITER:
             return WriterResponse(
                 derivation="a scaffold needs an answer",
@@ -193,6 +210,25 @@ def _sweep_reply(request):
     return BatchedIndependentReviewResponse(
         results=[
             IndependentBlockResult(
+                batch_item_id=item,
+                block_is_sound=True,
+                coverage=coverage.get(item, []),
+            )
+            for item in ids
+        ]
+    )
+
+
+def _final_reply(request):
+    ids = _batch_ids(request.user_payload)
+    if not ids:
+        return FinalVerificationResponse(
+            block_is_sound=True, coverage=full_coverage(request.user_payload)
+        )
+    coverage = _coverage_by_item(request.user_payload)
+    return BatchedFinalVerificationResponse(
+        results=[
+            FinalVerificationBlockResult(
                 batch_item_id=item,
                 block_is_sound=True,
                 coverage=coverage.get(item, []),
@@ -307,11 +343,14 @@ def test_a_sweep_of_one_block_also_delegates(setup):
 @pytest.mark.parametrize("batch", [1, 3])
 def test_a_batched_run_reaches_the_same_place_as_an_unbatched_one(setup, batch):
     db, _ = setup
-    result = council(setup, batched_client(), scan_batch_size=batch).run()
+    client = batched_client()
+    result = council(setup, client, scan_batch_size=batch).run()
 
     assert result.state is JobState.SUCCEEDED, result.failure_reason
     assert len(blocks_done(db, "job-1", "audited")) == 3
     assert len(list_issues(db, "job-1")) == 3
+    if batch == 3:
+        assert client.call_count(AgentRole.FINAL_VERIFIER) == 1
 
 
 def test_a_batch_of_three_audits_in_one_call(setup):
@@ -323,6 +362,64 @@ def test_a_batch_of_three_audits_in_one_call(setup):
     audits = client.call_count(AgentRole.INITIAL_AUDITOR)
     assert audits == 1
     assert len(blocks_done(db, "job-1", "audited")) == 3
+
+
+def test_final_verifier_requeues_an_omitted_batch_item(setup):
+    """Silence about one changed block is not a final certification of that block."""
+    _, copy = setup
+    parsed = read_workbook(copy.path)
+
+    def reply(request):
+        item = _batch_ids(request.user_payload)[0]
+        return BatchedFinalVerificationResponse(
+            results=[FinalVerificationBlockResult(batch_item_id=item)]
+        )
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    results, requeued = final_verifier.verify_blocks(
+        client,
+        blocks=parsed.blocks[:2],
+        conventions=parsed.conventions,
+        job_id="job-1",
+    )
+
+    assert len(results) == 1
+    assert [block.block_id for block in requeued] == [parsed.blocks[1].block_id]
+    assert client.call_count(AgentRole.FINAL_VERIFIER) == 1
+
+
+def test_claim_blind_checks_for_unrelated_blocks_share_one_call(setup):
+    """One blind whole-block answer can settle one claim in each unchanged block."""
+    db, copy = setup
+    parsed = read_workbook(copy.path)
+    issues = []
+    for block, row in zip(parsed.blocks[:2], (3, 6)):
+        finding = ValidationFinding(
+            code="AUDITOR_FINDING",
+            severity=Severity.ERROR,
+            scope=FindingScope.CELL,
+            message="the submitted answer is mathematically wrong",
+            row=row,
+            column=5,
+            block_id=block.block_id,
+            problem_name=block.problem_name,
+            detail={"category": "mathematics", "cells": [[row, 5]]},
+        )
+        issue = issue_from_finding(
+            finding, job_id="job-1", source=IssueSource.INITIAL_AUDITOR
+        )
+        insert_issue(db, issue)
+        issues.append(issue)
+
+    client = batched_client()
+    worker = council(setup, client, scan_batch_size=2)
+    worker._ask_blind_corroborator(issues[0])
+
+    assert client.call_count(AgentRole.INDEPENDENT_REVIEWER) == 1
+    assert {verdict.issue_id for verdict in list_verdicts(db, "job-1")} == {
+        issue.issue_id for issue in issues
+    }
 
 
 # --------------------------------------------------------------------------------------

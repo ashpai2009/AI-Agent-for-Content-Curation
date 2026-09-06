@@ -342,7 +342,10 @@ def compliant(reply: Any) -> Any:
     A double that *does* script the verifier keeps its own answer, so a test about the
     final phase still says what it meant to.
     """
-    from oatutor_council.agents.schemas import FinalVerificationResponse
+    from oatutor_council.agents.schemas import (
+        BatchedFinalVerificationResponse,
+        FinalVerificationResponse,
+    )
     from oatutor_council.llm.base import AgentRole
 
     def wrapped(request: Any) -> Any:
@@ -356,7 +359,7 @@ def compliant(reply: Any) -> Any:
                 raise
             value = None
         if request.role is AgentRole.FINAL_VERIFIER and not isinstance(
-            value, FinalVerificationResponse
+            value, (FinalVerificationResponse, BatchedFinalVerificationResponse)
         ):
             value = FinalVerificationResponse(block_is_sound=True)
         return with_coverage(value, request.user_payload)

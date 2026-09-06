@@ -7,6 +7,9 @@ from typing import Iterable
 
 from ...models import (
     FIXED_COLUMNS,
+    MAX_MC_CHOICES,
+    MC_CHOICE_DELIMITER,
+    MIN_MC_CHOICES,
     AnswerType,
     ColumnKey,
     IssueCategory,
@@ -89,15 +92,32 @@ def answer_type_mismatch(context: RuleContext) -> Iterable[ValidationFinding]:
 
         if not variable_equation and not free_variable_expression:
             continue
+        choices = [
+            choice.strip()
+            for choice in row.get(ColumnKey.MC_CHOICES).split(MC_CHOICE_DELIMITER)
+        ]
+        preserve_interaction = (
+            MIN_MC_CHOICES <= len(choices) <= MAX_MC_CHOICES
+            and bool(answer)
+            and choices.count(answer) == 1
+            and all(choices)
+        )
+        expected = AnswerType.MC if preserve_interaction else AnswerType.ALGEBRA
         yield finding(
             context,
             "ANSWER_TYPE_MISMATCH",
-            "answerType is numeric but Answer contains a free variable",
+            (
+                "answerType is numeric but the exact Answer occurs once in a valid "
+                "multiple-choice list"
+                if preserve_interaction
+                else "answerType is numeric but Answer contains a free variable"
+            ),
             row=row.row,
             column=FIXED_COLUMNS[ColumnKey.ANSWER_TYPE],
             column_key=ColumnKey.ANSWER_TYPE,
             answer=row.get(ColumnKey.ANSWER),
-            expected=AnswerType.ALGEBRA.value,
+            expected=expected.value,
+            preserve_interaction=preserve_interaction,
         )
 
 

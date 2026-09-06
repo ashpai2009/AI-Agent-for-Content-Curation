@@ -99,9 +99,12 @@ def test_a_resolved_issue_reopens_only_backwards_or_to_a_person(state):
     able to say so -- absorbing the rediscovery silently is how a job reports success
     over a workbook it never fixed -- but only in these two directions, so a rediscovery
     can never re-enter the pipeline at an earlier stage."""
-    assert LEGAL_ISSUE_TRANSITIONS[state] == frozenset(
-        {IssueState.REVISION_REQUESTED, IssueState.NEEDS_HUMAN_REVIEW}
-    )
+    expected = {IssueState.REVISION_REQUESTED, IssueState.NEEDS_HUMAN_REVIEW}
+    if state is IssueState.UNCONFIRMED:
+        # Exact expected content supplied by a later sibling repair, followed by final
+        # verification, can now settle a previously unresolved model-only claim.
+        expected.add(IssueState.SUPERSEDED)
+    assert LEGAL_ISSUE_TRANSITIONS[state] == frozenset(expected)
 
 
 def test_every_non_terminal_job_state_can_fail_or_be_cancelled():

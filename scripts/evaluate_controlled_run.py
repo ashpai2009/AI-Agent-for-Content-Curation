@@ -66,6 +66,31 @@ def keyed_items(key: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[st
     return automated, manual
 
 
+def supplementary_items(key: dict[str, Any]) -> list[dict[str, Any]]:
+    """Known source defects are allowed and reported, but never inflate the planted score."""
+    items: list[dict[str, Any]] = []
+    for group in key.get("knownSourceDefects", []):
+        for correction in group.get("corrections", []):
+            items.append(
+                {
+                    **correction,
+                    "problemName": group["problemName"],
+                    "kind": group["kind"],
+                }
+            )
+    return items
+
+
+def allowed_related_cells(key: dict[str, Any]) -> set[str]:
+    """Cells a complete planted repair may change without becoming separate score items."""
+    return {
+        str(cell)
+        for group in key.get("defectGroups", [])
+        for cell in group.get("allowedRelatedCells", [])
+        if cell
+    }
+
+
 def _has_automated_check(item: dict[str, Any]) -> bool:
     return bool(item.get("cell")) and any(
         key in item
@@ -140,11 +165,12 @@ def main() -> int:
         source = source_book.active
         corrected = corrected_book.active
         automated, manual = keyed_items(key)
+        supplementary = supplementary_items(key)
         target_cells = {
             item["cell"]
-            for item in (*automated, *manual)
+            for item in (*automated, *manual, *supplementary)
             if item.get("cell")
-        }
+        } | allowed_related_cells(key)
 
         passed = []
         failed = []
@@ -152,6 +178,16 @@ def main() -> int:
             item_passed, actual, check = evaluate_item(item, corrected)
             row = {**item, "actual": actual, "check": check}
             (passed if item_passed else failed).append(row)
+
+        supplementary_results = []
+        for item in supplementary:
+            if _has_automated_check(item):
+                item_passed, actual, check = evaluate_item(item, corrected)
+                supplementary_results.append(
+                    {**item, "passed": item_passed, "actual": actual, "check": check}
+                )
+            else:
+                supplementary_results.append({**item, "passed": None})
 
         unexpected = []
         max_row = max(source.max_row, corrected.max_row)
@@ -193,6 +229,7 @@ def main() -> int:
             "exact_total": len(automated),
             "exact_failed": failed,
             "manual_expectations": manual,
+            "known_source_defects": supplementary_results,
             "unexpected_changed_cells": unexpected,
             "changed_clean_controls": changed_clean_controls,
         }
@@ -202,6 +239,7 @@ def main() -> int:
             print(f"automated: {len(passed)}/{len(automated)}")
             print(f"failed automated cells: {failed_cells}")
             print(f"manual expectations: {len(manual)}")
+            print(f"known source defects: {len(supplementary_results)} (not scored)")
             print(f"unexpected changed cells: {unexpected_cells}")
             print(
                 "changed clean controls: "

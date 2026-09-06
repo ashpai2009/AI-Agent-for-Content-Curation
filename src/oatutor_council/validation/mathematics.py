@@ -228,6 +228,41 @@ def split_equation(text: str) -> tuple[str, str] | None:
     return stripped[:at], stripped[at + 1 :]
 
 
+def split_ordered_tuple(text: str) -> tuple[str, ...] | None:
+    """Split a parenthesized ordered tuple without evaluating workbook text.
+
+    SymPy's parser returns a native Python tuple for ``(x,y)``, which the guarded scalar
+    parser correctly refuses because it is not a SymPy expression. Ordered pairs are
+    nevertheless ordinary graded answers and MC distractors. Split only a balanced outer
+    pair of parentheses and only at top-level commas; every component still passes through
+    the same restricted scalar parser before it can influence a verdict.
+    """
+
+    candidate = strip_latex_delimiters(text).strip()
+    if len(candidate) < 5 or not (candidate.startswith("(") and candidate.endswith(")")):
+        return None
+    inner = candidate[1:-1]
+    depth = 0
+    start = 0
+    parts: list[str] = []
+    for index, character in enumerate(inner):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif character == "," and depth == 0:
+            parts.append(inner[start:index].strip())
+            start = index + 1
+    if depth != 0 or not parts:
+        return None
+    parts.append(inner[start:].strip())
+    if any(not part for part in parts):
+        return None
+    return tuple(parts)
+
+
 # --------------------------------------------------------------------------------------
 # Equivalence
 # --------------------------------------------------------------------------------------
@@ -245,6 +280,20 @@ def equivalent(left: str, right: str) -> MathVerdict:
     returning a non-zero difference is not proof of inequality for anything it failed to
     simplify. Either step failing yields `UNKNOWN` rather than a guess.
     """
+    left_tuple = split_ordered_tuple(left)
+    right_tuple = split_ordered_tuple(right)
+    if left_tuple is not None or right_tuple is not None:
+        if left_tuple is None or right_tuple is None:
+            return MathVerdict.UNKNOWN
+        if len(left_tuple) != len(right_tuple):
+            return MathVerdict.DIFFERENT
+        verdicts = tuple(equivalent(a, b) for a, b in zip(left_tuple, right_tuple, strict=True))
+        if any(verdict is MathVerdict.DIFFERENT for verdict in verdicts):
+            return MathVerdict.DIFFERENT
+        if all(verdict is MathVerdict.EQUIVALENT for verdict in verdicts):
+            return MathVerdict.EQUIVALENT
+        return MathVerdict.UNKNOWN
+
     try:
         a, b = parse_expression(left), parse_expression(right)
     except UnparseableExpression:

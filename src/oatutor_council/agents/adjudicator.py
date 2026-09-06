@@ -74,7 +74,12 @@ Then return one verdict:
 #: A defect in one of these columns cannot be repaired under a non-structural issue, so
 #: the adjudicator's canonical category has to carry that decision with it.
 _STRUCTURAL_CATEGORIES = frozenset(
-    {IssueCategory.STRUCTURE, IssueCategory.ROW_TYPE, IssueCategory.DEPENDENCY}
+    {
+        IssueCategory.STRUCTURE,
+        IssueCategory.ROW_TYPE,
+        IssueCategory.DEPENDENCY,
+        IssueCategory.MULTIPLE_CHOICE,
+    }
 )
 
 

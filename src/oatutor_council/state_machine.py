@@ -146,9 +146,11 @@ _ISSUE_FLOW: dict[IssueState, frozenset[IssueState]] = {
     # rediscovery at the same cells is precisely the independent evidence the second audit
     # failed to supply, so it belongs back with the Writer rather than left as a question.
     # It takes the same two exits as every other resolved state and no third one -- an
-    # unconfirmed claim carries no rule code, so nothing can re-derive it against the
-    # final workbook and nothing is in a position to supersede it.
-    IssueState.UNCONFIRMED: _REOPENABLE,
+    # A model-only claim carries no rule code, but a later sibling repair can now settle
+    # its exact expected value and final semantic verification can examine the resulting
+    # block. That narrow evidence also permits SUPERSEDED; unresolved disagreements about
+    # mathematically equivalent but differently requested forms remain UNCONFIRMED.
+    IssueState.UNCONFIRMED: _REOPENABLE | {IssueState.SUPERSEDED},
     # A later accepted sibling repair can make an escalated deterministic finding cease
     # to exist. `SUPERSEDED` is the only honest transition then: retaining the stale
     # escalation tells a curator to inspect a defect the final workbook does not have.

@@ -137,7 +137,12 @@ def _finding_cells(finding: ValidationFinding) -> tuple[tuple[int, int], ...]:
 #: declaration is the difference between a fixable defect and one that burns three attempts
 #: against `STRUCTURAL_COLUMN_UNAUTHORIZED`.
 _STRUCTURAL_CATEGORIES = frozenset(
-    {IssueCategory.STRUCTURE, IssueCategory.ROW_TYPE, IssueCategory.DEPENDENCY}
+    {
+        IssueCategory.STRUCTURE,
+        IssueCategory.ROW_TYPE,
+        IssueCategory.DEPENDENCY,
+        IssueCategory.MULTIPLE_CHOICE,
+    }
 )
 
 

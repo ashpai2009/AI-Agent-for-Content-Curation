@@ -30,6 +30,14 @@ from .schemas import RowCoverage
 
 
 _SIMPLE_ASSIGNMENT = re.compile(r"^[A-Za-z][A-Za-z0-9]*=(.+)$")
+_EXPLANATION_SUFFIX = re.compile(
+    r"(?:,?\s+(?:because|since|using|where|from|which|given)\b|\s+\(because\b)",
+    re.IGNORECASE,
+)
+_UNIT_SUFFIX = re.compile(
+    r"\s*(?:degrees?|radians?|units?|square\s+units?|cubic\s+units?)\.?$",
+    re.IGNORECASE,
+)
 
 
 def _assignment_value(text: str) -> str:
@@ -43,6 +51,40 @@ def _assignment_value(text: str) -> str:
     compact = "".join(text.split())
     match = _SIMPLE_ASSIGNMENT.fullmatch(compact)
     return match.group(1) if match else text
+
+
+def _answer_candidates(text: str) -> tuple[str, ...]:
+    """Conservative mathematical readings of a verifier's short answer.
+
+    Coverage prose is not a workbook cell. Models legitimately return a function label,
+    a derivation, an approximation, or a unit beside the same value. Comparing only the
+    complete strings made those forms look contradictory. These reductions remove only
+    wrappers whose right-hand mathematical value remains explicit; ordinary prose stays
+    unparseable and therefore can never become evidence of a contradiction.
+    """
+    cleaned = text.strip().strip("$").strip()
+    concise = _EXPLANATION_SUFFIX.split(cleaned, maxsplit=1)[0].strip()
+    fragments = [concise]
+    for marker in ("≈", r"\approx"):
+        expanded: list[str] = []
+        for fragment in fragments:
+            expanded.extend(part.strip() for part in fragment.split(marker) if part.strip())
+        fragments = expanded or fragments
+
+    candidates: list[str] = []
+    for fragment in fragments:
+        without_units = _UNIT_SUFFIX.sub("", fragment).strip()
+        for candidate in (fragment, without_units):
+            if candidate:
+                candidates.append(candidate)
+            if "=" in candidate:
+                rhs = candidate.rsplit("=", 1)[1].strip()
+                if rhs:
+                    candidates.append(rhs)
+            assigned = _assignment_value(candidate)
+            if assigned != candidate:
+                candidates.append(assigned)
+    return tuple(dict.fromkeys(candidates))
 
 
 def coverage_gaps(
@@ -94,45 +136,26 @@ def self_contradicting(
         if not record.answer_correct:
             continue
 
-        # Models often put a derivation around the short value. Check a complete
-        # calculation chain's final RHS *before* stripping prose: the live verifier wrote
-        # ``P(red then blue) = (5/9)*(4/8) = 20/72 = 5/18``. Cutting at the first `` (``
-        # turns that into ``P(red then blue) =`` and manufactures a contradiction.
-        compact_full = "".join(computed.casefold().split())
-        compact_submitted = "".join(submitted.casefold().split())
-        if compact_full == compact_submitted:
-            continue
-        if "=" in compact_full:
-            final_rhs = compact_full.rsplit("=", 1)[1]
-            if final_rhs == compact_submitted:
-                continue
-            if answers_equivalent(
-                _assignment_value(final_rhs), _assignment_value(submitted)
-            ) is MathVerdict.EQUIVALENT:
-                continue
+        verdicts: list[MathVerdict] = []
+        for computed_candidate in _answer_candidates(computed):
+            for submitted_candidate in _answer_candidates(submitted):
+                compact_computed = "".join(computed_candidate.casefold().split())
+                compact_submitted = "".join(submitted_candidate.casefold().split())
+                if compact_computed == compact_submitted:
+                    verdicts = [MathVerdict.EQUIVALENT]
+                    break
+                verdicts.append(
+                    answers_equivalent(computed_candidate, submitted_candidate)
+                )
+            if MathVerdict.EQUIVALENT in verdicts:
+                break
 
-        # A shorter common form is ``83 (because 7+19*4=83)``. Strip only a
-        # parenthetical introduced after a space (never a function call such as
-        # ``sqrt(3)``), then compare again.
-        concise = computed
-        for marker in (" (", " is ", " since ", " because "):
-            concise = concise.split(marker, 1)[0]
-        concise = concise.strip()
-        compact_computed = "".join(concise.casefold().split())
-        compact_submitted = "".join(submitted.casefold().split())
-        if compact_computed == compact_submitted:
+        if MathVerdict.EQUIVALENT in verdicts:
             continue
-        if (
-            "=" in compact_computed
-            and compact_computed.rsplit("=", 1)[1] == compact_submitted
-        ):
-            continue
-
-        verdict = answers_equivalent(
-            _assignment_value(concise), _assignment_value(submitted)
-        )
-        # UNKNOWN is not evidence of contradiction. This is a safety gate, so it may only
-        # accuse a record when deterministic mathematics says the two values differ.
-        if verdict is MathVerdict.DIFFERENT:
+        # UNKNOWN is not evidence of contradiction. Requiring every plausible reading
+        # to be deterministically different makes this a high-precision warning rather
+        # than a prose-similarity detector. Clear numeric disagreements such as 5 versus
+        # 6 still fire; explanations and labels remain silent.
+        if verdicts and all(verdict is MathVerdict.DIFFERENT for verdict in verdicts):
             contradictions.append(record.row)
     return tuple(contradictions)
