@@ -157,12 +157,16 @@ def build_command(settings: Settings, request: LLMRequest) -> list[str]:
         # is the CLI refusing to let it. Two independent limits, because the thing being
         # bounded is spend on somebody's subscription.
         #
-        # **The value is 2, and 1 was measured to be worse on both counts.** At 1 the live
+        # **The value is 4, and 1 was measured to be worse on both counts.** At 1 the live
         # pilot lost four independent-review calls to `Reached maximum number of turns (1)`
         # before the structured output was emitted; retry recovered every one, so the
         # ceiling meant to save calls was spending whole extra ones. A limit that fires on
         # correct work is not a limit, it is a retry loop with a confusing error message.
         "--max-turns", str(settings.claude_max_turns),
+        # The council never consumes a predicted follow-up prompt. Leaving the CLI's
+        # suggestion generator enabled can spend output on text discarded by the JSON
+        # adapter, so disable it explicitly rather than relying on a changing default.
+        "--prompt-suggestions", "false",
         "--safe-mode",
         "--disable-slash-commands",
         "--strict-mcp-config",
@@ -346,7 +350,7 @@ class ClaudeCLIClient:
         text = extract_structured_output(envelope)
         return LLMResponse(
             text=text,
-            model=str(envelope.get("model") or self._settings.claude_model),
+            model=extract_model_name(envelope, self._settings.claude_model),
             status="completed",
             usage=extract_usage(envelope, elapsed_ms),
         )
@@ -434,6 +438,27 @@ def _terminate_group(process: subprocess.Popen) -> None:
 #: rather than assumed: an envelope shape that changes should fail loudly here, not turn
 #: into a schema error that blames the model for a response it never gave.
 _STRUCTURED_KEYS = ("structured_output", "structuredOutput", "structured_result")
+
+
+def extract_model_name(envelope: dict[str, Any], configured: str) -> str:
+    """Exact model snapshot when the CLI discloses it, otherwise the requested name.
+
+    Claude Code JSON envelopes have used both a top-level ``model`` and a
+    ``modelUsage`` mapping keyed by full model id. The latter matters for an evaluation:
+    recording only the moving ``sonnet`` alias makes the result impossible to reproduce
+    after Anthropic advances that alias. Multiple keys are left as the configured name
+    rather than inventing which model deserves ownership of the call.
+    """
+    direct = envelope.get("model")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    usage = envelope.get("modelUsage") or envelope.get("model_usage")
+    if isinstance(usage, dict):
+        names = [name.strip() for name in usage if isinstance(name, str) and name.strip()]
+        if len(names) == 1:
+            return names[0]
+    return configured
 
 
 def extract_structured_output(envelope: dict[str, Any]) -> str:

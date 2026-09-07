@@ -75,6 +75,14 @@ if [ ! -x .venv/bin/uvicorn ]; then
   exit 1
 fi
 
+# Fail before starting either server when the one dependency a real job cannot recover
+# from is absent. `create_app()` performs the authoritative check as well; this preflight
+# exists to turn a buried worker-startup traceback into one concise action. It uses the
+# same settings loader as the service, including a configured CLI path, and sends nothing.
+if ! .venv/bin/python scripts/preflight.py; then
+  exit 1
+fi
+
 echo "starting the council service on :$API_PORT"
 # One worker, deliberately: SQLite in WAL over a single file wants a single writer, and
 # the working copies are on a local filesystem.

@@ -166,6 +166,32 @@ def test_current_semantic_prompts_pin_the_live_pilot_lessons():
     assert "plain fraction or constant is not a defect" in independent
 
 
+def test_the_two_full_audits_use_distinct_complete_lenses():
+    """Diversify attention without adding calls or narrowing either audit's scope."""
+    auditor = re.sub(r"\s+", " ", system_prompt(AgentRole.INITIAL_AUDITOR))
+    independent = re.sub(
+        r"\s+", " ", system_prompt(AgentRole.INDEPENDENT_REVIEWER)
+    )
+
+    assert "mathematics-first" in auditor
+    assert "without treating Answer, answerType, or mcChoices as evidence" in auditor
+    assert "instruction-first" in independent
+    assert "Follow the hint and scaffold sequence as a student would" in independent
+
+    for prompt in (auditor, independent):
+        for obligation in (
+            "requested form",
+            "units",
+            "domain",
+            "number of solutions",
+            "answerType",
+            "multiple choice",
+            "every graded row",
+            "every exact row-and-column cell",
+        ):
+            assert obligation.casefold() in prompt.casefold()
+
+
 def test_an_unknown_prompt_is_fatal():
     """A council running with a prompt nobody wrote is doing something nobody
     specified."""

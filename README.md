@@ -365,6 +365,8 @@ The properties that matter:
   prompt, so the lower ceiling increased rather than bounded spend. A fresh contract-11 run
   then lost two of its first four completed audit invocations at turn 3, so the measured
   ceiling is now 4.
+- **`--prompt-suggestions false`** because the council never consumes a predicted
+  follow-up prompt; generating one would be discarded output.
 
 Settings are prefixed `COUNCIL_` because `CLAUDE_EFFORT` is a variable the CLI itself sets:
 unprefixed, the service would inherit an effort level from whatever session launched it.
@@ -389,11 +391,20 @@ Failures are classified rather than lumped together, because they need opposite 
 | Safety block, recitation | Never retried either: the same cell trips the same filter every time. That one issue goes to a person and the job carries on |
 | Anything unrecognised | Treated as transient — the conservative reading, since a bounded few retries costs less than failing a job that would have worked |
 
-Every call carries a timeout. Lost calls are counted against a per-job budget stored in the
-database rather than in the worker, because a provider outage routinely takes the worker
-with it and an in-memory counter would reset exactly when it mattered. Persisted error
-messages are bounded at both ends and stripped of anything credential-shaped: a provider
-can quote your workbook back at you in an error, and errors end up in logs.
+Every call carries a timeout. Physical invocations are counted against a durable,
+size-aware per-job fuse: by default `min(300, 20 + 6 * problem_blocks)`. The allowance is
+pinned with the job and displayed as `used / allowed` in the interface. A small pilot
+therefore cannot silently consume a full-chapter allowance, while measured healthy runs
+retain room for repair and verification. The counter lives in the database rather than
+the worker because an outage routinely takes the worker with it and an in-memory counter
+would reset exactly when it mattered. Persisted error messages are bounded at both ends
+and stripped of anything credential-shaped: a provider can quote your workbook back at
+you in an error, and errors end up in logs.
+
+Generated output has a second size-aware fuse, by default
+`min(600000, 40000 + 10000 * problem_blocks)`. It uses the provider's reported output-token
+count, including reasoning, and excludes cache creation/read traffic. Usage is known only
+after a response, so one invocation may cross the boundary; no subsequent call is allowed.
 
 ### Scan batching
 
@@ -606,6 +617,15 @@ CLI as organization-grade capacity.
 
 The fourth workbook (`heldout-04`) has never been run and is the only genuinely unseen
 material left. Deployment evidence needs a new set built after the architecture stops moving.
+
+A newer frozen synthetic suite was run on 2026-09-07 after that architecture work. Across
+48 problems, all 33 machine-decidable checks passed; manual review accepted two of three
+instructional repairs, for 35/36 substantive corrections (97.2%), with no unexpected edit
+and no changed clean control. One correct defect report was left unchanged and escalated
+because the independent pass did not reproduce it. See
+`docs/evaluations/sealed-demo-benchmark-20260907-live.md` for the full result and limits.
+This is controlled synthetic pilot evidence, not a production SLA or proof across real
+OpenStax chapters.
 
 Do not expose the `evaluation-keys/` files in an upload or custom prompt; score the corrected
 downloads only after every run finishes.

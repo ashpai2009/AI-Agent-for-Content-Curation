@@ -1,7 +1,7 @@
 # LLM data contract
 
 This document is the auditable answer to: **what exactly leaves the service for Claude,
-when, and why?** It describes pipeline contract version 13.
+when, and why?** It describes pipeline contract version 18.
 
 ## Transport
 

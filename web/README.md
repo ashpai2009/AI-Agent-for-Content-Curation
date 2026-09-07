@@ -112,14 +112,15 @@ and a non-repairable error still needs a person.
 ## Limits worth knowing
 
 - **A job makes real Claude calls on your subscription.** The progress card shows the
-  running count. A thirty-block workbook needs roughly sixty calls before any repair.
+  running count and its size-aware ceiling. The measured five-block offline topology is
+  sixteen calls; a real run can use more when it finds work or a provider call retries.
 - **One job at a time**, by design (`MAX_CONCURRENT_JOBS=1`): SQLite in WAL over one file
   wants one writer.
 - **Closing the tab does not cancel a job.** The job is a durable row; the worker keeps
-  going and the poller picks it up after a crash. The page stores the latest opaque job id
+  going and the poller picks it up after a crash. The page stores the current opaque job id
   in local browser storage, so reopening or refreshing resumes polling and download access.
-- **The page remembers only the latest job.** It does not provide a multi-job history or
-  cross-device account view; those require user identities and a retention policy rather
-  than more browser storage.
+- **Recent jobs come from the local database.** The page can reopen the twenty newest runs
+  until retention removes them. It is not a cross-device or multi-user account view; that
+  requires institutional identities and authorization boundaries.
 - **50 MB upload guard** in `app/api/jobs/route.ts`, matching the council default. The
   backend remains authoritative if an operator configures a different limit.

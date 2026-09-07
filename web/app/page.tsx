@@ -15,6 +15,9 @@ type JobStatus = {
   issues_open: number;
   changes: number;
   llm_calls_used: number;
+  llm_call_budget: number;
+  llm_output_token_budget: number;
+  usage: { output_tokens: number };
 };
 
 type Finding = {
@@ -55,6 +58,15 @@ type Health = {
   detail?: string | null;
   subscription_type?: string | null;
   model?: string | null;
+};
+
+type RecentJob = {
+  job_id: string;
+  state: string;
+  source_filename: string;
+  created_at: string;
+  updated_at: string;
+  llm_calls_used: number;
 };
 
 /* ---------------------------------------------------------------------------------- */
@@ -134,6 +146,7 @@ export default function Page() {
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [recentJobs, setRecentJobs] = useState<RecentJob[]>([]);
 
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -144,6 +157,25 @@ export default function Page() {
     const saved = window.localStorage.getItem("oatutor-current-job");
     if (saved && /^[a-f0-9]{32}$/.test(saved)) setJobId(saved);
   }, []);
+
+  // Job ids live durably in SQLite, not only in this browser tab. Listing safe metadata
+  // means a refresh, a cleared localStorage entry, or starting a second run no longer
+  // makes an earlier download undiscoverable.
+  useEffect(() => {
+    if (jobId) return;
+    let live = true;
+    fetch("/api/jobs")
+      .then((response) => response.json())
+      .then((body: { jobs?: RecentJob[] }) => {
+        if (live) setRecentJobs(Array.isArray(body.jobs) ? body.jobs : []);
+      })
+      .catch(() => {
+        if (live) setRecentJobs([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [jobId]);
 
   /* -- readiness ------------------------------------------------------------------- */
 
@@ -247,6 +279,14 @@ export default function Page() {
     setFile(chosen);
   };
 
+  const openRecentJob = (id: string) => {
+    setError(null);
+    setReport(null);
+    setStatus(null);
+    setJobId(id);
+    window.localStorage.setItem("oatutor-current-job", id);
+  };
+
   const running = Boolean(jobId) && !(status && TERMINAL.has(status.state));
   const current = status ? phaseIndex(status.state) : -1;
 
@@ -257,7 +297,7 @@ export default function Page() {
         <StatusPill health={health} />
       </header>
       <p className="lede">
-        Upload an OATutor problem workbook. Four agents audit every problem block, repair
+        Upload an OATutor problem workbook. Specialized agents audit every problem block, repair
         what they find, review the repairs, and hand back a corrected file with a record
         of every change. Your original is never modified.
       </p>
@@ -406,6 +446,33 @@ export default function Page() {
               </button>
             )}
           </div>
+
+          {recentJobs.length > 0 && (
+            <section className="card">
+              <h2>Recent workbooks</h2>
+              <p className="hint">
+                Runs are kept on this computer for the configured retention period. Open
+                one to check its status, report, or corrected file.
+              </p>
+              <table className="findings recent-jobs">
+                <tbody>
+                  {recentJobs.map((job) => (
+                    <tr key={job.job_id}>
+                      <td>
+                        <button className="link" onClick={() => openRecentJob(job.job_id)}>
+                          {job.source_filename}
+                        </button>
+                        <div className="file-meta">
+                          {new Date(job.created_at).toLocaleString()} · {job.llm_calls_used} calls
+                        </div>
+                      </td>
+                      <td className="recent-state">{job.state.replaceAll("_", " ")}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
         </>
       ) : (
         <>
@@ -445,7 +512,11 @@ export default function Page() {
                 </div>
                 <div>
                   <dt>Model calls</dt>
-                  <dd>{status.llm_calls_used}</dd>
+                  <dd>{status.llm_calls_used} / {status.llm_call_budget}</dd>
+                </div>
+                <div>
+                  <dt>Generated tokens</dt>
+                  <dd>{status.usage.output_tokens.toLocaleString()} / {status.llm_output_token_budget.toLocaleString()}</dd>
                 </div>
               </dl>
             )}

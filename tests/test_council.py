@@ -69,6 +69,7 @@ from oatutor_council.persistence import (
     load_ledger,
     mark_block_done,
     record_changes,
+    record_llm_call,
     save_issue,
 )
 from oatutor_council.reporting.ledger import issue_from_finding
@@ -1246,10 +1247,10 @@ def test_contradictory_final_coverage_withholds_the_marker(setup):
 def test_a_contradictory_audit_record_reaches_the_report(setup):
     """An earlier phase's contradiction is a row to look at, and must be visible.
 
-    The final phase withholds its marker for one of these. The audit and sweep phases
-    cannot -- a contradiction there is not grounds to refuse the workbook -- so the only
-    thing that makes them useful is that a curator can see them, which means the report
-    rather than a table nobody queries.
+    The final phase withholds its marker. An Initial-Auditor contradiction may be
+    superseded by the later clean sweep, but it still belongs in the audit trail and
+    report; a contradictory latest sweep of unchanged content is separately tested as a
+    reason the job needs a curator.
     """
     db, _ = setup
 
@@ -1306,6 +1307,49 @@ def test_one_verifier_call_per_changed_block(setup):
 
     assert client.call_count(AgentRole.FINAL_VERIFIER) == 1
     assert result.state is JobState.SUCCEEDED, result.failure_reason
+
+
+def test_latest_contradictory_sweep_of_unchanged_content_needs_a_person(setup):
+    """Do not report success over the last semantic check refuting itself.
+
+    There is no reliable repair target here, so spending adjudication or Writer calls
+    would only ask another anchored agent to guess. The unchanged row is handed to a
+    curator, while an older Initial-Auditor contradiction remains supersedable by a clean
+    independent sweep.
+    """
+    db, _ = setup
+
+    def reply(request):
+        if request.role is AgentRole.INITIAL_AUDITOR:
+            return AuditorResponse(coverage=full_coverage(request.user_payload))
+        if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            records = full_coverage(request.user_payload)
+            records[0] = records[0].model_copy(
+                update={
+                    "computed_answer": "31",
+                    "submitted_answer": "30",
+                    "answer_correct": True,
+                }
+            )
+            return IndependentReviewResponse(
+                block_is_sound=True,
+                coverage=records,
+            )
+        return ReviewerResponse(decision="accept")
+
+    client = ScriptedLLMClient()
+    client.default = reply
+    result = council(setup, client).run()
+
+    assert result.state is JobState.NEEDS_HUMAN_ATTENTION
+    assert client.call_count(AgentRole.FINAL_VERIFIER) == 0
+    assert len(
+        [
+            event
+            for event in list_events(db, "job-1")
+                if event["kind"] == "coverage_contradiction_unresolved"
+        ]
+    ) == 1
 
 
 def test_an_untouched_block_is_not_paid_for_twice(tmp_path, make_workbook):
@@ -2259,14 +2303,14 @@ def test_a_rediscovered_defect_does_not_get_a_fresh_attempt_budget(setup):
     )
 
 
-def test_an_issue_whose_defect_is_already_gone_is_superseded_not_repaired(
+def test_two_exact_defects_on_one_cell_need_no_model_repair(
     make_workbook, tmp_path
 ):
-    """Two issues on one block, and repairing the first resolves the second.
+    """Two exact defects on one cell are repaired sequentially without a Writer.
 
-    Sending the second to the Writer buys an escalation or an invented change, and pays
-    for a model call to get it. `SUPERSEDED` is the honest terminal state, and it counts
-    towards success because nothing is left wrong.
+    Whitespace removal leaves the caret defect, then the exponent rewrite finishes the
+    cell. Both findings therefore have an accepted deterministic repair in the ledger;
+    neither needs a model call or a misleading SUPERSEDED state.
     """
     source = make_workbook(
         [
@@ -2302,10 +2346,9 @@ def test_an_issue_whose_defect_is_already_gone_is_superseded_not_repaired(
     assert read_workbook(copy.path).blocks[0].rows[1].get(ColumnKey.ANSWER) == "x**2"
 
     states = {i.title.split(" at ")[0]: i.state for i in list_issues(db, "job-1")}
-    assert states["WHITESPACE_PADDING"] is IssueState.SUPERSEDED
+    assert states["WHITESPACE_PADDING"] is IssueState.ACCEPTED
     assert states["CARET_EXPONENT"] is IssueState.ACCEPTED
-    # One Writer call between them, not two.
-    assert client.call_count(AgentRole.WRITER) == 1
+    assert client.call_count(AgentRole.WRITER) == 0
 
 
 def test_a_reviewer_asking_for_a_revision_is_not_overruled_by_the_rule_being_satisfied(
@@ -2501,6 +2544,130 @@ def test_known_ascii_whitespace_and_namespace_repairs_use_no_model_calls(
     assert repaired.rows[-1].get(ColumnKey.HINT_ID) == "s2"
     assert client.call_count(AgentRole.WRITER) == 0
     assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+
+
+def test_exact_dependency_name_and_exponent_repairs_use_no_model_calls(
+    make_workbook, tmp_path
+):
+    """Contract-derived structure and notation do not need a Writer's opinion.
+
+    The deliberately wrong dependencies also trigger symptom rules such as unresolved
+    and self-reference. Registry order must not force those symptoms through a model
+    before the same deterministic pass's canonical chain rule supplies the exact value.
+    """
+    source = make_workbook(
+        [
+            problem("exact1", title="Evaluate", oer_src="source", license="CC"),
+            cells(
+                problem_name="",
+                row_type="step",
+                title="Square x",
+                answer="x^2",
+                answer_type="algebra",
+                dependency="h9",
+            ),
+            hint("exact1", "h1", dependency="h9", body="Start with x."),
+            hint("exact1", "h2", dependency="h9", body="Multiply x by itself."),
+            scaffold(
+                "exact1",
+                "s1",
+                dependency="s1",
+                answer="x*x",
+                answer_type="algebra",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "exact-structural.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "exact-structural")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client()
+
+    result = council((db, copy), client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    rows = read_workbook(copy.path).blocks[0].rows
+    assert rows[1].get(ColumnKey.PROBLEM_NAME) == "exact1"
+    assert rows[1].get(ColumnKey.ANSWER) == "x**2"
+    assert rows[1].get(ColumnKey.DEPENDENCY) == ""
+    assert rows[2].get(ColumnKey.DEPENDENCY) == ""
+    assert rows[3].get(ColumnKey.DEPENDENCY) == "h1"
+    assert rows[4].get(ColumnKey.DEPENDENCY) == "h2"
+    assert client.call_count(AgentRole.WRITER) == 0
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+
+
+def test_exact_latex_unescape_uses_no_model_repair_calls(make_workbook, tmp_path):
+    source = make_workbook(
+        [
+            problem("latex1", title="Name the angle", oer_src="source", license="CC"),
+            step("latex1", answer=r"$$\\theta$$", answer_type="algebra"),
+        ]
+    )
+    db = Database(tmp_path / "latex-unescape.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "latex-unescape")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    client = quiet_client()
+
+    result = council((db, copy), client).run()
+
+    assert result.state is JobState.SUCCEEDED, result.failure_reason
+    assert read_workbook(copy.path).blocks[0].rows[1].get(ColumnKey.ANSWER) == r"$$\theta$$"
+    assert client.call_count(AgentRole.WRITER) == 0
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 0
+
+
+def test_dependency_cleanup_refuses_a_structurally_ambiguous_shifted_row(
+    make_workbook, tmp_path
+):
+    """A dependency-looking value may be displaced content, not disposable content."""
+    source = make_workbook(
+        [
+            problem("shift1", title="Evaluate", oer_src="source", license="CC"),
+            cells(
+                problem_name="shift1",
+                row_type="step",
+                title="Evaluate",
+                answer="1",
+                answer_type="h1",
+                hint_id="h2",
+                dependency="h1",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "ambiguous-dependency.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "ambiguous-dependency")
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-1", source_filename=source.name, source_sha256=copy.source_sha256
+        ),
+    )
+    parsed = read_workbook(copy.path)
+    from oatutor_council.validation.rules import run_rules
+
+    finding = next(
+        finding
+        for finding in run_rules(parsed)
+        if finding.code == "STEP_HAS_DEPENDENCY"
+    )
+    issue = issue_from_finding(
+        finding,
+        job_id="job-1",
+        source=IssueSource.INITIAL_AUDITOR,
+    )
+    runner = council((db, copy), quiet_client())
+
+    assert runner._mechanical_patch(issue, parsed, parsed.blocks[0]) is None
 
 
 def test_unsupported_model_only_answer_type_claim_is_filtered(make_workbook, tmp_path):
@@ -2827,6 +2994,76 @@ def test_the_model_call_budget_is_a_real_fuse(setup):
     result = council(setup, client, llm_call_budget=1).run()
     assert result.state is JobState.FAILED
     assert result.failure_reason is FailureReason.BUDGET_EXHAUSTED
+
+
+def test_the_model_call_budget_scales_with_workbook_size_and_keeps_an_absolute_cap(setup):
+    one_block = council(
+        setup,
+        quiet_client(),
+        llm_call_budget=200,
+        llm_call_base_budget=10,
+        llm_calls_per_block_budget=7,
+    )
+    assert one_block.effective_call_budget == 17
+
+    absolute_cap = council(
+        setup,
+        quiet_client(),
+        llm_call_budget=12,
+        llm_call_base_budget=10,
+        llm_calls_per_block_budget=7,
+    )
+    assert absolute_cap.effective_call_budget == 12
+
+
+def test_a_resumed_job_keeps_the_call_allowance_it_started_with(setup):
+    started = council(
+        setup,
+        quiet_client(),
+        llm_call_budget=200,
+        llm_call_base_budget=10,
+        llm_calls_per_block_budget=7,
+    )
+    assert started.effective_call_budget == 17
+    # The first step performs the crash-recovery check; INGESTING is the second and pins
+    # behaviour before any model call.
+    started.run(max_steps=2)
+
+    resumed_after_environment_edit = council(
+        setup,
+        quiet_client(),
+        llm_call_budget=900,
+        llm_call_base_budget=500,
+        llm_calls_per_block_budget=100,
+    )
+    assert resumed_after_environment_edit.effective_call_budget == 17
+
+
+def test_generated_output_tokens_stop_the_next_physical_call(setup):
+    db, _ = setup
+    client = quiet_client()
+    guarded = council(
+        setup,
+        client,
+        llm_output_token_budget=100,
+        llm_output_token_base_budget=100,
+        llm_output_tokens_per_block_budget=1,
+    )
+    record_llm_call(
+        db,
+        "job-1",
+        role="initial_auditor",
+        model="mock",
+        status="completed",
+        prompt_sha256="a" * 64,
+        payload={"usage": {"output_tokens": 100}},
+    )
+
+    result = guarded.run()
+
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.BUDGET_EXHAUSTED
+    assert client.requests == []
 
 
 # --------------------------------------------------------------------------------------

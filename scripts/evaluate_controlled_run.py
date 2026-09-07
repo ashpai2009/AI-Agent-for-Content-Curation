@@ -92,10 +92,32 @@ def allowed_related_cells(key: dict[str, Any]) -> set[str]:
 
 
 def _has_automated_check(item: dict[str, Any]) -> bool:
-    return bool(item.get("cell")) and any(
-        key in item
-        for key in ("expected", "accepted", "mathEquivalentTo", "predicate")
+    """Whether a key supplies a machine-decidable success condition.
+
+    A prose hint is not machine-decidable merely because its author wrote one preferred
+    sentence in ``expected``. That mistake made two substantively correct repairs fail a
+    sealed score character-for-character. Predicates, accepted sets and mathematical
+    equivalence are explicit contracts. An exact prose string must likewise opt in with
+    ``comparison: exact``; otherwise title/body prose stays in the manual queue.
+    """
+    if not item.get("cell"):
+        return False
+    if any(key in item for key in ("accepted", "mathEquivalentTo", "predicate")):
+        return True
+    if "expected" not in item:
+        return False
+    expected = item.get("expected")
+    if item.get("comparison") == "exact":
+        return isinstance(expected, (str, int, float))
+    if not isinstance(expected, (str, int, float)):
+        return False
+    coordinate = str(item["cell"]).upper()
+    column = "".join(character for character in coordinate if character.isalpha())
+    kind = str(item.get("kind") or "").casefold()
+    instructional_prose = column in {"C", "D"} and any(
+        marker in kind for marker in ("hint", "instruction", "wording", "explanation")
     )
+    return not (instructional_prose and isinstance(expected, str))
 
 
 def evaluate_item(item: dict[str, Any], sheet) -> tuple[bool, str, str]:

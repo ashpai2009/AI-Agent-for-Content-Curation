@@ -52,13 +52,16 @@ from oatutor_council.persistence import (
     list_artifacts,
     list_changes,
     list_events,
+    list_jobs,
     load_ledger,
     next_issue_for_phase,
     open_apply_intent,
     open_apply_intents,
     open_attempts,
+    output_tokens_used,
     record_artifact,
     record_changes,
+    record_llm_call,
     save_issue,
     settle_apply_intent,
     settle_attempt,
@@ -129,6 +132,22 @@ def test_a_job_round_trips(db, job):
     stored = get_job(db, "job-1")
     assert stored.source_sha256 == "abc123"
     assert stored.state is JobState.CREATED
+
+
+def test_job_history_is_newest_first_and_bounded(db, job):
+    create_job(
+        db,
+        CurationJob(
+            job_id="job-2",
+            source_filename="newer.xlsx",
+            source_sha256="def456",
+            created_at=job.created_at + timedelta(seconds=1),
+            updated_at=job.updated_at + timedelta(seconds=1),
+        ),
+    )
+
+    assert [item.job_id for item in list_jobs(db, limit=1)] == ["job-2"]
+    assert [item.job_id for item in list_jobs(db, limit=20)] == ["job-2", "job-1"]
 
 
 def test_an_illegal_transition_is_refused_at_the_database(db, job):
@@ -454,6 +473,22 @@ def test_recording_an_artifact_twice_updates_it(db, job):
     record_artifact(db, "job-1", ArtifactKind.CORRECTED_WORKBOOK, "out/v1.xlsx")
     record_artifact(db, "job-1", ArtifactKind.CORRECTED_WORKBOOK, "out/v2.xlsx")
     assert list_artifacts(db, "job-1")[ArtifactKind.CORRECTED_WORKBOOK] == "out/v2.xlsx"
+
+
+def test_output_token_total_ignores_missing_and_non_numeric_usage(db, job):
+    for output in (125, 75, None, "not-a-number"):
+        usage = {} if output is None else {"output_tokens": output}
+        record_llm_call(
+            db,
+            "job-1",
+            role="initial_auditor",
+            model="mock",
+            status="completed",
+            prompt_sha256="a" * 64,
+            payload={"usage": usage, "user_payload": "large text need not be loaded"},
+        )
+
+    assert output_tokens_used(db, "job-1") == 200
 
 
 # --------------------------------------------------------------------------------------

@@ -419,7 +419,7 @@ def test_an_image_only_pdf_is_a_clear_error_and_starts_no_job(
 def test_no_job_is_left_behind_when_the_document_is_rejected(client, workbook_bytes, tmp_path):
     scan = write_image_only_pdf(tmp_path / "scan.pdf").read_bytes()
     submit(client, workbook_bytes, instructions=("scan.pdf", scan, "application/pdf"))
-    assert client.get("/jobs").status_code in (404, 405)  # no listing endpoint
+    assert client.get("/jobs").json() == {"jobs": []}
     # Nothing was recorded, so nothing can be polled or downloaded.
     from oatutor_council.persistence import claimable_jobs
 
@@ -446,6 +446,25 @@ def test_status_is_pollable_before_the_job_runs(client, workbook_bytes):
     body = client.get(f"/jobs/{job_id}").json()
     assert body["state"] == "created"
     assert body["succeeded"] is False
+
+
+def test_recent_jobs_restore_durable_history_without_private_data(client, workbook_bytes):
+    first = submit(client, workbook_bytes, name="first.xlsx").json()["job_id"]
+    second = submit(client, workbook_bytes, name="second.xlsx").json()["job_id"]
+
+    response = client.get("/jobs")
+    assert response.status_code == 200
+    jobs = response.json()["jobs"]
+    assert [item["job_id"] for item in jobs[:2]] == [second, first]
+    assert jobs[0]["source_filename"] == "second.xlsx"
+    assert set(jobs[0]) == {
+        "job_id",
+        "state",
+        "source_filename",
+        "created_at",
+        "updated_at",
+        "llm_calls_used",
+    }
 
 
 def test_an_unknown_job_is_a_404(client):
@@ -503,6 +522,7 @@ def test_no_response_ever_leaks_a_filesystem_path(client, workbook_bytes, tmp_pa
         submit(client, workbook_bytes),
         submit(client, b"not a workbook"),
         submit(client, workbook_bytes, name="../../etc/passwd.xlsx"),
+        client.get("/jobs"),
         client.get("/jobs/nope"),
     ]
     job_id = responses[0].json()["job_id"]
@@ -751,6 +771,12 @@ def test_the_status_and_report_agree_about_what_the_job_cost(client, workbook_by
     report = client.get(f"/jobs/{job_id}/report").json()
     assert status["usage"]["calls"] == report["model_usage"]["calls"] > 0
     assert status["usage"]["calls"] == status["llm_calls_used"]
+    # This fixture has one problem block: 20 base calls + 6 per block, below the
+    # absolute 200-call test setting. The UI therefore exposes the real fuse rather than
+    # suggesting the whole absolute allowance is available to a tiny workbook.
+    assert status["llm_call_budget"] == 26
+    assert status["llm_output_token_budget"] == 50_000
+    assert status["usage"]["output_tokens"] >= 0
 
 
 # --------------------------------------------------------------------------------------

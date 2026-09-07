@@ -476,6 +476,23 @@ def get_job(db: Database, job_id: str) -> CurationJob | None:
     return _job_from_row(row) if row else None
 
 
+def list_jobs(db: Database, *, limit: int = 20) -> tuple[CurationJob, ...]:
+    """Newest durable jobs for the local curator's history page.
+
+    This deliberately returns job metadata only. Workbook contents, private model
+    reasoning, prompts, and filesystem paths belong behind the per-job endpoints and
+    never become part of a convenient list response.
+    """
+    bounded = max(1, min(int(limit), 100))
+    rows = db.connection.execute(
+        """SELECT * FROM jobs
+           ORDER BY created_at DESC, job_id DESC
+           LIMIT ?""",
+        (bounded,),
+    ).fetchall()
+    return tuple(_job_from_row(row) for row in rows)
+
+
 def _job_from_row(row: sqlite3.Row) -> CurationJob:
     return CurationJob(
         job_id=row["job_id"],
@@ -1263,6 +1280,31 @@ def token_usage(db: Database, job_id: str) -> dict[str, int]:
             if isinstance(value, (int, float)):
                 totals[name] += int(value)
     return totals
+
+
+def output_tokens_used(db: Database, job_id: str) -> int:
+    """Provider-reported generated tokens without loading historical prompt payloads.
+
+    The call fuse asks this before every physical invocation. Reusing `token_usage` there
+    would deserialize every system prompt and user payload on every call, turning a
+    long-running job into quadratic local work merely to read one number.
+
+    Usage values are normalized by the recorder before persistence. Older or failed rows
+    may have no value; SQLite's numeric cast plus `COALESCE` treats those as zero, matching
+    `token_usage`'s historical behavior.
+    """
+    row = db.connection.execute(
+        """SELECT COALESCE(SUM(
+                   CASE WHEN json_type(payload_json, '$.usage.output_tokens')
+                                  IN ('integer', 'real')
+                        THEN CAST(json_extract(payload_json, '$.usage.output_tokens') AS INTEGER)
+                        ELSE 0 END
+               ), 0) AS total
+           FROM llm_calls
+           WHERE job_id = ?""",
+        (job_id,),
+    ).fetchone()
+    return int(row["total"]) if row else 0
 
 
 def relative_to_data_root(path: str | Path, data_root: Path) -> str:

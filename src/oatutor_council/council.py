@@ -50,6 +50,7 @@ from .agents.rendering import (
     render_findings,
 )
 from .agents.coverage import self_contradicting
+from .agents.schemas import RowCoverage
 from .agents.isolation import ContextIsolationError, TaintRegistry
 from .config import Settings
 from .ingestion.instruction_documents import SegmentPurpose, referenced_locations
@@ -114,6 +115,7 @@ from .persistence import (
     list_artifacts,
     list_claim_results,
     list_issues,
+    latest_coverage,
     load_instruction_segments,
     load_ledger,
     load_job_settings,
@@ -125,6 +127,7 @@ from .persistence import (
     save_private_blob,
     mark_block_done,
     next_attempt_number,
+    output_tokens_used,
     record_artifact,
     record_coverage,
     record_claim_result,
@@ -378,7 +381,7 @@ FINAL_GATE_ROUND = 1_000
 #: Initial Auditor invocations to ``Reached maximum number of turns (3)``. Both envelopes
 #: reported a fourth turn; the first retry succeeded, proving the lower ceiling was again
 #: paying twice for one prompt. The job was stopped before more allowance was wasted.
-CLI_ADAPTER_VERSION = 5
+CLI_ADAPTER_VERSION = 7
 
 #: Version of orchestration and user-payload construction that changes what agents see or
 #: when workbook bytes are committed. Prompt files are pinned separately; this covers the
@@ -429,7 +432,12 @@ CLI_ADAPTER_VERSION = 5
 #: 16 (2026-09-05): claim-blind Independent Reviewer checks and final semantic
 #: verification share bounded multi-block calls. Per-block opaque attribution and final
 #: round accounting preserve the old safety decisions while changing call topology.
-PIPELINE_CONTRACT_VERSION = 16
+#: 17 (2026-09-05): physical-call capacity is pinned and scaled to immutable source block
+#: count under an absolute ceiling, so a small workbook cannot consume a chapter's fuse.
+#: 18 (2026-09-06): a contradictory latest independent sweep of unchanged content cannot
+#: end in SUCCEEDED; it goes to a curator without another model call. Audit prompts also
+#: use distinct math-first and instruction-first attention order, pinned in prompt files.
+PIPELINE_CONTRACT_VERSION = 18
 
 
 class BudgetExhausted(Exception):
@@ -722,13 +730,50 @@ class CurationCouncil:
         intention to make one. A retried outage and a schema retry each cost a real call,
         and both used to be free.
         """
-        if self.job.llm_calls_used + 1 > self.settings.llm_call_budget:
+        allowance = self.effective_call_budget
+        if self.job.llm_calls_used + 1 > allowance:
             raise BudgetExhausted(
-                f"job exceeded its model-call budget of {self.settings.llm_call_budget}"
+                f"job exceeded its size-aware model-call budget of {allowance} "
+                f"for {len(self.source_workbook().blocks)} problem block(s)"
+            )
+        output_tokens = output_tokens_used(self.db, self.job_id)
+        output_allowance = self.effective_output_token_budget
+        if output_tokens >= output_allowance:
+            raise BudgetExhausted(
+                f"job generated {output_tokens} output tokens, reaching its size-aware "
+                f"output-token budget of {output_allowance}"
             )
         increment_counters(
             self.db, self.job_id, run_epoch=self.run_epoch, llm_calls=1
         )
+
+    @property
+    def effective_call_budget(self) -> int:
+        """Maximum physical CLI invocations this workbook may consume.
+
+        Scaling from the immutable source workbook makes the limit predictable before
+        the first call and prevents a one-block upload from receiving the same allowance
+        as a chapter. The absolute setting remains the operator's final ceiling.
+        """
+        sized = self.settings.llm_call_base_budget + (
+            len(self.source_workbook().blocks)
+            * self.settings.llm_calls_per_block_budget
+        )
+        return min(self.settings.llm_call_budget, sized)
+
+    @property
+    def effective_output_token_budget(self) -> int:
+        """Generated-token ceiling, excluding cache creation and cache reads.
+
+        Provider usage arrives only after a call, so one physical call may overshoot this
+        boundary. The next call is refused. The process-output byte cap remains the guard
+        against one pathological response; this fuse bounds continued generation.
+        """
+        sized = self.settings.llm_output_token_base_budget + (
+            len(self.source_workbook().blocks)
+            * self.settings.llm_output_tokens_per_block_budget
+        )
+        return min(self.settings.llm_output_token_budget, sized)
 
     def _advance(self, target: JobState, reason: FailureReason | None = None) -> None:
         transition_job(
@@ -847,7 +892,7 @@ class CurationCouncil:
     def _behaviour_settings(self) -> dict[str, object]:
         """What must not change under a running job.
 
-        Two kinds of entry, and they are enforced differently. The first four are
+        Two kinds of entry, and they are enforced differently. Behaviour entries are
         *re-applied* on resume, which is enforcement enough: whatever the environment says
         now, the job runs at the batch size and model it started with. `cli_adapter_version`
         cannot be re-applied -- it names the code, and the code is whatever was deployed --
@@ -862,6 +907,16 @@ class CurationCouncil:
             },
             "model": self.settings.claude_model,
             "provider_timeout_seconds": self.settings.provider_timeout_seconds,
+            "llm_call_budget": self.settings.llm_call_budget,
+            "llm_call_base_budget": self.settings.llm_call_base_budget,
+            "llm_calls_per_block_budget": self.settings.llm_calls_per_block_budget,
+            "effective_llm_call_budget": self.effective_call_budget,
+            "llm_output_token_budget": self.settings.llm_output_token_budget,
+            "llm_output_token_base_budget": self.settings.llm_output_token_base_budget,
+            "llm_output_tokens_per_block_budget": (
+                self.settings.llm_output_tokens_per_block_budget
+            ),
+            "effective_llm_output_token_budget": self.effective_output_token_budget,
             "cli_adapter_version": CLI_ADAPTER_VERSION,
             "pipeline_contract_version": PIPELINE_CONTRACT_VERSION,
         }
@@ -896,6 +951,37 @@ class CurationCouncil:
             provider_timeout_seconds=float(
                 pinned.get(
                     "provider_timeout_seconds", self.settings.provider_timeout_seconds
+                )
+            ),
+            llm_call_budget=int(
+                pinned.get("llm_call_budget", self.settings.llm_call_budget)
+            ),
+            llm_call_base_budget=int(
+                pinned.get(
+                    "llm_call_base_budget", self.settings.llm_call_base_budget
+                )
+            ),
+            llm_calls_per_block_budget=int(
+                pinned.get(
+                    "llm_calls_per_block_budget",
+                    self.settings.llm_calls_per_block_budget,
+                )
+            ),
+            llm_output_token_budget=int(
+                pinned.get(
+                    "llm_output_token_budget", self.settings.llm_output_token_budget
+                )
+            ),
+            llm_output_token_base_budget=int(
+                pinned.get(
+                    "llm_output_token_base_budget",
+                    self.settings.llm_output_token_base_budget,
+                )
+            ),
+            llm_output_tokens_per_block_budget=int(
+                pinned.get(
+                    "llm_output_tokens_per_block_budget",
+                    self.settings.llm_output_tokens_per_block_budget,
                 )
             ),
         )
@@ -1890,7 +1976,8 @@ class CurationCouncil:
         # being handed back. Another accepted repair can resolve a deterministic issue
         # after that issue exhausted its own attempts. Re-derive those escalations against
         # the final workbook so “needs a person” never points at a defect that is gone.
-        self._reconcile_stale_escalations(self.current_workbook())
+        current = self.current_workbook()
+        self._reconcile_stale_escalations(current)
         ledger = load_ledger(self.db, self.job_id)
 
         outputs = self.copy.path.parent.parent / "outputs"
@@ -1940,12 +2027,14 @@ class CurationCouncil:
         # change, and there is no honest way to call that finished.
         verified = blocks_done(self.db, self.job_id, FINAL_SEMANTIC_PHASE)
         unverified_blocks = sorted(self._final_semantic_targets() - verified)
+        unresolved_coverage = self._unresolved_coverage_contradictions(current)
         succeeded = (
             gate.passed
             and ledger.all_resolved
             and not remaining
             and not unverified
             and not unverified_blocks
+            and not unresolved_coverage
         )
         if unverified_blocks:
             record_event(
@@ -1955,6 +2044,18 @@ class CurationCouncil:
                 f"{len(unverified_blocks)} block(s) were not semantically verified "
                 "against the workbook as it now stands: "
                 + ", ".join(sorted(unverified_blocks)),
+            )
+        if unresolved_coverage:
+            details = ", ".join(
+                f"{block_id} row(s) {', '.join(str(row) for row in rows)}"
+                for block_id, rows in unresolved_coverage.items()
+            )
+            record_event(
+                self.db,
+                self.job_id,
+                "coverage_contradiction_unresolved",
+                "the latest independent check of unchanged content contradicted itself: "
+                + details,
             )
         final_state = (
             JobState.SUCCEEDED if succeeded else JobState.NEEDS_HUMAN_ATTENTION
@@ -1995,6 +2096,39 @@ class CurationCouncil:
         # `SUCCEEDED` is set here and nowhere else, guarded by every gate.
         self._advance(final_state)
         return StepOutcome(True, reports.validation_report["unresolved_summary"], final_state)
+
+    def _unresolved_coverage_contradictions(
+        self, current: ParsedWorkbook
+    ) -> dict[str, tuple[int, ...]]:
+        """Contradictory checks that still describe the handed-back workbook.
+
+        Changed blocks are governed by their post-edit final-semantic marker, which is
+        already withheld when that verifier contradicts itself. For an unchanged block,
+        the Independent Reviewer's latest sweep is the last semantic statement about the
+        exact bytes being handed back. If that statement says both "correct" and
+        "computed differs", silence is not a safe success condition and no extra model
+        call is justified: the row goes to the curator.
+
+        Initial-audit contradictions are intentionally absent. A later clean sweep
+        supersedes them; blocking forever on historical uncertainty would turn an audit
+        trail into a retry trap rather than evaluate the current artifact.
+        """
+        changed = self._final_semantic_targets()
+        unresolved: dict[str, tuple[int, ...]] = {}
+        for block in current.blocks:
+            if block.block_id in changed:
+                continue
+            raw = latest_coverage(
+                self.db,
+                self.job_id,
+                phase="swept",
+                block_id=block.block_id,
+            )
+            records = tuple(RowCoverage.model_validate(item) for item in raw)
+            rows = self_contradicting(records, graded_rows=block.graded_rows)
+            if rows:
+                unresolved[block.block_id] = rows
+        return unresolved
 
     def _reconcile_stale_escalations(self, parsed: ParsedWorkbook) -> None:
         changes = list_changes(self.db, self.job_id)
@@ -2658,6 +2792,57 @@ class CurationCouncil:
             return None
         before = row.get(key)
         code = issue.rule_codes[0]
+        derivation = ""
+
+        # A dependency in the wrong place can also be the visible edge of a shifted row.
+        # In that case clearing or replacing it would destroy displaced source content
+        # before the structural repair sees it. Exact dependency automation is therefore
+        # available only when the row has no independent evidence of structural ambiguity.
+        structural_ambiguity = {
+            "ROW_SHIFT_RIGHT",
+            "COLUMN_SHIFT",
+            "BLOCK_BOUNDARY_DISAGREEMENT",
+            "PROBLEM_NAME_MISMATCH_IN_BLOCK",
+            "UNKNOWN_ROW_TYPE",
+            "INVALID_ANSWER_TYPE",
+            "ROW_HAS_FORBIDDEN_CONTENT",
+        }
+        row_is_ambiguous = any(
+            finding.row == row_number and finding.code in structural_ambiguity
+            for finding in self._findings_for_block(parsed, block)
+        )
+        chain_code = code
+        chain_expected = issue.expected.strip()
+        if code in {
+            "DEPENDENCY_UNRESOLVED",
+            "DEPENDENCY_ON_LATER_ROW",
+            "DEPENDENCY_ON_SELF",
+            "DEPENDENCY_CROSSES_STEP",
+        }:
+            # Several rules can describe one bad dependency cell. The queue may select
+            # the symptom (unresolved/self/later/cross-step) before the rule that carries
+            # the exact contract-derived replacement. Recompute the latter rather than
+            # paying a Writer because of registry order; the selected issue still has to
+            # be resolved by the candidate and the ordinary patch gate checks that.
+            canonical = next(
+                (
+                    finding
+                    for finding in self._findings_for_block(parsed, block)
+                    if finding.row == row_number
+                    and finding.column == column_number
+                    and finding.code
+                    in {
+                        "STEP_HAS_DEPENDENCY",
+                        "FIRST_HINT_HAS_DEPENDENCY",
+                        "HINT_DEPENDENCY_NOT_PREVIOUS",
+                        "SCAFFOLD_DEPENDENCY_NOT_HINT",
+                    }
+                ),
+                None,
+            )
+            if canonical is not None:
+                chain_code = canonical.code
+                chain_expected = str(canonical.detail.get("expected") or "").strip()
 
         if code == "WHITESPACE_PADDING":
             if len(issue.cells) != 1:
@@ -2666,6 +2851,7 @@ class CurationCouncil:
             if not before or after == before:
                 return None
             reason = "remove leading or trailing whitespace exactly"
+            derivation = "boundary whitespace changes no mathematical token"
             edits = (
                 CellEdit(
                     row=row_number,
@@ -2682,6 +2868,7 @@ class CurationCouncil:
             if not before or after == before:
                 return None
             reason = "replace prohibited whitespace runs with one ordinary space"
+            derivation = "whitespace normalization preserves the mathematical token sequence"
             edits = (
                 CellEdit(
                     row=row_number,
@@ -2698,6 +2885,7 @@ class CurationCouncil:
             if after is None or after == before:
                 return None
             reason = "replace known Unicode glyphs with their exact ASCII spelling"
+            derivation = "the replacement is the workbook's exact spelling of the same symbol"
             edits = (
                 CellEdit(
                     row=row_number,
@@ -2774,6 +2962,85 @@ class CurationCouncil:
                     after=after,
                 ),
             )
+        elif code == "ROW_MISSING_PROBLEM_NAME" and key is ColumnKey.PROBLEM_NAME:
+            if len(issue.cells) != 1 or before.strip() or not block.problem_name.strip():
+                return None
+            after = block.problem_name
+            reason = "repeat the unambiguous enclosing block name on its populated row"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif code == "CARET_EXPONENT":
+            if len(issue.cells) != 1 or "^" not in before:
+                return None
+            after = before.replace("^", "**")
+            reason = "replace the ASCII exponent marker with the required double asterisk"
+            derivation = "only the exponent operator spelling changes; its operands are unchanged"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif code == "DOUBLE_ESCAPED_BACKSLASH":
+            if len(issue.cells) != 1:
+                return None
+            after = re.sub(r"\\\\(?=[A-Za-z])", lambda _match: "\\", before)
+            if after == before:
+                return None
+            reason = "remove one accidental escape before each LaTeX command"
+            derivation = "the LaTeX command is unchanged after removing its extra escape"
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
+        elif chain_code in {
+            "STEP_HAS_DEPENDENCY",
+            "FIRST_HINT_HAS_DEPENDENCY",
+            "HINT_DEPENDENCY_NOT_PREVIOUS",
+            "SCAFFOLD_DEPENDENCY_NOT_HINT",
+        }:
+            if len(issue.cells) != 1 or key is not ColumnKey.DEPENDENCY or row_is_ambiguous:
+                return None
+            if chain_code in {"STEP_HAS_DEPENDENCY", "FIRST_HINT_HAS_DEPENDENCY"}:
+                after = ""
+            else:
+                after = chain_expected
+                # An expected empty dependency is legitimate only for a scaffold with no
+                # preceding hint. The registered rule derived it; do not infer it here.
+                if chain_code == "HINT_DEPENDENCY_NOT_PREVIOUS" and not after:
+                    return None
+            if after == before:
+                return None
+            reason = {
+                "STEP_HAS_DEPENDENCY": "clear a dependency from a row type that cannot carry one",
+                "FIRST_HINT_HAS_DEPENDENCY": "start the hint chain without a prerequisite",
+                "HINT_DEPENDENCY_NOT_PREVIOUS": "point the hint at the immediately preceding hint",
+                "SCAFFOLD_DEPENDENCY_NOT_HINT": "point the scaffold at its nearest preceding hint",
+            }[chain_code]
+            edits = (
+                CellEdit(
+                    row=row_number,
+                    column=column_number,
+                    column_key=key,
+                    before=before,
+                    after=after,
+                ),
+            )
         elif code == "STEP_TITLE_DUPLICATES_BODY" and key is ColumnKey.BODY_TEXT:
             if len(issue.cells) != 1:
                 return None
@@ -2840,11 +3107,7 @@ class CurationCouncil:
             attempt_no=1,
             edits=edits,
             reason=reason,
-            derivation=(
-                "removing boundary whitespace preserves the mathematical value exactly"
-                if code == "WHITESPACE_PADDING"
-                else ""
-            ),
+            derivation=derivation,
         )
 
     def _apply_mechanical_patch(

@@ -1,8 +1,8 @@
 """The HTTP surface.
 
 `POST /jobs` returns `202` immediately and the council runs on a worker thread. Progress
-is observable through `GET /jobs/{id}`, which never blocks on an in-flight write because
-the database is in WAL mode.
+is observable through `GET /jobs/{id}`, and safe recent-run metadata through `GET /jobs`;
+neither blocks on an in-flight write because the database is in WAL mode.
 
 Work runs on a `ThreadPoolExecutor` created in the lifespan, **not** on FastAPI's
 `BackgroundTasks`. Background tasks are tied to the request lifetime and give no
@@ -45,7 +45,9 @@ from .persistence import (
     list_changes,
     list_claim_results,
     list_events,
+    list_jobs,
     list_verdicts,
+    load_job_settings,
     load_instruction_segments,
     load_ledger,
     record_artifact,
@@ -444,10 +446,30 @@ def create_app(
             raise HTTPException(status_code=404, detail="no such job")
         return job
 
+    @app.get("/jobs")
+    async def recent_jobs(limit: int = 20) -> dict[str, Any]:
+        """Return resumable local history without exposing workbook or prompt data."""
+        jobs = list_jobs(database, limit=limit)
+        return {
+            "jobs": [
+                {
+                    "job_id": job.job_id,
+                    "state": job.state.value,
+                    "source_filename": job.source_filename,
+                    "created_at": job.created_at.isoformat(),
+                    "updated_at": job.updated_at.isoformat(),
+                    "llm_calls_used": job.llm_calls_used,
+                }
+                for job in jobs
+            ]
+        }
+
     @app.get("/jobs/{job_id}")
     async def job_status(job_id: str) -> dict[str, Any]:
         job = _job_or_404(job_id)
         ledger = load_ledger(database, job_id)
+        pinned = load_job_settings(database, job_id)
+        usage = token_usage(database, job_id)
         return {
             "job_id": job.job_id,
             "state": job.state.value,
@@ -459,10 +481,21 @@ def create_app(
             "validation_rounds_used": job.validation_rounds_used,
             "steps_used": job.steps_used,
             "llm_calls_used": job.llm_calls_used,
+            "llm_call_budget": int(
+                pinned.get(
+                    "effective_llm_call_budget", resolved.llm_call_budget
+                )
+            ),
+            "llm_output_token_budget": int(
+                pinned.get(
+                    "effective_llm_output_token_budget",
+                    resolved.llm_output_token_budget,
+                )
+            ),
             # From the recorded calls rather than the counter: the counter is a fuse and
             # is reserved before a call, so it says what was *spent*, while this says what
             # actually happened -- including the calls that failed.
-            "usage": token_usage(database, job_id),
+            "usage": usage,
         }
 
     @app.get("/jobs/{job_id}/issues")

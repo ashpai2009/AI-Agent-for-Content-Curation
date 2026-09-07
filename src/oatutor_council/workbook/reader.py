@@ -433,21 +433,13 @@ def _build_block(index: int, span: list[WorkbookRow]) -> ProblemBlock:
             )
 
         name = row.get(ColumnKey.PROBLEM_NAME).strip()
-        if not name:
-            block_findings.append(
-                ValidationFinding(
-                    code=StructuralCode.MISSING_PROBLEM_NAME,
-                    severity=Severity.WARNING,
-                    scope=FindingScope.CELL,
-                    row=row.row,
-                    column=FIXED_COLUMNS[ColumnKey.PROBLEM_NAME],
-                    column_key=ColumnKey.PROBLEM_NAME,
-                    block_id=block_id,
-                    problem_name=declared_name or None,
-                    message="row inside a block has no Problem Name",
-                )
-            )
-        elif declared_name and name != declared_name:
+        # A missing name on an interior row is exact, repairable validation owned by
+        # ROW_MISSING_PROBLEM_NAME. Emitting a second parser finding here created two
+        # issues for one cell; the parser-only duplicate had no registered rule, went
+        # through blind corroboration, and could leave a fully repaired workbook needing
+        # a person. The reader still owns disagreement, because that bears on whether the
+        # row belongs to this block at all. A missing name does not.
+        if name and declared_name and name != declared_name:
             mismatched.append(row.row)
             block_findings.append(
                 ValidationFinding(

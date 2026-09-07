@@ -43,6 +43,7 @@ from oatutor_council.llm.claude_cli import (
     child_environment,
     classify_cli_failure,
     describe_authentication,
+    extract_model_name,
     extract_structured_output,
     extract_usage,
     find_reset_time,
@@ -180,6 +181,7 @@ def test_the_call_carries_the_configured_turn_ceiling(tmp_path, recorder):
     sent = args.read_text().splitlines()
 
     assert sent[sent.index("--max-turns") + 1] == str(configured.claude_max_turns)
+    assert sent[sent.index("--prompt-suggestions") + 1] == "false"
 
 
 def test_the_turn_ceiling_is_a_setting_rather_than_a_literal(tmp_path, recorder):
@@ -587,6 +589,16 @@ def test_usage_carries_cache_tokens_through():
     assert usage["cache_read_tokens"] == 8
     assert usage["cache_creation_tokens"] == 2
     assert usage["duration_ms"] == 900
+
+
+def test_the_exact_model_snapshot_is_read_from_model_usage():
+    envelope = {"modelUsage": {"claude-sonnet-4-6-20260901": {"outputTokens": 10}}}
+    assert extract_model_name(envelope, "sonnet") == "claude-sonnet-4-6-20260901"
+
+
+def test_ambiguous_model_usage_does_not_invent_a_primary_model():
+    envelope = {"modelUsage": {"model-a": {}, "model-b": {}}}
+    assert extract_model_name(envelope, "sonnet") == "sonnet"
 
 
 def test_no_dollar_cost_is_ever_derived():

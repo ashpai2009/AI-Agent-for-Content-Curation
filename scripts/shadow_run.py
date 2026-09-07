@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import shutil
 import sys
 import tempfile
@@ -36,8 +37,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from oatutor_council.agents.schemas import (  # noqa: E402
     AdjudicatorResponse,
+    AuditorBlockResult,
     AuditorResponse,
+    BatchedAuditorResponse,
+    BatchedFinalVerificationResponse,
+    BatchedIndependentReviewResponse,
+    BlockReviewerResponse,
+    BlockWriterResponse,
+    FinalVerificationBlockResult,
     FinalVerificationResponse,
+    IndependentBlockResult,
     RowCoverage,
     IndependentReviewResponse,
     ReviewerResponse,
@@ -99,6 +108,18 @@ def _coverage(payload: str) -> list[RowCoverage]:
     ]
 
 
+def _batch_sections(payload: str) -> list[tuple[str, str]]:
+    """Opaque batch id paired with only the rendered block under that id."""
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"SECTION: batch_item=([^;]+);[^\n]*\n(.*?)(?=<<<END UNTRUSTED DATA)",
+            payload,
+            flags=re.DOTALL,
+        )
+    ]
+
+
 def observer_client() -> ScriptedLLMClient:
     """An agent set that looks and never touches.
 
@@ -108,6 +129,7 @@ def observer_client() -> ScriptedLLMClient:
     """
     replies = {
         AgentRole.WRITER: WriterResponse(
+            derivation="",
             needs_human_review=True,
             human_review_reason="shadow run: no repairs are proposed",
         ),
@@ -122,15 +144,70 @@ def observer_client() -> ScriptedLLMClient:
     client = ScriptedLLMClient()
 
     def reply(request):
+        if "Issues and candidate edits" in request.user_payload:
+            issue_ids = re.findall(
+                r"^issue_id: ([^\n]+)$", request.user_payload, re.MULTILINE
+            )
+            return BlockReviewerResponse(
+                results=[
+                    {"issue_id": issue_id, "decision": "accept"}
+                    for issue_id in issue_ids
+                ]
+            )
+        if request.role is AgentRole.WRITER and "Issues to resolve together" in request.user_payload:
+            issue_ids = re.findall(
+                r"^issue_id: ([^\n]+)$", request.user_payload, re.MULTILINE
+            )
+            return BlockWriterResponse(
+                results=[
+                    {
+                        "issue_id": issue_id,
+                        "proposal": replies[AgentRole.WRITER],
+                    }
+                    for issue_id in issue_ids
+                ]
+            )
         # The two scan roles answer per call, because coverage is about the block this
         # call was sent and a fixed response cannot know which one that is.
         if request.role is AgentRole.INITIAL_AUDITOR:
+            if sections := _batch_sections(request.user_payload):
+                return BatchedAuditorResponse(
+                    results=[
+                        AuditorBlockResult(
+                            batch_item_id=item_id,
+                            coverage=_coverage(section),
+                        )
+                        for item_id, section in sections
+                    ]
+                )
             return AuditorResponse(coverage=_coverage(request.user_payload))
         if request.role is AgentRole.INDEPENDENT_REVIEWER:
+            if sections := _batch_sections(request.user_payload):
+                return BatchedIndependentReviewResponse(
+                    results=[
+                        IndependentBlockResult(
+                            batch_item_id=item_id,
+                            block_is_sound=True,
+                            coverage=_coverage(section),
+                        )
+                        for item_id, section in sections
+                    ]
+                )
             return IndependentReviewResponse(
                 block_is_sound=True, coverage=_coverage(request.user_payload)
             )
         if request.role is AgentRole.FINAL_VERIFIER:
+            if sections := _batch_sections(request.user_payload):
+                return BatchedFinalVerificationResponse(
+                    results=[
+                        FinalVerificationBlockResult(
+                            batch_item_id=item_id,
+                            block_is_sound=True,
+                            coverage=_coverage(section),
+                        )
+                        for item_id, section in sections
+                    ]
+                )
             return FinalVerificationResponse(
                 block_is_sound=True, coverage=_coverage(request.user_payload)
             )

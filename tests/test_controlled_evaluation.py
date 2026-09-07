@@ -92,6 +92,69 @@ def test_a_key_without_a_machine_check_stays_manual():
     assert len(manual) == 1
 
 
+def test_one_preferred_hint_sentence_is_not_an_automated_exact_check():
+    """Instructional quality permits correct wording the fixture author did not choose."""
+    automated, manual = keyed_items(
+        {
+            "defectGroups": [
+                {
+                    "problemName": "p1",
+                    "kind": "wrong_hint",
+                    "corrections": [
+                        {
+                            "cell": "D4",
+                            "expected": "Subtract 5 from both sides, then divide by 2.",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert automated == []
+    assert [item["cell"] for item in manual] == ["D4"]
+
+
+def test_a_fixture_can_explicitly_require_exact_prose_when_that_is_the_contract():
+    automated, manual = keyed_items(
+        {
+            "defectGroups": [
+                {
+                    "problemName": "p1",
+                    "kind": "required_copy",
+                    "corrections": [
+                        {
+                            "cell": "D4",
+                            "expected": "Use this required sentence.",
+                            "comparison": "exact",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert [item["cell"] for item in automated] == ["D4"]
+    assert manual == []
+
+
+def test_structural_cell_moves_remain_machine_checked():
+    """Prose values are exact when the defect is structural, not instructional."""
+    automated, manual = keyed_items(
+        {
+            "defectGroups": [
+                {
+                    "problemName": "p1",
+                    "kind": "row_shift_right",
+                    "corrections": [
+                        {"cell": "D4", "expected": "Body text restored to its column."}
+                    ],
+                }
+            ]
+        }
+    )
+    assert [item["cell"] for item in automated] == ["D4"]
+    assert manual == []
+
+
 def test_known_source_defects_are_separate_from_the_planted_score():
     key = {
         "defectGroups": [

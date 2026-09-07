@@ -90,6 +90,10 @@ def _describe_envelope(stdout: str) -> None:
     else:
         print(f"  usage: absent or not an object ({type(usage).__name__})")
 
+    model_usage = envelope.get("modelUsage") or envelope.get("model_usage")
+    if isinstance(model_usage, dict):
+        print(f"  exact model ids: {sorted(str(name) for name in model_usage)}")
+
     for field in ("subtype", "is_error", "model", "duration_ms", "num_turns"):
         if field in envelope:
             value = envelope[field]

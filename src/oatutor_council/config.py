@@ -39,6 +39,22 @@ DEFAULT_PROVIDER_FAILURE_BUDGET = 12
 DEFAULT_RUN_DEADLINE_SECONDS = 21_600.0
 DEFAULT_RETENTION_DAYS = 30.0
 
+#: The model-call fuse has two layers. The absolute ceiling protects the subscription
+#: from a malformed or unexpectedly large workbook; the size allowance prevents a tiny
+#: pilot from inheriting that entire ceiling. These are deliberately generous relative
+#: to the current offline topology measurements (14 logical calls for the five-block demo
+#: and 45 for a 30-block shadow run), so the guardrail stops runaway repetition without
+#: shortening any review stage.
+DEFAULT_LLM_CALL_BUDGET = 300
+DEFAULT_LLM_CALL_BASE_BUDGET = 20
+DEFAULT_LLM_CALLS_PER_BLOCK_BUDGET = 6
+#: Generated output (including provider-reported reasoning) gets its own fuse. Cache-read
+#: tokens are intentionally excluded: they measure reused context traffic, not new model
+#: generation, and treating them as spend would stop healthy cached jobs immediately.
+DEFAULT_LLM_OUTPUT_TOKEN_BUDGET = 600_000
+DEFAULT_LLM_OUTPUT_TOKEN_BASE_BUDGET = 40_000
+DEFAULT_LLM_OUTPUT_TOKENS_PER_BLOCK_BUDGET = 10_000
+
 #: Provider defaults. `sonnet` is an alias that tracks the latest model in that family.
 #:
 #: **The environment names are prefixed, and that is not decoration.** `CLAUDE_EFFORT` is a
@@ -60,11 +76,10 @@ ROLE_EFFORT_ENV = {
     "final_verifier": "COUNCIL_FINAL_VERIFIER_EFFORT",
 }
 
-#: Turns per call. **2, not 1, and measured rather than chosen.** At 1 the live pilot lost
-#: four independent-review calls to `Reached maximum number of turns (1)` before the model
-#: had emitted its structured output. Retry recovered all four, which is the point: the
-#: ceiling that was meant to bound spend was *causing* whole extra calls, so 1 was more
-#: expensive than 2 as well as less reliable.
+#: Turns per call. **4, measured rather than chosen.** Live pilots successively lost calls
+#: to `Reached maximum number of turns` at ceilings 1, 2 and 3 before the model emitted its
+#: structured output. Retrying each whole prompt was more expensive than allowing the
+#: already-started invocation to reach turn 4.
 #:
 #: A setting because it is a fuse, and the reason to keep it low is unchanged -- what is
 #: bounded is spend on somebody's subscription, and `--tools ""` already leaves nothing to
@@ -159,6 +174,16 @@ class Settings:
 
     #: Agentic turns the CLI will allow per call. See `DEFAULT_CLAUDE_MAX_TURNS`.
     claude_max_turns: int = DEFAULT_CLAUDE_MAX_TURNS
+    #: Size-aware part of the physical-call fuse. The effective allowance is
+    #: `min(llm_call_budget, llm_call_base_budget + blocks *
+    #: llm_calls_per_block_budget)` and is pinned when a job starts.
+    llm_call_base_budget: int = DEFAULT_LLM_CALL_BASE_BUDGET
+    llm_calls_per_block_budget: int = DEFAULT_LLM_CALLS_PER_BLOCK_BUDGET
+    llm_output_token_budget: int = DEFAULT_LLM_OUTPUT_TOKEN_BUDGET
+    llm_output_token_base_budget: int = DEFAULT_LLM_OUTPUT_TOKEN_BASE_BUDGET
+    llm_output_tokens_per_block_budget: int = (
+        DEFAULT_LLM_OUTPUT_TOKENS_PER_BLOCK_BUDGET
+    )
 
     #: How often a running worker renews its lease. Must be comfortably shorter than
     #: `lease_seconds` or a worker loses a job it is actively working on -- see
@@ -205,6 +230,20 @@ class Settings:
     final_semantic_rounds: int = DEFAULT_FINAL_SEMANTIC_ROUNDS
 
     def __post_init__(self) -> None:
+        if self.llm_call_budget < 1:
+            raise ConfigurationError("LLM_CALL_BUDGET must be at least 1")
+        if self.llm_call_base_budget < 0:
+            raise ConfigurationError("LLM_CALL_BASE_BUDGET cannot be negative")
+        if self.llm_calls_per_block_budget < 1:
+            raise ConfigurationError("LLM_CALLS_PER_BLOCK_BUDGET must be at least 1")
+        if self.llm_output_token_budget < 1:
+            raise ConfigurationError("LLM_OUTPUT_TOKEN_BUDGET must be at least 1")
+        if self.llm_output_token_base_budget < 0:
+            raise ConfigurationError("LLM_OUTPUT_TOKEN_BASE_BUDGET cannot be negative")
+        if self.llm_output_tokens_per_block_budget < 1:
+            raise ConfigurationError(
+                "LLM_OUTPUT_TOKENS_PER_BLOCK_BUDGET must be at least 1"
+            )
         if not 1 <= self.scan_batch_size <= MAX_SCAN_BATCH_SIZE:
             raise ConfigurationError(
                 f"SCAN_BATCH_SIZE must be between 1 and {MAX_SCAN_BATCH_SIZE}, "
@@ -351,8 +390,24 @@ def load_settings(*, env_file: str | Path | None = ".env") -> Settings:
         max_repair_attempts=_int("MAX_REPAIR_ATTEMPTS", DEFAULT_MAX_REPAIR_ATTEMPTS),
         max_validation_rounds=_int("MAX_VALIDATION_ROUNDS", 2),
         step_budget=_int("STEP_BUDGET", 2000),
-        llm_call_budget=_int("LLM_CALL_BUDGET", 1500),
+        llm_call_budget=_int("LLM_CALL_BUDGET", DEFAULT_LLM_CALL_BUDGET),
         interrupted_retry_budget=_int("INTERRUPTED_RETRY_BUDGET", 2),
+        llm_call_base_budget=_int(
+            "LLM_CALL_BASE_BUDGET", DEFAULT_LLM_CALL_BASE_BUDGET
+        ),
+        llm_calls_per_block_budget=_int(
+            "LLM_CALLS_PER_BLOCK_BUDGET", DEFAULT_LLM_CALLS_PER_BLOCK_BUDGET
+        ),
+        llm_output_token_budget=_int(
+            "LLM_OUTPUT_TOKEN_BUDGET", DEFAULT_LLM_OUTPUT_TOKEN_BUDGET
+        ),
+        llm_output_token_base_budget=_int(
+            "LLM_OUTPUT_TOKEN_BASE_BUDGET", DEFAULT_LLM_OUTPUT_TOKEN_BASE_BUDGET
+        ),
+        llm_output_tokens_per_block_budget=_int(
+            "LLM_OUTPUT_TOKENS_PER_BLOCK_BUDGET",
+            DEFAULT_LLM_OUTPUT_TOKENS_PER_BLOCK_BUDGET,
+        ),
         # One at a time by default. The CLI backend runs a subprocess per call against a
         # single interactive subscription; two jobs in parallel double the rate at which a
         # session allowance is consumed and make a usage limit twice as likely mid-run.

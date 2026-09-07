@@ -54,6 +54,7 @@ Every flag below exists in 2.1.219's `--help`:
 | `--disable-slash-commands` | No skills reachable through `/name`. |
 | `--strict-mcp-config` + `--mcp-config '{"mcpServers":{}}'` | An explicitly empty MCP set, and every other MCP configuration ignored. |
 | `--max-turns 4` | A turn ceiling enforced by the CLI rather than inferred from having no tools. **4, measured rather than guessed** — see below. `COUNCIL_CLAUDE_MAX_TURNS`. |
+| `--prompt-suggestions false` | The service never consumes a predicted follow-up prompt, so generating one is pure discarded output. Explicitly disabled rather than left to the CLI default. |
 | `--permission-mode dontAsk` | Never blocks waiting for a human. With no tools there is nothing to permit, so this is belt and braces. |
 | `--no-session-persistence` | Nothing written to disk, nothing resumable. |
 
@@ -92,10 +93,11 @@ The reason to keep it low is untouched — this is somebody's subscription — s
 moved to 2 rather than to a comfortable number. A later blind run over a real 30-block
 workbook lost eight physical calls to `Reached maximum number of turns (2)` (six Initial
 Auditor calls and two Writer calls). Each failure reported three turns and then retried the
-entire prompt, so 2 was again increasing spend. The measured default is therefore 3. It
-remains a setting (`COUNCIL_CLAUDE_MAX_TURNS`) so it can be tightened during an incident
-without a redeploy. Raise it again only with the same kind of evidence: an observed failure
-mode, not a hunch about headroom.
+entire prompt, so 2 was again increasing spend. The ceiling therefore moved to 3 before
+the later contract-11 run below established that 3 had the same failure mode. It remains a
+setting (`COUNCIL_CLAUDE_MAX_TURNS`) so it can be tightened during an incident without a
+redeploy. Raise it again only with the same kind of evidence: an observed failure mode,
+not a hunch about headroom.
 
 The first fresh run under the contract-11 architecture then lost two of its first four
 completed Initial Auditor invocations to `Reached maximum number of turns (3)`. Each failed
@@ -176,7 +178,8 @@ cannot establish:
   schema it was given;
 - **`--max-turns` is accepted** — an unknown option aborts the call, so this is proof the
   flag exists at 2.1.219, not just that the binary contains the string. (That call passed
-  `1`; the ceiling is now 2 for the reason recorded above.)
+  `1`; later real runs established the current ceiling of 4, for the reason recorded
+  above.)
 - the restricted child environment still reaches the keychain. The allowlist entries
   `XPC_SERVICE_NAME` and `__CF_USER_TEXT_ENCODING` were a judgment call about macOS
   keychain bootstrap, and they are enough.
@@ -204,6 +207,12 @@ Usage is read from `usage` with both snake_case and camelCase spellings tried:
 `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`,
 `total_tokens`. **No dollar figure is derived** — the CLI reports a cost estimate for
 API-key users, and on a subscription that number is fiction.
+
+The audit row records a top-level `model` when present. When it is absent, the adapter
+uses the sole key of `modelUsage` / `model_usage`, which is normally the full snapshot id;
+if the mapping names multiple models it conservatively records the configured alias rather
+than inventing which one owns the call. This makes a future evaluation reproducible when
+the CLI supplies the information, while remaining compatible with older envelopes.
 
 `scripts/smoke_claude_cli.py` is the only thing in the repository that exercises this. It
 observes the envelope through the client's `runner` seam rather than reimplementing the

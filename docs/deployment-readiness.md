@@ -27,6 +27,11 @@ Bedrock or Google Vertex AI. It also documents print mode as the programmatic CL
 - Every graded row is accounted for by the Initial Auditor and again by the independent
   sweep. After repairs, a blind Final Semantic Verifier re-solves every current graded row;
   edits invalidate that block's final marker until it is checked again.
+- The two full audit passes use different attention order without adding a call: the
+  Initial Auditor derives mathematics before consulting recorded answers, while the
+  Independent Reviewer reconstructs the instructional contract and hint sequence first.
+  Both retain the complete semantic checklist. This is a general anti-correlation design,
+  not evidence of higher accuracy until a sealed live evaluation measures it.
 - Every unsupported model finding is audited from scratch by the other audit role, without
   exposing the original accusation. Exact agreement proceeds directly; related or silent
   results go to a separate adjudicator, and an undecided claim cannot be reported as fixed.
@@ -35,8 +40,11 @@ Bedrock or Google Vertex AI. It also documents print mode as the programmatic CL
 - Exact target cells, before-values, allowed scope, deterministic regressions, and final
   source-to-output differences are gated in Python.
 - Prompt versions, composed prompt hashes, JSON schemas, provider behavior, and the
-  Python-side pipeline contract (currently version 10) are pinned per job.
+  Python-side pipeline contract (currently version 18) are pinned per job.
 - Each physical model invocation has a durable audit row and a pre-call budget charge.
+- Physical calls and generated output tokens have separate, size-aware, per-workbook
+  ceilings. Both are pinned and shown in the local interface; cache traffic is reported
+  but does not masquerade as newly generated output.
 - Worker replacement runs recovery before resuming any durable phase.
 - Upload size, job steps, repair attempts, model calls, provider failures, process output,
   process time, run time, concurrency, and retention are bounded.
@@ -46,26 +54,37 @@ Bedrock or Google Vertex AI. It also documents print mode as the programmatic CL
 - Correct mathematical restatements in an Answer cell are protected from normalization:
   equation-to-value and named-evaluation-to-value rewrites are rejected when they are
   provably equivalent, while genuinely different answers remain repairable.
+- Exact, lossless defects no longer consume Writer or reviewer calls: boundary and
+  irregular whitespace, known Unicode spellings, doubled LaTeX command escapes, ASCII
+  exponent markers, repeated block names, redundant metadata, supported answer-type
+  corrections, scaffold namespaces, and dependency-chain values derived uniquely from
+  the row/step structure are repaired in Python through the same patch gate. Dependency
+  automation refuses rows carrying independent shift/corruption evidence.
 - Workbook notation detection uses positive notation evidence. Plain numbers and bare
   graded equations are neutral, so a LaTeX workbook with ordinary numeric answers is not
   misclassified as mixed.
 
 The exact model disclosure is in `docs/llm-data-contract.md`.
 
+The four-workbook demo benchmark's no-call fixture check is recorded in
+`docs/evaluations/sealed-demo-benchmark-20260904-preflight.md`. Its subsequent frozen live
+run is recorded in `docs/evaluations/sealed-demo-benchmark-20260907-live.md`: 33/33
+machine checks passed, manual review accepted two of three instructional alternatives,
+and the combined substantive score was 35/36 (97.2%) with no unexpected edit or changed
+clean control. That is a controlled 48-problem synthetic result, not a production SLA.
+
 ## What is not established yet
 
-- **Held-out semantic accuracy.** Historical corrected files contain missed keyed cells
-  and unexpected edits. Architecture fixes address several causes, but old files cannot
-  prove the new pipeline's accuracy. The `20260819` suite of four workbooks (60 problems,
-  38 defect groups, 52 automated checks, 22 clean controls) **is no longer unused**: three
-  of the four have been run live and their failures drove architecture changes, so they are
-  regression material now. Only `heldout-04` has never been sent to a live model. See the
-  evaluation section below — there is no held-out accuracy result, and there will not be one
-  until a set is built after the architecture stops moving.
+- **Real-workbook generalization.** The new sealed synthetic suite provides a frozen live
+  accuracy result, but 48 synthetic problems cannot establish performance across the
+  diversity of real OpenStax chapters. Historical corrected files contain misses and
+  unexpected edits, and the older `20260819` suite is regression material because its
+  failures shaped the system. A deployment claim still needs a sealed set sampled from
+  real curator work and judged by curators.
 - **Organization provider choice.** Console API, Bedrock, Vertex AI, or an approved gateway
   is a Berkeley decision involving billing, identity, retention, and procurement.
 - **Multi-user boundaries.** The current SQLite/data-directory design, shared bearer token,
-  and latest-job-only page are suitable for one trusted local curator, not an organization.
+  and local recent-job history are suitable for one trusted curator, not an organization.
 - **API cost.** Subscription calls do not establish an API budget. Cost needs token usage
   from a run made through the provider and model the organization intends to purchase.
 - **Operational controls.** Central deployment still needs institutional authentication,

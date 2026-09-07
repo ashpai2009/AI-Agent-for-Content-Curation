@@ -328,15 +328,19 @@ def test_partial_left_shift_is_detected_by_an_identifier_in_answer_type(make_wor
     assert finding.column_key is ColumnKey.ANSWER_TYPE
 
 
-def test_a_genuinely_missing_name_is_still_reported(make_workbook):
-    """The shift detector must not swallow the ordinary case it was carved out of."""
+def test_an_interior_missing_name_is_owned_by_the_registered_rule(make_workbook):
+    """The reader must not duplicate an exact repair as an unregistered claim."""
     path = make_workbook(
         [problem("angles1"), cells(row_type="step", answer="1", answer_type="numeric")]
     )
     parsed = read_workbook(path)
     found = codes(parsed)
-    assert StructuralCode.MISSING_PROBLEM_NAME in found
+    assert StructuralCode.MISSING_PROBLEM_NAME not in found
     assert StructuralCode.ROW_SHIFT_RIGHT not in found
+
+    from oatutor_council.validation.rules import run_rules
+
+    assert "ROW_MISSING_PROBLEM_NAME" in {finding.code for finding in run_rules(parsed)}
 
 
 # --------------------------------------------------------------------------------------
