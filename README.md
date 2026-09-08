@@ -1,6 +1,6 @@
-# OATutor Curation Council
+# OpenStax Curation Council
 
-Autonomous curation of OATutor/OpenStax mathematics problem workbooks.
+Autonomous curation of OpenStax mathematics problem workbooks.
 
 A curator uploads one `.xlsx`, optionally attaches a text instruction document, and starts
 **one** job. They get back a corrected workbook, a complete issue ledger, a cell-level
@@ -66,8 +66,7 @@ and prints every artefact.
 
 ```bash
 claude auth login                    # once; this app never sees your password or token
-.venv/bin/uvicorn "oatutor_council.api:create_app" --factory --app-dir src \
-  --port 8000 --workers 1
+./scripts/serve.sh --api-only
 
 # Verify the provider with one live call carrying no workbook content
 .venv/bin/python scripts/smoke_claude_cli.py
@@ -173,7 +172,7 @@ avoid.
 ## Architecture
 
 ```
-src/oatutor_council/
+src/ (service package)
   api.py           HTTP surface, upload validation, job runner
   council.py       the five-stage loop; one step = one bounded durable unit
   orchestrator.py  crash-safe apply, recovery after a crash
@@ -199,7 +198,8 @@ scripts/           demo.py · evaluate_workbooks.py · shadow_run.py ·
 The prompts ship **inside** the package. They started outside it, on the reasoning that
 they are content rather than code — which does not survive a wheel install, where the
 directory beside the source tree is site-packages and every agent raises on its first
-call. `OATUTOR_PROMPT_ROOT` overrides the location for anyone iterating on wording.
+call. A development-only prompt-root setting overrides the packaged location for anyone
+iterating on wording.
 `scripts/verify_wheel.py dist/*.whl` also refuses a release artifact that omits the newest
 prompts, declares a retired SDK, or resurrects the deleted provider module from a stale
 local `build/` directory; CI runs it before installing the wheel.
@@ -326,8 +326,8 @@ several corrections in this codebase exist because of it:
 - **Trailing columns move.** `Validator Check` appears at column 18, 19 or 20, duplicated
   in two files, and one workbook pushes `Time Last Checked` to column 21. They are resolved
   by header name across the full width, never by index.
-- **A row is blank only when every column is empty.** Three workbooks put the OATutor
-  validator's own output on row 2, in columns the contract never describes.
+- **A row is blank only when every column is empty.** Three workbooks put legacy validator
+  output on row 2, in columns the contract never describes.
 - **The `h` scaffold namespace is the majority**, not an outlier — six of eleven files.
   A workbook-wide consistent alternative is a house style and downgrades to a warning; a
   workbook that *mixes* namespaces keeps the error.
