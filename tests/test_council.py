@@ -38,6 +38,7 @@ from oatutor_council.llm.base import (
 )
 from oatutor_council.llm.mock import ScriptedLLMClient
 from oatutor_council.models import (
+    CellEdit,
     ColumnKey,
     ChangeRecord,
     CurationJob,
@@ -48,6 +49,7 @@ from oatutor_council.models import (
     IssueSource,
     IssueState,
     JobState,
+    Patch,
     RepairAttempt,
     ReviewerRole,
     Severity,
@@ -61,6 +63,7 @@ from oatutor_council.persistence import (
     get_job,
     insert_attempt,
     insert_issue,
+    insert_patch,
     list_changes,
     list_events,
     list_attempts,
@@ -505,6 +508,126 @@ def test_same_row_sibling_findings_are_repaired_sequentially_then_superseded(
     }
     assert not any(
         event["kind"] == "block_writer_batch" for event in list_events(db, "same-row")
+    )
+
+
+def test_an_existing_same_row_proposal_is_reviewed_before_its_sibling_gets_written(
+    make_workbook, tmp_path
+):
+    """Do not let two sequential batches author competing after-values for one cell.
+
+    The first proposal can include a related edit on the row named by its sibling. If the
+    sibling gets a Writer turn before that proposal is reviewed and applied, both durable
+    patches can carry the same original `before` and different `after` values. Whichever
+    lands second makes the first look corrupt during recovery.
+    """
+    source = make_workbook(
+        [
+            problem("same-cell", title="One row", oer_src="s", license="CC"),
+            step(
+                "same-cell",
+                title="Enter the value",
+                body_text="misleading instruction",
+                answer="1",
+                answer_type="numeric",
+            ),
+        ]
+    )
+    db = Database(tmp_path / "same-cell.db")
+    copy = create_working_copy(SourcePath(str(source)), tmp_path / "same-cell-job")
+    create_job(
+        db,
+        CurationJob(
+            job_id="same-cell",
+            source_filename=source.name,
+            source_sha256=copy.source_sha256,
+        ),
+    )
+    block = read_workbook(copy.path).blocks[0]
+
+    # Insert the writer-ready sibling first: this is the ordering that previously made
+    # `_inflight_sibling` choose it ahead of the existing reviewable proposal.
+    writer_issue = issue_from_finding(
+        ValidationFinding(
+            code="AUDITOR_FINDING",
+            severity=Severity.ERROR,
+            scope=FindingScope.CELL,
+            message="answer is wrong",
+            row=3,
+            column=5,
+            column_key=ColumnKey.ANSWER,
+            block_id=block.block_id,
+            problem_name=block.problem_name,
+        ),
+        job_id="same-cell",
+        source=IssueSource.INITIAL_AUDITOR,
+    ).model_copy(update={"state": IssueState.AWAITING_PATCH})
+    review_issue = issue_from_finding(
+        ValidationFinding(
+            code="AUDITOR_FINDING",
+            severity=Severity.ERROR,
+            scope=FindingScope.CELL,
+            message="instruction is wrong",
+            row=3,
+            column=4,
+            column_key=ColumnKey.BODY_TEXT,
+            block_id=block.block_id,
+            problem_name=block.problem_name,
+        ),
+        job_id="same-cell",
+        source=IssueSource.INITIAL_AUDITOR,
+    ).model_copy(update={"state": IssueState.PATCH_PROPOSED, "attempts_used": 1})
+    insert_issue(db, writer_issue)
+    insert_issue(db, review_issue)
+    attempt = RepairAttempt(
+        attempt_id="same-cell-attempt",
+        issue_id=review_issue.issue_id,
+        attempt_no=1,
+    )
+    insert_attempt(db, attempt)
+    patch = Patch(
+        patch_id="same-cell-patch",
+        issue_id=review_issue.issue_id,
+        attempt_no=1,
+        edits=(
+            CellEdit(
+                row=3,
+                column=4,
+                column_key=ColumnKey.BODY_TEXT,
+                before="misleading instruction",
+                after="correct instruction",
+            ),
+        ),
+        reason="correct the instruction",
+        derivation="the instruction contradicts the question",
+    )
+    insert_patch(db, patch)
+
+    client = ScriptedLLMClient()
+
+    def reply(request):
+        if request.role is AgentRole.KNOWN_ISSUE_REVIEWER:
+            return ReviewerResponse(decision="accept")
+        raise AssertionError(f"Writer ran before existing proposal review: {request.role}")
+
+    client.default = compliant(reply)
+    runner = CurationCouncil(
+        db=db,
+        settings=settings(repair_batch_size=8),
+        client=client,
+        job_id="same-cell",
+        copy=copy,
+    )
+    outcome = runner._repair(JobState.REPAIRING_KNOWN)
+
+    assert outcome.did_work
+    assert client.call_count(AgentRole.KNOWN_ISSUE_REVIEWER) == 1
+    assert client.call_count(AgentRole.WRITER) == 0
+    states = {issue.issue_id: issue.state for issue in list_issues(db, "same-cell")}
+    assert states[review_issue.issue_id] is IssueState.PATCH_APPROVED
+    assert states[writer_issue.issue_id] is IssueState.AWAITING_PATCH
+    assert read_workbook(copy.path).blocks[0].rows[1].get(ColumnKey.BODY_TEXT) == (
+        "misleading instruction"
     )
 
 

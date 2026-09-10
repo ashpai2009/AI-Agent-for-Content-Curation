@@ -437,7 +437,9 @@ CLI_ADAPTER_VERSION = 7
 #: 18 (2026-09-06): a contradictory latest independent sweep of unchanged content cannot
 #: end in SUCCEEDED; it goes to a curator without another model call. Audit prompts also
 #: use distinct math-first and instruction-first attention order, pinned in prompt files.
-PIPELINE_CONTRACT_VERSION = 18
+#: 19 (2026-09-09): a reviewable single patch is completed before a same-row sibling
+#: receives another Writer turn, preventing two durable proposals from competing for one cell.
+PIPELINE_CONTRACT_VERSION = 19
 
 
 class BudgetExhausted(Exception):
@@ -1762,6 +1764,15 @@ class CurationCouncil:
         if self.settings.repair_batch_size > 1:
             if group := self._live_block_group(_NEEDS_REVIEW, role, minimum=2):
                 return self._review_batch(group, state)
+            # A same-row sibling is intentionally excluded from a coordinated Writer
+            # batch because the two proposals may need the same physical cell. Once one
+            # proposal exists, finish reviewing and applying it before asking the Writer
+            # for its sibling. Otherwise the queue can select the still-writer-ready
+            # issue first, apply a second patch to the same cell, and leave the first
+            # durable patch at neither its before nor after value. Recovery correctly
+            # calls that corruption, but the scheduler created it.
+            if group := self._live_block_group(_NEEDS_REVIEW, role, minimum=1):
+                return self._advance_issue(group[0], state)
             if group := self._live_block_group(_NEEDS_APPLY, role, minimum=1):
                 return self._apply(group[0], state)
             if group := self._live_block_group(

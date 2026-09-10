@@ -40,7 +40,7 @@ Bedrock or Google Vertex AI. It also documents print mode as the programmatic CL
 - Exact target cells, before-values, allowed scope, deterministic regressions, and final
   source-to-output differences are gated in Python.
 - Prompt versions, composed prompt hashes, JSON schemas, provider behavior, and the
-  Python-side pipeline contract (currently version 18) are pinned per job.
+  Python-side pipeline contract (currently version 19) are pinned per job.
 - Each physical model invocation has a durable audit row and a pre-call budget charge.
 - Physical calls and generated output tokens have separate, size-aware, per-workbook
   ceilings. Both are pinned and shown in the local interface; cache traffic is reported
